@@ -1,0 +1,74 @@
+name: Клиент Windows
+
+# Сборка RetixHub.exe и установщика RetixHub_Setup_<версия>.exe (client/build.bat).
+#  - push в любую ветку с изменениями в client/ -> установщик в Artifacts запуска;
+#  - тег v<версия> (например v1.0.0) -> ещё и GitHub Release с установщиком;
+#  - Release, созданный вручную на GitHub (Releases -> Draft a new release, тег v<версия>)
+#    -> установщик прикрепляется к нему.
+#    Тег должен совпадать с VERSION в client/retixhub_client.py.
+on:
+  push:
+    branches: ['**']
+    tags: ['v*']
+    paths:
+      - 'client/**'
+      - '.github/workflows/client.yml'
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          architecture: x64
+
+      - name: Inno Setup
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) {
+            choco install innosetup -y --no-progress
+          }
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /? | Select-Object -First 1
+
+      - name: Версия
+        id: ver
+        shell: pwsh
+        run: |
+          $v = (Select-String -Path client/retixhub_client.py -Pattern '^VERSION = "([0-9.]+)"').Matches[0].Groups[1].Value
+          "version=$v" >> $env:GITHUB_OUTPUT
+          Write-Host "VERSION = $v"
+          if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -ne "v$v") {
+            throw "Тег $env:GITHUB_REF_NAME не совпадает с VERSION = $v в client/retixhub_client.py"
+          }
+
+      - name: Сборка (build.bat)
+        shell: cmd
+        run: client\build.bat
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: RetixHub_Setup_${{ steps.ver.outputs.version }}
+          path: client/dist/RetixHub_Setup_*.exe
+          if-no-files-found: error
+
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Retix Hub ${{ steps.ver.outputs.version }}
+          files: client/dist/RetixHub_Setup_*.exe
+          body: |
+            Установщик клиента Retix Hub для Windows 10/11 (x64). WireGuard внутри — ставится сам, если его нет.
+
+            На сервер: положите `RetixHub_Setup_${{ steps.ver.outputs.version }}.exe` в `/root/hub/data/downloads/` — сайт отдаст его по кнопке «Скачать».
+
+            Тихая установка: `RetixHub_Setup_${{ steps.ver.outputs.version }}.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART`
