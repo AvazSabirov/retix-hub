@@ -1023,3 +1023,119 @@ class TestPeerAccess:
         r = ctx.cabinet("firma1").post(f"/cabinet/devices/{d['device_id']}/peers_off")
         assert "не найдено" in r.text
         assert ctx.api.get("/api/me", headers=ctx.h(d["token"])).json()["show_peers"] is True
+
+
+class TestDirectLan:
+    """Прямой путь по локальной сети: сервер сводит соседей, только в компании с «любым трафиком»."""
+
+    def _office(self, ctx, full_lan=True, n=2):
+        from app import db
+        cid = ctx.company("office")
+        if full_lan:
+            conn = db.connect(); conn.execute("UPDATE companies SET full_lan=1 WHERE id=?", (cid,)); conn.commit(); conn.close()
+        pcs = [ctx.register("office", name=f"PC{i}") for i in range(n)]
+        for i, pc in enumerate(pcs):
+            self._report(ctx, pc, [f"192.168.1.{10 + i}/24"], 51000 + i)
+            self._seen(pc, "203.0.113.5")
+        return cid, pcs
+
+    @staticmethod
+    def _report(ctx, pc, lan, port, direct=()):
+        r = ctx.api.post("/api/heartbeat", headers=ctx.h(pc["token"]),
+                         json={"client_version": "1.0.11", "lan": lan, "wg_port": port, "direct": list(direct)})
+        assert r.status_code == 200, r.text
+
+    @staticmethod
+    def _seen(pc, public_ip, online=True):
+        """Монитор: пакеты WireGuard от ПК приходят с public_ip."""
+        import time
+        from app import db
+        now = int(time.time()) if online else 0
+        conn = db.connect()
+        conn.execute("UPDATE devices SET endpoint=?, last_handshake=?, last_rx_at=? WHERE id=?",
+                     (f"{public_ip}:4{pc['device_id']:04d}", now, now, pc["device_id"]))
+        conn.commit(); conn.close()
+
+    def _me(self, ctx, pc):
+        return ctx.api.get("/api/me", headers=ctx.h(pc["token"])).json()
+
+    def test_same_office_are_neighbors(self, ctx):
+        _, (a, b) = self._office(ctx)
+        me = self._me(ctx, a)
+        assert me["direct_enabled"] is True
+        assert me["direct"] == [{"id": b["device_id"], "public_key": b["_key"], "ip": b["ip"],
+                                 "endpoints": ["192.168.1.11:51001"]}]
+        assert [n["id"] for n in self._me(ctx, b)["direct"]] == [a["device_id"]]
+
+    def test_only_with_full_lan(self, ctx):
+        _, (a, b) = self._office(ctx, full_lan=False)
+        me = self._me(ctx, a)
+        assert me["direct_enabled"] is False and me["direct"] == []
+
+    def test_other_office_or_offline_or_stale_not_neighbors(self, ctx):
+        import time
+        from app import db
+        _, (a, b) = self._office(ctx)
+        self._seen(b, "198.51.100.7")                       # другой роутер — другой офис
+        assert self._me(ctx, a)["direct"] == []
+        self._seen(b, "203.0.113.5", online=False)          # выключен
+        assert self._me(ctx, a)["direct"] == []
+        self._seen(b, "203.0.113.5")
+        conn = db.connect()
+        conn.execute("UPDATE devices SET lan_at=? WHERE id=?", (int(time.time()) - 3600, b["device_id"]))
+        conn.commit(); conn.close()
+        assert self._me(ctx, a)["direct"] == []             # адреса давно не обновлялись
+        self._report(ctx, b, ["192.168.1.11/24"], 0)        # порт туннеля неизвестен
+        assert self._me(ctx, a)["direct"] == []
+
+    def test_blocked_pending_other_company_not_neighbors(self, ctx):
+        cid, (a, b, c) = self._office(ctx, n=3)
+        ctx.company("rival")
+        r = ctx.register("rival", name="R")
+        self._report(ctx, r, ["192.168.1.50/24"], 51050); self._seen(r, "203.0.113.5")
+        from app import db
+        conn = db.connect()
+        conn.execute("UPDATE devices SET is_blocked=1 WHERE id=?", (b["device_id"],))
+        conn.execute("UPDATE devices SET is_approved=0 WHERE id=?", (c["device_id"],))
+        conn.commit(); conn.close()
+        assert self._me(ctx, a)["direct"] == []
+        assert self._me(ctx, r)["direct"] == []
+
+    def test_no_nat_same_subnet(self, ctx):
+        """Сервер в той же сети, что и ПК (без NAT): соседи — ПК одной подсети."""
+        _, (a, b) = self._office(ctx)
+        self._seen(a, "192.168.1.10"); self._seen(b, "192.168.1.11")
+        assert self._me(ctx, a)["direct"][0]["endpoints"] == ["192.168.1.11:51001"]
+        self._report(ctx, b, ["192.168.7.11/24"], 51001); self._seen(b, "192.168.7.11")
+        assert self._me(ctx, a)["direct"] == []
+
+    def test_shared_subnet_first_and_own_ips_skipped(self, ctx):
+        _, (a, b) = self._office(ctx)
+        # у обоих VirtualBox 192.168.56.1 — свой же адрес соседу не отдаём
+        self._report(ctx, a, ["192.168.1.10/24", "192.168.56.1/24"], 51000)
+        self._report(ctx, b, ["192.168.56.1/24", "172.16.0.4/16", "192.168.1.11/24"], 51001)
+        assert self._me(ctx, a)["direct"][0]["endpoints"] == ["192.168.1.11:51001", "172.16.0.4:51001"]
+
+    def test_lan_addresses_cleaned(self, ctx):
+        from app import services
+        assert services.clean_lan(["192.168.1.10/24", "127.0.0.1/8", "169.254.1.2/16", "10.66.3.2/32",
+                                   "8.8.8.8/24", "garbage", "192.168.1.0/24", "10.1.2.3/8", "192.168.1.10/24",
+                                   "10.0.0.1/4"]) == ["192.168.1.10/24", "10.1.2.3/8"]
+        ctx.company("solo")
+        d = ctx.register("solo", name="PC")
+        r = ctx.api.post("/api/heartbeat", headers=ctx.h(d["token"]), json={"lan": ["1.1.1.1/24"] * 17})
+        assert r.status_code == 422
+        r = ctx.api.post("/api/heartbeat", headers=ctx.h(d["token"]), json={"wg_port": 70000})
+        assert r.status_code == 422
+
+    def test_old_client_heartbeat_keeps_lan(self, ctx):
+        _, (a, b) = self._office(ctx)
+        assert ctx.api.post("/api/heartbeat", headers=ctx.h(b["token"]), json={"client_version": "1.0.10"}).json()["ok"]
+        assert self._me(ctx, a)["direct"]
+
+    def test_cabinet_shows_direct_peers(self, ctx):
+        _, (a, b) = self._office(ctx)
+        self._report(ctx, a, ["192.168.1.10/24"], 51000, direct=[b["device_id"], 999])
+        page = ctx.cabinet("office").get("/cabinet").text
+        assert "напрямую: PC1" in page and "999" not in page.split("напрямую:")[1][:40]
+        assert "мимо сервера" in page

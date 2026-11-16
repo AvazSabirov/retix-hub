@@ -15,7 +15,7 @@
       </form>
     </td>
     <td data-label="Компьютер">{{ d.hostname or '—' }}</td>
-    <td data-label="IP"><code>{{ d.ip }}</code></td>
+    <td data-label="IP"><code>{{ d.ip }}</code>{% if d.direct_peers %}<br><small class="muted" title="С этими ПК связь идёт напрямую по локальной сети, мимо сервера">напрямую: {{ d.direct_peers | join(', ') }}</small>{% endif %}</td>
     <td data-label="Последняя связь" class="muted">{{ (d.last_rx_at or d.last_handshake) | ago }}{% if d.endpoint %}<br><small>{{ d.endpoint }}</small>{% endif %}</td>
     <td data-label="Клиент" class="muted">{{ d.client_version or '—' }}</td>
     <td data-label="Видит другие ПК">

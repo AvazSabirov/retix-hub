@@ -43,6 +43,10 @@ CREATE TABLE IF NOT EXISTS devices (
     rx_bytes        INTEGER NOT NULL DEFAULT 0,  -- принято от ПК по WireGuard (из wg show dump)
     last_rx_at      INTEGER NOT NULL DEFAULT 0,  -- когда rx_bytes последний раз вырос: ПК реально на связи
     endpoint        TEXT NOT NULL DEFAULT '',
+    lan_addrs       TEXT NOT NULL DEFAULT '',   -- JSON ["192.168.1.15/24", …]: адреса ПК в его локальной сети
+    wg_port         INTEGER NOT NULL DEFAULT 0, -- UDP-порт WireGuard на ПК (для прямого пути по локальной сети)
+    lan_at          INTEGER NOT NULL DEFAULT 0, -- когда ПК последний раз сообщил lan_addrs / wg_port
+    direct_ids      TEXT NOT NULL DEFAULT '',   -- JSON [id ПК], с которыми связь сейчас идёт напрямую
     last_seen       TEXT,
     update_state    TEXT NOT NULL DEFAULT '',   -- что ПК сообщает об обновлении: downloading:1.0.6 …
     update_state_at TEXT,
@@ -118,6 +122,10 @@ MIGRATIONS = [
     ("devices", "show_peers", "INTEGER NOT NULL DEFAULT 1"),
     ("devices", "rx_bytes", "INTEGER NOT NULL DEFAULT 0"),
     ("devices", "last_rx_at", "INTEGER NOT NULL DEFAULT 0"),
+    ("devices", "lan_addrs", "TEXT NOT NULL DEFAULT ''"),
+    ("devices", "wg_port", "INTEGER NOT NULL DEFAULT 0"),
+    ("devices", "lan_at", "INTEGER NOT NULL DEFAULT 0"),
+    ("devices", "direct_ids", "TEXT NOT NULL DEFAULT ''"),
 ]
 
 
