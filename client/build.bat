@@ -7,7 +7,7 @@ REM   1. dist\RetixHub\RetixHub.exe        - программа (onedir, PyInsta
 REM   2. самопроверка собранного exe       - модули, Tcl/Tk, SSL, иконка
 REM   3. client\wireguard\*.msi            - официальный WireGuard (скачивается один раз)
 REM   4. dist\RetixHub_Setup_<версия>.exe  - установщик: раздаётся пользователям и
-REM                                          кладётся на сервер в data\downloads\
+REM                                          кладётся на сервер в /root/hub/downloads/
 REM Версия берётся из VERSION в retixhub_client.py.
 
 python -m pip install --upgrade pip
@@ -62,7 +62,7 @@ if errorlevel 1 goto :fail
 
 echo.
 echo Готово: dist\RetixHub_Setup_%APPVER%.exe
-echo На сервер: положите его в server\data\downloads\ - сайт отдаст самый новый.
+echo На сервер: положите его в /root/hub/downloads/ на сервере - сайт отдаст самый новый.
 if not defined CI pause
 exit /b 0
 

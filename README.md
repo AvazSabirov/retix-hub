@@ -13,7 +13,7 @@ client/   Python-клиент для Windows (Tkinter), сборка в RetixHub
   даже если поменять конфиг руками.
 * Между компаниями трафик запрещён. Внутри компании по умолчанию разрешены только ping и SMB (445)
   к компьютеру с общей папкой. Галочка «любой трафик между ПК» в кабинете открывает всё внутри компании.
-* База SQLite (`server/data/vpn.db`) — источник правды. При старте контейнера и каждые 5 минут
+* База SQLite (`/root/hub/vpn.db` на хосте) — источник правды. При старте контейнера и каждые 5 минут
   `wg0` и iptables пересобираются из базы.
 * Кабинет компании видит только свою компанию: `company_id` берётся из сессии, а не из запроса.
 
@@ -36,12 +36,16 @@ nginx: пример в `server/nginx-hub.retix.uz.conf` (SSL через certbot)
 ```bash
 wg show                                # интерфейс wg0 и пиры
 iptables -S RETIX_FWD                   # правила между клиентами
-sqlite3 data/vpn.db 'select login, subnet_index from companies'
+sqlite3 /root/hub/vpn.db 'select login, subnet_index from companies'
 ```
 
 > Если `iptables -V` на хосте показывает `legacy` — поставьте в `.env` `IPTABLES=iptables-legacy`.
-> Бэкап — это папка `server/data/` (база + ключ сервера). Без `server.key` всем клиентам придётся
+> Все данные — в `/root/hub` на хосте (база, `server.key`, `secret.key`, `downloads/`); другая папка — `HUB_DATA` в `.env`.
+> Бэкап — это папка `/root/hub`. Без `server.key` всем клиентам придётся
 > переподключаться.
+>
+> Сервер уже работал с данными в `server/data/`? Перенесите их один раз:
+> `docker compose down && mkdir -p /root/hub && cp -a data/. /root/hub/ && docker compose up -d`
 
 ### Адреса на hub.retix.uz
 
@@ -51,7 +55,7 @@ sqlite3 data/vpn.db 'select login, subnet_index from companies'
 | `https://hub.retix.uz/api/...` | все запросы клиентов (справка: `/api`) |
 | `https://hub.retix.uz/cabinet` | кабинет компании |
 | `https://hub.retix.uz/admin` | суперадмин (ссылки на главной нет) |
-| `https://hub.retix.uz/download/client` | скачать клиент — положите `RetixHub_Setup_<версия>.exe` в `server/data/downloads/` |
+| `https://hub.retix.uz/download/client` | скачать клиент — положите `RetixHub_Setup_<версия>.exe` в `/root/hub/downloads/` |
 
 DNS: A-запись `hub.retix.uz` → IP сервера. SSL: `certbot --nginx -d hub.retix.uz`.
 Порт WireGuard (UDP 51820) идёт на тот же адрес — клиент подключается к `hub.retix.uz:51820`.
@@ -106,7 +110,7 @@ build.bat
 * Тихая установка на много ПК: `RetixHub_Setup_<версия>.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART`.
 * Удаление (Параметры → Приложения): снимает туннель, блок в `hosts`, правило firewall и автозапуск.
   WireGuard и `C:\ProgramData\RetixHub\` остаются — после повторной установки ПК вернётся в сеть сам.
-* На сайт: положите установщик в `server/data/downloads/` — по кнопке «Скачать» отдаётся самый новый
+* На сайт: положите установщик в `/root/hub/downloads/` на сервере — по кнопке «Скачать» отдаётся самый новый
   `RetixHub_Setup_*.exe`.
 
 Что делает клиент:
