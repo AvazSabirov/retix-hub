@@ -47,8 +47,8 @@
 </div>
 <div class="card">
   <h2>Журнал</h2>
-  <table>
-    {% for l in log %}<tr><td class="muted" style="width:170px">{{ l.created_at }}</td><td>{{ l.action }}</td><td>{{ l.details }}</td></tr>
+  <table class="log">
+    {% for l in log %}<tr><td class="muted log-time">{{ l.created_at }}</td><td>{{ l.action }}</td><td>{{ l.details }}</td></tr>
     {% else %}<tr><td class="muted">Пусто</td></tr>{% endfor %}
   </table>
 </div>

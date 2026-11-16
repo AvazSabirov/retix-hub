@@ -46,6 +46,51 @@
   .login { max-width:360px; margin:80px auto; }
   code { background:#f1f5f9; padding:1px 5px; border-radius:4px; }
   .rename { display:flex; gap:4px; } .rename input { width:130px; padding:3px 6px; font-size:12px; }
+  .log-time { width:170px; }
+
+  /* ---------- телефон: таблицы — карточками, формы и кнопки — под палец ---------- */
+  @media (max-width: 760px) {
+    body { font-size:15px; }
+    header { flex-wrap:wrap; gap:4px 12px; padding:10px 16px; }
+    header .sub { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:55vw; }
+    .adminnav { order:3; width:100%; margin-left:0; gap:20px; padding-top:4px; }
+    .adminnav a { padding:4px 0; }
+    main { margin:12px auto; padding:0 12px; }
+    .card { padding:14px; margin-bottom:12px; }
+    .card[style*="max-width"] { max-width:none !important; }
+    .grid { grid-template-columns:1fr; gap:0; }
+    .stats { gap:12px 22px; }
+    /* 16px — иначе iPhone увеличивает страницу при вводе */
+    input[type=text], input[type=password], input[type=number], input[type=datetime-local], textarea, select { font-size:16px; padding:9px 10px; }
+    input[type=datetime-local] { width:100%; border:1px solid var(--line); border-radius:7px; background:#fff; }
+    input[type=file] { max-width:100%; }
+    button, .btn { padding:9px 14px; }
+    button.small { padding:7px 11px; font-size:13px; }
+    button.link { padding:4px 0; }
+    .actions { gap:6px; }
+    code { word-break:break-all; }
+
+    table.cards, table.cards tbody, table.cards tr, table.cards td { display:block; width:100%; }
+    table.cards thead { display:none; }
+    table.cards tr { border:1px solid var(--line); border-radius:9px; padding:6px 12px; margin-bottom:10px; background:#fff; }
+    table.cards td { border:none; padding:6px 0; text-align:left; }
+    table.cards td[data-label] { position:relative; padding-left:118px; min-height:30px; }
+    table.cards td[data-label]::before { content:attr(data-label); position:absolute; left:0; top:7px; width:110px;
+      color:var(--muted); font-size:12px; line-height:1.3; }
+    table.cards td.card-title { font-size:16px; font-weight:600; padding-top:8px; }
+    table.cards td.actions { display:flex; padding-top:10px; border-top:1px solid var(--line); margin-top:4px; }
+    table.cards td.empty { text-align:center; }
+    table.cards tr.empty-row { border-style:dashed; }
+    table.cards .nowrap { white-space:normal; }
+    /* версия обновления и её «Что нового» — одна карточка из двух строк таблицы */
+    table.cards tr.joined { border-bottom:none; border-radius:9px 9px 0 0; margin-bottom:0; }
+    table.cards tr.joined + tr { border-top:1px dashed var(--line); border-radius:0 0 9px 9px; }
+    table.cards .rename { width:100%; } table.cards .rename input { flex:1; width:auto; min-width:0; font-size:16px; padding:6px 8px; }
+    table.log, table.log tbody, table.log tr, table.log td { display:block; width:auto; }
+    table.log tr { padding:8px 0; border-bottom:1px solid var(--line); }
+    table.log td { border:none; padding:1px 0; }
+    table.log td.log-time { font-size:12px; width:auto; }
+  }
 </style>
 </head>
 <body>
