@@ -6,7 +6,8 @@ Retix Hub — клиент для Windows (окно, значок в трее).
 * следит за сервером: если сервер пропал — ждёт, когда появится — переподключается;
 * показывает компьютеры компании (online/offline), открывает их общие папки (\\\\10.66.x.y),
   подключает сетевой диск; файл hosts не трогает;
-* открывает в firewall Windows общие папки (SMB) и ping из подсети компании.
+* открывает в firewall Windows общие папки (SMB) и ping из подсети компании;
+* раз в 10 минут проверяет новую версию на сервере и обновляется сам (тихая установка).
 
 Работает с правами администратора (перезапускает себя через UAC).
 Журнал: <папка программы>\\logs\\client.log, аварийные падения — logs\\crash.log.
@@ -15,6 +16,7 @@ import base64
 import faulthandler
 import ctypes
 import hashlib
+import ipaddress
 import json
 import logging
 import os
@@ -29,12 +31,13 @@ import tkinter as tk
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from tkinter import messagebox, simpledialog, ttk
+from urllib.parse import urlparse
 
 import requests
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
 
-VERSION = "1.0.4"
+VERSION = "1.0.5"
 APP_NAME = "RetixHub"          # служебное имя: папки, задачи, мьютекс
 APP_TITLE = "Retix Hub"        # то, что видит пользователь
 TUNNEL = "retixhub"
@@ -57,6 +60,14 @@ FW_RULE_PING = "RetixHub Ping"    # входящий ping из подсети к
 CHECK_EVERY = 8          # сек — основной цикл
 HANDSHAKE_OK = 180       # сек — handshake свежее этого = туннель жив
 HEARTBEAT_EVERY = 60
+
+UPDATE_FIRST = 60        # сек после запуска — первая проверка новой версии
+UPDATE_EVERY = 600       # сек — дальше каждые 10 минут
+UPDATE_RETRY = 3600      # та же версия не встала — снова не раньше чем через час
+UPDATE_MAX_SIZE = 300 * 1024 * 1024
+UPDATE_DIR = DATA_DIR / "update"   # внутри DATA_DIR: доступ только SYSTEM и администраторам
+
+TOKEN_HEADER = "X-Retix-Token"     # сервер присылает новый токен — старый после этого не действует
 
 log = logging.getLogger("retixhub")
 
@@ -142,7 +153,7 @@ class State:
 
     FIELDS = {"server_url": "", "company_login": "", "device_name": "", "token": "",
               "private_key": "", "join_password": "", "last_conf_hash": "", "fw_subnet": "",
-              "autostart_done": False, "enabled": True}
+              "autostart_done": False, "enabled": True, "auto_update": True, "update_attempt": {}}
 
     def __init__(self, path: Path | None = None):
         self.path = path or STATE_FILE
@@ -225,14 +236,24 @@ class Api:
         self.state = state
         self.http = requests.Session()
         self.http.headers["User-Agent"] = f"{APP_NAME}/{VERSION}"
+        # запросы по одному: иначе окно сообщений могло бы отправить уже заменённый токен,
+        # а старый токен сервер считает признаком копии входа на другом ПК
+        self.lock = threading.Lock()
 
     def _req(self, method: str, path: str, auth: bool = True, **kw):
+        with self.lock:
+            return self._req_locked(method, path, auth, **kw)
+
+    def _req_locked(self, method: str, path: str, auth: bool, **kw):
         url = self.state.get("server_url").rstrip("/") + path
         headers = {"Authorization": f"Bearer {self.state.get('token')}"} if auth else {}
         try:
             r = self.http.request(method, url, headers=headers, timeout=8, **kw)
         except requests.RequestException as e:
             raise ServerUnreachable(str(e)) from e
+        new_token = r.headers.get(TOKEN_HEADER)
+        if auth and new_token and r.status_code < 400:
+            self.state.set(token=new_token)   # сразу на диск: после перезапуска — уже новый
         if r.status_code >= 500:
             raise ServerUnreachable(f"HTTP {r.status_code}")
         if r.status_code >= 400:
@@ -262,6 +283,63 @@ class Api:
 
     def messages(self):
         return self._req("GET", "/api/messages")
+
+    def logout(self):
+        return self._req("POST", "/api/logout")
+
+
+# ====================================================================== проверка ответа сервера
+# Конфигурация WireGuard, правила firewall и адреса для ping/mstsc/Radmin собираются из ответа сервера.
+# Не верим ему вслепую: только сеть Retix Hub 10.66.0.0/16, ключи base64, без переводов строк.
+
+VPN_NET = ipaddress.IPv4Network("10.66.0.0/16")
+KEY_RE = re.compile(r"^[A-Za-z0-9+/]{43}=$")
+ENDPOINT_RE = re.compile(r"^(?:[A-Za-z0-9.-]{1,253}|\[[0-9A-Fa-f:]{2,39}\]):(\d{1,5})$")
+PORTS_RE = re.compile(r"^\d{1,5}(,\d{1,5}){0,14}$")
+
+
+def _ipv4(value) -> ipaddress.IPv4Address:
+    ip = ipaddress.IPv4Address(str(value))
+    if str(ip) != value:
+        raise ValueError(f"адрес {value!r}")
+    return ip
+
+
+def _vpn_net(value) -> ipaddress.IPv4Network:
+    net = ipaddress.IPv4Network(str(value).strip())
+    if not net.subnet_of(VPN_NET):
+        raise ValueError(f"сеть {value!r} вне {VPN_NET}")
+    return net
+
+
+def check_cfg(cfg: dict) -> None:
+    """ValueError, если в конфигурации от сервера есть что-то кроме сети Retix Hub."""
+    ip = _ipv4(cfg["ip"])
+    subnet = _vpn_net(cfg["subnet"])
+    if ip not in subnet or cfg["address"] != f"{ip}/32":
+        raise ValueError("адрес ПК вне подсети компании")
+    if _ipv4(cfg["server_ip"]) not in VPN_NET:
+        raise ValueError("адрес сервера вне сети Retix Hub")
+    for part in str(cfg["allowed_ips"]).split(","):
+        _vpn_net(part)
+    if not KEY_RE.match(str(cfg["server_public_key"])):
+        raise ValueError("ключ сервера")
+    m = ENDPOINT_RE.match(str(cfg["endpoint"]))
+    if not m or not 0 < int(m.group(1)) < 65536:
+        raise ValueError(f"endpoint {cfg['endpoint']!r}")
+    for key in ("keepalive", "radmin_port"):
+        if key in cfg and not (isinstance(cfg[key], int) and 0 <= cfg[key] < 65536):
+            raise ValueError(key)
+    if cfg.get("share_ports") and not PORTS_RE.match(str(cfg["share_ports"])):
+        raise ValueError("порты")
+
+
+def peer_ip_ok(ip, subnet: str) -> bool:
+    """IP соседа — обычный IPv4 в подсети компании (его подставляем в ping, \\\\ip, mstsc, Radmin)."""
+    try:
+        return _ipv4(ip) in _vpn_net(subnet)
+    except (ValueError, TypeError):
+        return False
 
 
 # ====================================================================== WireGuard
@@ -443,6 +521,129 @@ def remove_autostart() -> None:
     run(["schtasks", "/Delete", "/TN", APP_NAME, "/F"])
 
 
+# ====================================================================== автообновление
+
+VERSION_RE = re.compile(r"^\d+(\.\d+){1,3}$")
+
+
+def version_tuple(v: str) -> tuple:
+    if not VERSION_RE.match(v or ""):
+        raise ValueError(f"версия {v!r}")
+    return tuple((list(map(int, v.split("."))) + [0, 0, 0])[:4])
+
+
+def launch_installer(path: Path) -> None:
+    """Тихая установка новой версии. Через «start», а не дочерним процессом: установщик закрывает
+    RetixHub.exe вместе с его дочерними процессами (taskkill /T) — себя он бы тоже убил.
+    /AUTOUPDATE=1 — после установки установщик сам запустит новый клиент (в трее)."""
+    subprocess.Popen(["cmd", "/c", "start", "", str(path), "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART",
+                      "/AUTOUPDATE=1"], creationflags=CREATE_NO_WINDOW)
+
+
+class Updater(threading.Thread):
+    """Раз в 10 минут: есть ли на сервере версия новее (GET /api/client/version). Если есть —
+    скачивает установщик в %ProgramData%\\RetixHub\\update, сверяет размер и sha256 и ставит его.
+    VPN при обновлении не рвётся: туннель держит служба WireGuard."""
+
+    def __init__(self, state: State, on_update=None, launcher=None):
+        super().__init__(daemon=True, name="updater")
+        self.state = state
+        self.on_update = on_update or (lambda ver: None)
+        self.launcher = launcher or launch_installer
+        self.stop_event = threading.Event()
+        self.http = requests.Session()
+        self.http.headers["User-Agent"] = f"{APP_NAME}/{VERSION}"
+
+    def run(self):
+        if not getattr(sys, "frozen", False):
+            log.info("автообновление выключено: запуск из исходников")
+            return
+        delay = UPDATE_FIRST
+        while not self.stop_event.wait(delay):
+            delay = UPDATE_EVERY
+            try:
+                if self.check():
+                    return
+            except Exception:  # noqa: BLE001
+                log.exception("автообновление")
+
+    def check(self) -> str | None:
+        """Версия, которая начала устанавливаться, или None."""
+        if self.state.get("auto_update") is False:
+            return None
+        base = (self.state.get("server_url") or "").rstrip("/")
+        u = urlparse(base)
+        if u.scheme != "https" and u.hostname not in ("127.0.0.1", "localhost"):
+            log.warning("автообновление только по https: %s", base)
+            return None
+        try:
+            r = self.http.get(base + "/api/client/version", timeout=15)
+            r.raise_for_status()
+            info = r.json()
+        except (requests.RequestException, ValueError):
+            return None
+        ver = str(info.get("version") or "")
+        try:
+            if version_tuple(ver) <= version_tuple(VERSION):
+                self._cleanup()
+                return None
+        except ValueError:
+            return None
+        last = self.state.get("update_attempt") or {}
+        if last.get("version") == ver and time.time() - last.get("at", 0) < UPDATE_RETRY:
+            return None   # эта версия уже ставилась и не встала — не долбим каждые 10 минут
+        sha = str(info.get("sha256") or "").lower()
+        size = info.get("size")
+        if not re.fullmatch(r"[0-9a-f]{64}", sha) or not isinstance(size, int) or not 0 < size <= UPDATE_MAX_SIZE:
+            log.warning("обновление %s: сервер не прислал sha256/размер", ver)
+            return None
+        path = self._download(base + "/download/client", ver, sha, size)
+        if not path:
+            return None
+        log.warning("обновление %s -> %s: запускаю установщик", VERSION, ver)
+        self.state.set(update_attempt={"version": ver, "at": int(time.time())})
+        self.launcher(path)
+        self.on_update(ver)
+        return ver
+
+    def _download(self, url: str, ver: str, sha: str, size: int) -> Path | None:
+        UPDATE_DIR.mkdir(parents=True, exist_ok=True)
+        final = UPDATE_DIR / f"RetixHub_Setup_{ver}.exe"
+        part = UPDATE_DIR / f"RetixHub_Setup_{ver}.part"
+        h, got = hashlib.sha256(), 0
+        try:
+            with self.http.get(url, stream=True, timeout=30) as r:
+                r.raise_for_status()
+                with open(part, "wb") as f:
+                    for chunk in r.iter_content(1 << 16):
+                        got += len(chunk)
+                        if got > size:
+                            raise ValueError("файл больше заявленного")
+                        h.update(chunk)
+                        f.write(chunk)
+            if got != size or h.hexdigest() != sha:
+                raise ValueError("размер или sha256 не совпали")
+            part.replace(final)
+            return final
+        except (requests.RequestException, OSError, ValueError) as e:
+            log.warning("обновление %s не скачано: %s", ver, e)
+            try:
+                part.unlink()
+            except OSError:
+                pass
+            return None
+
+    @staticmethod
+    def _cleanup():
+        """Установщик прошлого обновления больше не нужен."""
+        if UPDATE_DIR.exists():
+            for f in UPDATE_DIR.iterdir():
+                try:
+                    f.unlink()
+                except OSError:
+                    pass
+
+
 def is_admin() -> bool:
     try:
         return bool(ctypes.windll.shell32.IsUserAnAdmin())
@@ -504,6 +705,11 @@ class Worker(threading.Thread):
 
     def logout(self):
         self.paused = True
+        if self.state.get("token"):
+            try:
+                self.api.logout()   # токен больше не действует, ПК снят с сервера WireGuard
+            except (ApiError, ServerUnreachable):
+                pass
         self.state.set(token="", join_password="", last_conf_hash="")
         try:
             self.tunnel.uninstall()
@@ -537,6 +743,9 @@ class Worker(threading.Thread):
 
     # --- внутреннее
     def _register(self, password: str):
+        # старый токен забываем до запроса: если ответ потеряется, он не уйдёт на сервер снова
+        # (старый токен сервер считает копией входа и отключает ПК)
+        self.state.set(token="")
         _, pub = self.state.keypair()
         res = self.api.register(self.state.get("company_login"), password,
                                 self.state.get("device_name") or socket.gethostname(), pub)
@@ -610,6 +819,14 @@ class Worker(threading.Thread):
                 return
             raise
 
+        try:
+            check_cfg(self.cfg)
+        except (ValueError, KeyError, TypeError) as e:
+            log.error("сервер прислал неверную конфигурацию: %s", e)
+            self.cfg = None
+            self.status(Status.ERROR, "Сервер прислал неверную конфигурацию — туннель не изменён")
+            return
+
         if self.cfg["status"] == "blocked":
             if self.tunnel.service_state() != "missing":
                 self.tunnel.uninstall()
@@ -671,6 +888,7 @@ class Worker(threading.Thread):
             peers = self.api.peers()["peers"]
         except (ApiError, ServerUnreachable):
             peers = []
+        peers = [p for p in peers if peer_ip_ok(p.get("ip"), self.cfg["subnet"])]
         self.emit("peers", peers=peers)
 
         # 6. новые сообщения от других ПК
@@ -1113,6 +1331,8 @@ class App(tk.Tk):
         dark_titlebar(self)
         no_maximize_button(self)
         self.worker.start()
+        self.updater = Updater(state, on_update=lambda ver: self.ui_q.put(("update", ver)))
+        self.updater.start()
         self.after(200, self._poll)
 
     # --- журнал ошибок окна
@@ -1278,6 +1498,10 @@ class App(tk.Tk):
             self.worker.force_reconnect()
         elif kind == "quit":
             self.quit_app()
+        elif kind == "update":
+            # установщик уже запущен: закрываемся, он поставит новую версию и запустит её
+            self.tray.notify(APP_TITLE, f"Обновление до версии {data}…")
+            self.after(800, self.quit_app)
         elif kind == "login_done":
             if self.login_dialog:
                 self.login_dialog.done(data)
@@ -1434,8 +1658,8 @@ class App(tk.Tk):
     def ping(self):
         p = self.selected_peer()
         if p and WINDOWS:
-            subprocess.Popen(["cmd", "/k", f"title Ping {p['name']} & ping -t {p['ip']}"],
-                             creationflags=subprocess.CREATE_NEW_CONSOLE)
+            # без cmd: имя ПК задаёт пользователь, в «cmd /k …» символы & | выполнились бы как команды
+            subprocess.Popen(["ping", "-t", str(_ipv4(p["ip"]))], creationflags=subprocess.CREATE_NEW_CONSOLE)
 
     def _on_messages(self, msgs):
         for m in msgs:
@@ -1595,6 +1819,7 @@ class App(tk.Tk):
     def quit_app(self):
         log.info("выход из программы (VPN продолжает работать)")
         self.worker.stop_flag = True
+        self.updater.stop_event.set()
         self.tray.stop()
         self.destroy()
 

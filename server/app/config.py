@@ -28,6 +28,10 @@ ONLINE_SECONDS = int(os.getenv("ONLINE_SECONDS", "180"))
 # Radmin Server: Radmin Viewer подключается к нему по TCP 4899 — открыт между ПК компании всегда
 RADMIN_PORT = int(os.getenv("RADMIN_PORT", "4899"))
 
+# Токен устройства меняется не реже, чем раз в столько секунд. Старый токен, пришедший снова
+# (его скопировали на другой ПК), отключает устройство до одобрения администратором.
+TOKEN_ROTATE_SECONDS = int(os.getenv("TOKEN_ROTATE_SECONDS", "120"))
+
 # Журнал: по умолчанию только ошибки и предупреждения (+ одна строка о запуске). INFO — для разбора проблем.
 LOG_LEVEL = os.getenv("LOG_LEVEL", "WARNING").upper()
 
