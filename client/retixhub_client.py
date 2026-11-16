@@ -362,6 +362,24 @@ def ensure_firewall(subnet: str | None, ports: str = "445") -> None:
         log.info("firewall: общие папки (%s) и ping разрешены из %s", ports, subnet)
 
 
+def smb_check(ip: str, timeout: float = 3.0) -> str | None:
+    """Доступны ли общие папки (SMB, порт 445) на ПК. None — да, иначе понятная причина."""
+    try:
+        with socket.create_connection((ip, 445), timeout=timeout):
+            return None
+    except OSError:
+        pass
+    rc, out = run(["ping", "-n", "1", "-w", "1500", ip], timeout=10) if WINDOWS else (1, "")
+    if rc == 0 and "TTL=" in out.upper():
+        return ("Компьютер в сети (ping проходит), но порт общих папок 445 закрыт. Возможные причины:\n"
+                "• на том ПК ещё старая версия Retix Hub — обновите до последней (она открывает 445 в firewall);\n"
+                "• на том ПК выключен «Общий доступ к файлам и принтерам» или служба «Сервер» (LanmanServer).")
+    return ("Компьютер не отвечает. Возможные причины:\n"
+            "• он выключен или не подключён к Retix Hub;\n"
+            "• на сервере Retix Hub не обновлены правила (обновите сервер: git pull && ./run.sh);\n"
+            "• на том ПК старая версия Retix Hub — обновите до последней.")
+
+
 def ensure_autostart() -> None:
     if not getattr(sys, "frozen", False):
         return
@@ -1203,7 +1221,9 @@ class App(tk.Tk):
             self.ip_lbl.config(text="—")
             self.group_lbl.config(text="▼  —")
         self.msg_lbl.config(text="" if status == Status.ONLINE else (text or ""))
-        tray_color = {C["green"]: "green", C["orange"]: "orange", C["red"]: "red"}.get(color, "off")
+        # значок в трее: зелёный — в сети, жёлтый — подключается, красный — VPN не работает (выключен, нет входа,
+        # сервер недоступен, блок, ошибка)
+        tray_color = {C["green"]: "green", C["orange"]: "orange"}.get(color, "red")
         ip = (c or {}).get("ip", "")
         self.tray.update(tray_color, f"{APP_TITLE} — {label}" + (f" · {ip}" if ip and status == Status.ONLINE else ""))
         if status == Status.NEED_LOGIN and self.last_status != Status.NEED_LOGIN and not self.login_dialog:
@@ -1311,12 +1331,18 @@ class App(tk.Tk):
             return
         path = rf"\\{p['ip']}"
 
-        def work():  # Проводник может думать несколько секунд — не держим окно
+        def work():  # проверка и Проводник могут думать несколько секунд — не держим окно
+            problem = smb_check(p["ip"])
+            if problem:
+                self.ui_q.put(("error", f"Общие папки {p['name']} ({path}) не открываются.\n\n{problem}"))
+                return
             try:
                 os.startfile(path)
             except OSError as e:
-                self.ui_q.put(("error", f"Не удалось открыть {path}\n{e}\n\nПроверьте, что на {p['name']} "
-                                        "открыт общий доступ к папке (Справка → Как открыть доступ к папке)."))
+                # str(e) показывает путь как '\\\\10.66…' — берём только текст ошибки Windows
+                self.ui_q.put(("error", f"Не удалось открыть {path}\n{e.strerror or e}\n\n"
+                                        f"Проверьте, что на {p['name']} открыт общий доступ к папке "
+                                        "(Справка → Как открыть доступ к папке)."))
         threading.Thread(target=work, daemon=True, name="open").start()
 
     def ping(self):
