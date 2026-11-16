@@ -13,35 +13,52 @@ client/   Python-клиент для Windows (Tkinter), сборка в RetixHub
   даже если поменять конфиг руками.
 * Между компаниями трафик запрещён. Внутри компании по умолчанию разрешены только ping и SMB (445)
   к компьютеру с общей папкой. Галочка «любой трафик между ПК» в кабинете открывает всё внутри компании.
-* База SQLite (`server/data/vpn.db`) — источник правды. При старте контейнера и каждые 5 минут
+* База SQLite (`/root/hub/data/vpn.db` на хосте) — источник правды. При старте контейнера и каждые 5 минут
   `wg0` и iptables пересобираются из базы.
 * Кабинет компании видит только свою компанию: `company_id` берётся из сессии, а не из запроса.
 
 ## 1. Сервер
 
-Требования: Ubuntu 20.04+ (модуль WireGuard в ядре), Docker + compose, nginx.
+Требования: Ubuntu 20.04+ (модуль WireGuard в ядре), Docker, nginx.
+
+Код — в `/root/hub`, данные — в `/root/hub/data` (в git не попадают).
 
 ```bash
-cd server
-cp .env.example .env      # укажите WG_ENDPOINT, SUPERADMIN_PASSWORD
-docker compose up -d --build
+git clone https://github.com/AvazSabirov/retix-hub.git /root/hub
+cd /root/hub/server
+cp .env.example .env      # укажите SUPERADMIN_PASSWORD
+./run.sh                  # сборка образа и запуск контейнера (без compose)
 docker logs -f retixhub  # «Retix Hub запущен, server pubkey …»
+```
 
+Обновление сервера: `cd /root/hub/server && git pull && ./run.sh` — образ пересобирается, контейнер пересоздаётся, данные в `/root/hub/data` остаются.
+Остановить: `docker stop retixhub`, запустить снова: `docker start retixhub`. После перезагрузки хоста контейнер
+поднимается сам (`--restart unless-stopped`).
+
+```bash
 ufw allow 51820/udp       # если включён ufw
 ```
 
-nginx: пример в `server/nginx-hub.retix.uz.conf` (SSL через certbot). API слушает только `127.0.0.1:8100`.
+nginx: API слушает только `127.0.0.1:8100`, наружу — через nginx. Конфиг `server/nginx-hub.retix.uz.conf`
+(только HTTP) кладётся отдельным файлом, SSL добавляет certbot — другие сайты на сервере не затрагиваются:
+```bash
+cp server/nginx-hub.retix.uz.conf /etc/nginx/conf.d/hub.retix.uz.conf
+nginx -t && systemctl reload nginx
+certbot --nginx -d hub.retix.uz --redirect
+```
 
 Проверка на сервере:
 ```bash
 wg show                                # интерфейс wg0 и пиры
 iptables -S RETIX_FWD                   # правила между клиентами
-sqlite3 data/vpn.db 'select login, subnet_index from companies'
+sqlite3 /root/hub/data/vpn.db 'select login, subnet_index from companies'
 ```
 
 > Если `iptables -V` на хосте показывает `legacy` — поставьте в `.env` `IPTABLES=iptables-legacy`.
-> Бэкап — это папка `server/data/` (база + ключ сервера). Без `server.key` всем клиентам придётся
+> Все данные — в `/root/hub/data` на хосте (база, `server.key`, `secret.key`, `downloads/`); другая папка — `HUB_DATA` в `.env`.
+> Бэкап — это папка `/root/hub/data`. Без `server.key` всем клиентам придётся
 > переподключаться.
+>
 
 ### Адреса на hub.retix.uz
 
@@ -51,9 +68,9 @@ sqlite3 data/vpn.db 'select login, subnet_index from companies'
 | `https://hub.retix.uz/api/...` | все запросы клиентов (справка: `/api`) |
 | `https://hub.retix.uz/cabinet` | кабинет компании |
 | `https://hub.retix.uz/admin` | суперадмин (ссылки на главной нет) |
-| `https://hub.retix.uz/download/client` | скачать клиент — положите `RetixHub.exe` в `server/data/downloads/` |
+| `https://hub.retix.uz/download/client` | скачать клиент — положите `RetixHub_Setup_<версия>.exe` в `/root/hub/data/downloads/` |
 
-DNS: A-запись `hub.retix.uz` → IP сервера. SSL: `certbot --nginx -d hub.retix.uz`.
+DNS: A-запись `hub.retix.uz` → IP сервера. SSL: см. выше (`certbot --nginx`).
 Порт WireGuard (UDP 51820) идёт на тот же адрес — клиент подключается к `hub.retix.uz:51820`.
 
 ## 2. Кабинеты
@@ -68,14 +85,46 @@ DNS: A-запись `hub.retix.uz` → IP сервера. SSL: `certbot --nginx 
 
 ## 3. Клиент (Windows)
 
-Сборка на Windows:
+Пользователям раздаётся один файл — установщик `RetixHub_Setup_<версия>.exe`. Внутри: программа,
+`client_config.json` и официальный WireGuard (ставится сам, если его нет).
+
+### Сборка в GitHub
+
+Workflow `.github/workflows/client.yml` собирает установщик на Windows:
+* push с изменениями в `client/` → установщик лежит в **Actions → запуск → Artifacts**;
+* тег `v<версия>` (например `v1.0.0`) → ещё и **Releases** с установщиком.
+  Тег должен совпадать с `VERSION` в `client/retixhub_client.py`.
+
+Выпуск новой версии: поменять `VERSION` в `client/retixhub_client.py`, закоммитить, затем либо
+```bash
+git tag v1.0.1
+git push origin v1.0.1
+```
+либо на GitHub: **Releases → Draft a new release** → тег `v1.0.1` → **Publish release** — установщик
+соберётся и прикрепится к релизу сам (через 3–5 минут).
+
+### Сборка на своём ПК
+
+Нужны Windows 10/11 x64, Python 3.10+ (64-бит) и [Inno Setup 6.3+](https://jrsoftware.org/isdl.php).
 ```
 cd client
-:: поменяйте server_url в client_config.json
+:: при необходимости поменяйте server_url в client_config.json
 build.bat
 ```
-Раздавать: `dist\RetixHub.exe` + `client_config.json` + `wireguard-amd64-*.msi`
-(с https://download.wireguard.com/windows-client/) — если WireGuard не установлен, клиент поставит его сам.
+`build.bat`: ставит зависимости → PyInstaller (`RetixHub.spec`, onedir) → самопроверка собранного exe
+(`RetixHub.exe --selftest`: Tcl/Tk, cryptography, SSL, иконка) → скачивает WireGuard MSI с проверкой подписи
+(`get_wireguard.ps1`) → Inno Setup (`RetixHub.iss`). Результат: `client\dist\RetixHub_Setup_<версия>.exe`.
+
+### Установщик
+
+* Без вопросов: окно UAC и полоса прогресса. Обновление — тот же установщик поверх; запущенный клиент
+  закрывается (VPN держит служба WireGuard, связь не рвётся). Более старую версию поверх новой не ставит.
+* Ярлыки: рабочий стол и «Пуск». Автозапуск создаёт сам клиент (задача Планировщика).
+* Тихая установка на много ПК: `RetixHub_Setup_<версия>.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART`.
+* Удаление (Параметры → Приложения): снимает туннель, блок в `hosts`, правило firewall и автозапуск.
+  WireGuard и `C:\ProgramData\RetixHub\` остаются — после повторной установки ПК вернётся в сеть сам.
+* На сайт: положите установщик в `/root/hub/data/downloads/` на сервере — по кнопке «Скачать» отдаётся самый новый
+  `RetixHub_Setup_*.exe`.
 
 Что делает клиент:
 1. Окно входа: сервер, логин компании, пароль компании, имя ПК. Ключ WireGuard генерируется на ПК,
@@ -114,7 +163,7 @@ build.bat
 
 ```bash
 pip install -r server/requirements.txt -r client/requirements.txt pytest httpx
-python -m pytest tests/test_server.py tests/test_client.py -q   # 113 тестов, ~2 мин
+python -m pytest tests/test_server.py tests/test_client.py -q   # 114 тестов, ~2 мин
 sudo python3 tests/e2e_network.py                               # 52 проверки на настоящей сети
 ```
 

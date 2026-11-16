@@ -1,4 +1,5 @@
 """Публичная часть hub.retix.uz: главная страница, скачивание клиента, справка по API."""
+import glob
 import os
 
 from fastapi import APIRouter, Request
@@ -9,29 +10,45 @@ from ..web import templates
 
 router = APIRouter(include_in_schema=False)
 
-CLIENT_FILE = "RetixHub.exe"
+CLIENT_FILE = "RetixHub.exe"              # старый вариант: один exe
+SETUP_PATTERN = "RetixHub_Setup_*.exe"     # установщик из client/build.bat — отдаётся самый новый
 WIREGUARD_URL = "https://download.wireguard.com/windows-client/wireguard-installer.exe"
 
 
+def _version_key(path: str):
+    ver = os.path.basename(path)[len("RetixHub_Setup_"):-len(".exe")]
+    return [int(p) if p.isdigit() else 0 for p in ver.split(".")], os.path.getmtime(path)
+
+
+def client_file() -> str | None:
+    """Что отдавать по «Скачать»: самый новый RetixHub_Setup_<версия>.exe, иначе RetixHub.exe."""
+    setups = [p for p in glob.glob(os.path.join(DOWNLOADS_DIR, SETUP_PATTERN)) if os.path.isfile(p)]
+    if setups:
+        return max(setups, key=_version_key)
+    path = os.path.join(DOWNLOADS_DIR, CLIENT_FILE)
+    return path if os.path.isfile(path) else None
+
+
 def client_available() -> bool:
-    return os.path.isfile(os.path.join(DOWNLOADS_DIR, CLIENT_FILE))
+    return client_file() is not None
 
 
 @router.get("/")
 def landing(request: Request, msg: str = "", err: int = 0):
     return templates.TemplateResponse(request, "landing.html", {
         "title": APP_NAME, "version": APP_VERSION, "public_url": PUBLIC_URL,
-        "client_available": client_available(), "wireguard_url": WIREGUARD_URL,
+        "client_available": client_available(),
+        "client_name": os.path.basename(client_file() or CLIENT_FILE), "wireguard_url": WIREGUARD_URL,
         "msg": msg, "err": err})
 
 
 @router.get("/download/client")
 def download_client():
-    path = os.path.join(DOWNLOADS_DIR, CLIENT_FILE)
-    if not os.path.isfile(path):
+    path = client_file()
+    if not path:
         return RedirectResponse("/?msg=Клиент+ещё+не+выложен.+Обратитесь+к+администратору.&err=1#download",
                                 status_code=303)
-    return FileResponse(path, filename=CLIENT_FILE, media_type="application/octet-stream")
+    return FileResponse(path, filename=os.path.basename(path), media_type="application/octet-stream")
 
 
 @router.get("/download/wireguard")

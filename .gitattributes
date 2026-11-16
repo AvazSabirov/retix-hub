@@ -1,0 +1,6 @@
+# Файлы Windows — с CRLF
+*.bat eol=crlf
+*.iss eol=crlf
+*.ps1 eol=crlf
+*.ico binary
+*.sh text eol=lf
