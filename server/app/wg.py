@@ -75,11 +75,14 @@ def setup_interface() -> None:
     run(["ip", "address", "replace", SERVER_CIDR, "dev", WG_IF])
     run(["ip", "link", "set", WG_IF, "up"])
     try:
+        with open("/proc/sys/net/ipv4/ip_forward") as f:
+            if f.read().strip() == "1":
+                return  # уже включён (обычно Docker) — писать и шуметь в журнале незачем
         with open("/proc/sys/net/ipv4/ip_forward", "w") as f:
             f.write("1")
     except OSError as e:
-        # Docker на хосте обычно уже включил ip_forward
-        log.warning("ip_forward не записан (%s) — проверьте sysctl на хосте", e)
+        log.warning("ip_forward выключен и не записан (%s): ПК компании не увидят друг друга — "
+                    "включите на хосте: sysctl -w net.ipv4.ip_forward=1", e)
 
 
 def current_peers() -> set[str]:
