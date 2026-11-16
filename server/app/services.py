@@ -5,8 +5,8 @@ import sqlite3
 import time
 
 from . import db, wg
-from .config import (NET_PREFIX, ONLINE_SECONDS, SERVER_IP, WG_ENDPOINT,
-                     WG_KEEPALIVE)
+from .config import (NET_PREFIX, ONLINE_SECONDS, RADMIN_PORT, SERVER_IP,
+                     WG_ENDPOINT, WG_KEEPALIVE)
 
 log = logging.getLogger("services")
 
@@ -94,6 +94,7 @@ def client_config(conn, dev, company) -> dict:
         "keepalive": WG_KEEPALIVE,
         "is_share_host": bool(dev["is_share_host"]),
         "share_ports": company["share_ports"],
+        "radmin_port": RADMIN_PORT,
         "share": {
             "ip": share["ip"],
             "hostname": share["hostname"],
@@ -116,6 +117,8 @@ def build_forward_rules(conn) -> list[str]:
         rules.append(f"-A RETIX_FWD -s {sub} -d {sub} -p icmp -j ACCEPT")
         ports = clean_ports(c["share_ports"]) or "445"
         rules.append(f"-A RETIX_FWD -s {sub} -d {sub} -p tcp -m multiport --dports {ports} -j ACCEPT")
+        # Radmin Viewer -> Radmin Server на кассах
+        rules.append(f"-A RETIX_FWD -s {sub} -d {sub} -p tcp --dport {RADMIN_PORT} -j ACCEPT")
     return rules
 
 

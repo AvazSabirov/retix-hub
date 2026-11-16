@@ -281,9 +281,9 @@ def run_scenarios(srv: ServerProc):
     a2 = Pc("a2", "BUH-01", "alpha", "Бухгалтерия")
     a3 = Pc("a3", "SPARE", "alpha", "Запасной")
     b1 = Pc("b1", "BETA-PC", "beta", "Beta PC")
-    # «сервисы» на ПК: 445 = SMB общей папки, 22 = любой другой порт
+    # «сервисы» на ПК: 445 = SMB общей папки, 4899 = Radmin Server, 22 = любой другой порт
     for ns in ("a1", "a2"):
-        for port in (445, 22):
+        for port in (445, 4899, 22):
             subprocess.Popen(f"ip netns exec {ns} nc -lk {port}", shell=True,
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     subprocess.Popen("ip netns exec srv nc -lk 2222", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -306,7 +306,8 @@ def run_scenarios(srv: ServerProc):
     a2.step()
     check("Бухгалтерия → PC1:445 (SMB) открыт", tcp("a2", a1.ip, 445))
     check("PC1 → Бухгалтерия:445 (SMB) открыт", tcp("a1", a2.ip, 445))
-    check("Бухгалтерия → PC1:22 закрыт (только ping и папки)", not tcp("a2", a1.ip, 22))
+    check("Бухгалтерия → PC1:4899 (Radmin Server) открыт", tcp("a2", a1.ip, 4899))
+    check("Бухгалтерия → PC1:22 закрыт (только ping, папки и Radmin)", not tcp("a2", a1.ip, 22))
 
     print("\n4. Изоляция компаний")
     check("Beta → PC1 alpha: ping не проходит", not ping("b1", a1.ip))
@@ -317,6 +318,7 @@ def run_scenarios(srv: ServerProc):
     nsx("b1", "ip route replace 203.0.113.0/24 dev wg-b1")
     check("Beta с подменённым конфигом → PC1 alpha: ping блокирует сервер", not ping("b1", a1.ip))
     check("Beta с подменённым конфигом → PC1:445 блокирует сервер", not tcp("b1", a1.ip, 445))
+    check("Beta с подменённым конфигом → PC1:4899 (Radmin) блокирует сервер", not tcp("b1", a1.ip, 4899))
 
     print("\n5. Интернет НЕ идёт через VPN")
     route = nsx("a2", "ip route get 8.8.8.8").stdout
