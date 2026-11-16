@@ -37,7 +37,7 @@ import requests
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
 
-VERSION = "1.0.7"
+VERSION = "1.0.8"
 APP_NAME = "RetixHub"          # служебное имя: папки, задачи, мьютекс
 APP_TITLE = "Retix Hub"        # то, что видит пользователь
 TUNNEL = "retixhub"
@@ -1229,6 +1229,18 @@ C = {
 }
 
 
+def work_area(win) -> tuple[int, int, int, int]:
+    """Рабочая область основного монитора без панели задач: (left, top, right, bottom)."""
+    if WINDOWS:
+        try:
+            r = wintypes.RECT()
+            if ctypes.windll.user32.SystemParametersInfoW(0x0030, 0, ctypes.byref(r), 0):   # SPI_GETWORKAREA
+                return r.left, r.top, r.right, r.bottom
+        except Exception:  # noqa: BLE001
+            pass
+    return 0, 0, win.winfo_screenwidth(), win.winfo_screenheight() - 48
+
+
 def dark_menu(parent) -> "tk.Menu":
     """Выпадающее меню в цветах приложения."""
     return tk.Menu(parent, tearoff=0, bg=C["head"], fg=C["text"], activebackground=C["sel"],
@@ -1627,6 +1639,8 @@ class App(tk.Tk):
         self.bind("<Unmap>", self._on_unmap)   # кнопка «свернуть» — тоже в трей, а не на панель задач
         if minimized:   # программа запускается в трей; окно — двойным щелчком по значку у часов
             self.after(100, self.hide)
+        else:
+            self.after(50, self.place_corner)
         if announce:    # запустили ярлыком — подсказать, где программа (при автозапуске — молча)
             self.after(1500, lambda: self.tray.notify(
                 APP_TITLE, "Retix Hub работает в трее (значок у часов). Двойной щелчок — открыть окно."))
@@ -1663,6 +1677,7 @@ class App(tk.Tk):
         h.add_command(label="О программе", command=self.about)
         self.company_menu = dark_menu(self)
         self.company_menu.configure(postcommand=self._fill_company_menu)   # список — при каждом открытии
+        self._company_var = tk.StringVar(self, "")
         self._forget_menu = None
         for title, menu in (("Система", m), ("Компания", self.company_menu), ("Справка", h)):
             b = tk.Label(bar, text=title, bg=C["bg"], fg=C["text"], padx=8, pady=3, font=("Segoe UI", 9),
@@ -1675,6 +1690,7 @@ class App(tk.Tk):
         # шапка: кнопка ON/OFF, имя ПК, IP, статус
         top = tk.Frame(self, bg=C["panel"], highlightthickness=1, highlightbackground=C["line"])
         top.pack(fill="x", padx=8, pady=(8, 6))
+        self.top_frame = top
         self.power = tk.Canvas(top, width=76, height=76, bg=C["panel"], highlightthickness=0, cursor="hand2")
         self.power.pack(side="left", padx=8, pady=8)
         self.power.bind("<Button-1>", lambda _e: self.toggle())
@@ -1697,6 +1713,8 @@ class App(tk.Tk):
         # сеть компании: заголовок группы + список компьютеров
         box = tk.Frame(self, bg=C["panel"], highlightthickness=1, highlightbackground=C["line"])
         box.pack(fill="both", expand=True, padx=8, pady=(0, 4))
+        self.list_box = box
+        self.compact = False   # список другим ПК скрыт администратором — окно только с шапкой
         self.group = tk.Frame(box, bg=C["head"], cursor="hand2")
         self.group.pack(fill="x")
         self.group_lbl = tk.Label(self.group, text="▼  —", bg=C["head"], fg=C["text"],
@@ -1833,12 +1851,23 @@ class App(tk.Tk):
             self.name_lbl.config(text=c.get("device_name") or socket.gethostname())
             self.ip_lbl.config(text=c.get("ip") or "—")
             hidden = c.get("show_peers") is False   # администратор скрыл список (сеть при этом та же)
+            self.set_compact(hidden)
             self.group_lbl.config(text=("▶  " if self.collapsed else "▼  ") + (c.get("company") or "—")
                                   + ("  · список скрыт администратором" if hidden else ""))
         elif status == Status.NEED_LOGIN:
             self.ip_lbl.config(text="—")
             self.group_lbl.config(text="▼  —")
+            self.set_compact(False)
         self.msg_lbl.config(text="" if status == Status.ONLINE else (text or ""))
+        if self.compact:   # окно по содержимому: пустую строку сообщения не показываем, длинную — целиком
+            if self.msg_lbl.cget("text"):
+                self.msg_lbl.pack(fill="x", pady=(0, 6))
+            else:
+                self.msg_lbl.pack_forget()
+            self.update_idletasks()
+            self.geometry(f"{max(self.winfo_width(), 320)}x{self.winfo_reqheight()}")
+            if self.state() == "normal":
+                self.place_corner()
         # значок в трее: зелёный — в сети, жёлтый — подключается, красный — VPN не работает (выключен, нет входа,
         # сервер недоступен, блок, ошибка)
         tray_color = {C["green"]: "green", C["orange"]: "orange"}.get(color, "red")
@@ -1870,6 +1899,7 @@ class App(tk.Tk):
     # --- окно и трей
     def show(self):
         self.deiconify()
+        self.place_corner()
         self.lift()
         try:
             self.attributes("-topmost", True)
@@ -1877,6 +1907,46 @@ class App(tk.Tk):
             self.focus_force()
         except tk.TclError:
             pass
+
+    def place_corner(self):
+        """Окно — в правый нижний угол рабочей области (над панелью задач), как у программ из трея."""
+        try:
+            self.update_idletasks()
+            w = max(self.winfo_width(), self.winfo_reqwidth()) if self.winfo_ismapped() else self.winfo_reqwidth()
+            h = self.winfo_height() if self.winfo_ismapped() and self.winfo_height() > 1 else self.winfo_reqheight()
+            g = re.match(r"(\d+)x(\d+)", self.geometry())
+            if g and int(g.group(1)) > 1:
+                w, h = int(g.group(1)), int(g.group(2))
+            # рамка окна Windows: заголовок и края (у невидимого окна берём обычные размеры)
+            border = max(self.winfo_rootx() - self.winfo_x(), 0) or 8
+            title = max(self.winfo_rooty() - self.winfo_y(), 0) or 31
+            left, top, right, bottom = work_area(self)
+            x = max(left, right - w - 2 * border - 4)
+            y = max(top, bottom - h - title - border - 4)
+            self.geometry(f"+{x}+{y}")
+        except tk.TclError:
+            pass
+
+    def set_compact(self, compact: bool):
+        """Нет доступа к списку ПК — окно ниже: только шапка (кнопка, имя, IP, статус) и строка сообщений."""
+        if compact == self.compact:
+            return
+        self.compact = compact
+        width = self.winfo_width() if self.winfo_width() > 1 else 360
+        if compact:
+            self.list_box.pack_forget()
+            self.resizable(False, False)
+            self.minsize(320, 1)
+            self.update_idletasks()
+            self.geometry(f"{width}x{self.winfo_reqheight()}")
+        else:
+            self.list_box.pack(fill="both", expand=True, padx=8, pady=(0, 4), after=self.top_frame)
+            self.msg_lbl.pack(fill="x", pady=(0, 6))
+            self.minsize(320, 380)
+            self.resizable(False, True)
+            self.geometry(f"{width}x620")
+        if self.state() == "normal":
+            self.place_corner()
 
     def _on_unmap(self, event):
         if event.widget is self and self.tray.ok:
@@ -1926,12 +1996,13 @@ class App(tk.Tk):
             self._forget_menu.destroy()
             self._forget_menu = None
         profiles = self.state_.profiles()
+        current = next((p["key"] for p in profiles if p["active"]), "")
+        self._company_var.set(current)
         for p in profiles:
             title = self._company_title(p)
-            if p["active"]:
-                m.add_command(label=f"●  {title}  (сейчас)", state="disabled")
-            else:
-                m.add_command(label=f"     {title}", command=lambda k=p["key"], t=title: self.switch_company(k, t))
+            m.add_radiobutton(label=title, variable=self._company_var, value=p["key"], selectcolor=C["green"],
+                              command=(lambda: None) if p["active"] else
+                              (lambda k=p["key"], t=title, cur=current: self.switch_company(k, t, cur)))
         if profiles:
             m.add_separator()
         m.add_command(label="Добавить компанию…", command=lambda: self.show_login(add=True))
@@ -1943,10 +2014,11 @@ class App(tk.Tk):
                 self._forget_menu.add_command(label=title, command=lambda k=p["key"], t=title: self.forget_company(k, t))
             m.add_cascade(label="Убрать из списка", menu=self._forget_menu)
 
-    def switch_company(self, key: str, title: str):
+    def switch_company(self, key: str, title: str, current: str = ""):
         if not messagebox.askyesno(APP_TITLE, f"Переключиться на «{title}»?\n\n"
                                               "Сеть текущей компании отключится — компьютер будет в сети выбранной. "
                                               "Вернуться можно так же, через меню «Компания».", parent=self):
+            self._company_var.set(current)   # отказались — отметка остаётся на текущей
             return
         for win in list(self.chats.values()):   # переписка — с ПК прежней компании
             win.close()
