@@ -22,6 +22,9 @@
       <label><span>Название</span><input type="text" name="name" value="{{ company.name }}"></label>
       <label><span>Лимит устройств</span><input type="number" name="max_devices" value="{{ company.max_devices }}" min="1" max="253"></label>
       <label class="check"><input type="checkbox" name="is_active" value="1" {{ 'checked' if company.is_active }}> Компания активна</label>
+      <label class="check"><input type="checkbox" name="require_approval" value="1" {{ 'checked' if company.require_approval }}> Новые ПК ждут одобрения</label>
+      <p class="muted">Уже подключённые ПК остаются в сети. Новые — только после «Одобрить» в списке компьютеров
+        (здесь или в кабинете компании).</p>
       <button class="primary">Сохранить</button>
     </form>
   </div>

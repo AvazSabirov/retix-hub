@@ -3,18 +3,19 @@
 <div class="card">
   <h2>Компании</h2>
   <table>
-    <tr><th>Логин</th><th>Название</th><th>Подсеть</th><th>Онлайн</th><th>Ждут</th><th>Лимит</th><th>Статус</th><th></th></tr>
+    <tr><th>Логин</th><th>Название</th><th>Подсеть</th><th>Онлайн</th><th>Ждут</th><th>Одобрение</th><th>Лимит</th><th>Статус</th><th></th></tr>
     {% for c in companies %}
     <tr>
       <td><b>{{ c.login }}</b></td><td>{{ c.name }}</td><td><code>{{ c.subnet }}</code></td>
       <td>{{ c.online }} / {{ c.total }}</td>
       <td>{% if c.pending %}<span class="tag warn">{{ c.pending }}</span>{% else %}—{% endif %}</td>
+      <td>{{ 'да' if c.require_approval else 'нет' }}</td>
       <td>{{ c.max_devices }}</td>
       <td>{% if c.is_active %}<span class="tag share">активна</span>{% else %}<span class="tag bad">отключена</span>{% endif %}</td>
       <td><a class="btn" href="/admin/companies/{{ c.id }}">Открыть</a></td>
     </tr>
     {% else %}
-    <tr><td colspan="8" class="muted">Компаний пока нет</td></tr>
+    <tr><td colspan="9" class="muted">Компаний пока нет</td></tr>
     {% endfor %}
   </table>
 </div>
@@ -26,6 +27,8 @@
     <label><span>Пароль кабинета (для админа компании)</span><input type="password" name="cabinet_password" minlength="6" required></label>
     <label><span>Пароль подключения (вводят в клиенте на ПК)</span><input type="password" name="join_password" minlength="6" required></label>
     <label><span>Лимит устройств</span><input type="number" name="max_devices" value="20" min="1" max="253"></label>
+    <input type="hidden" name="approval_form" value="1">
+    <label class="check"><input type="checkbox" name="require_approval" value="1" checked> Новые ПК ждут одобрения</label>
     <button class="primary">Создать</button>
   </form>
 </div>

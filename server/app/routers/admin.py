@@ -69,8 +69,11 @@ def index(request: Request, conn=Depends(require_admin), msg: str = "", err: int
 
 @router.post("/companies")
 def create_company(login: str = Form(...), name: str = Form(""), cabinet_password: str = Form(...),
-                   join_password: str = Form(...), max_devices: int = Form(20), conn=Depends(require_admin)):
+                   join_password: str = Form(...), max_devices: int = Form(20),
+                   approval_form: str = Form(""), require_approval: str = Form(""), conn=Depends(require_admin)):
     login = login.strip()
+    # галочка «ПК ждут одобрения» есть в форме (approval_form) — берём её; без формы — одобрение включено
+    approval = (1 if require_approval else 0) if approval_form else 1
     if not services.LOGIN_RE.match(login):
         return redirect("/admin", "Логин: 3–32 символа, латиница, цифры, _ . -", err=True)
     if len(cabinet_password) < 6 or len(join_password) < 6:
@@ -83,10 +86,10 @@ def create_company(login: str = Form(...), name: str = Form(""), cabinet_passwor
             return redirect("/admin", "Свободных подсетей нет", err=True)
         cur = conn.execute(
             "INSERT INTO companies(login, name, cabinet_pass_hash, join_pass_hash, subnet_index, max_devices, "
-            "require_approval) VALUES (?,?,?,?,?,?,1)",  # новые ПК подключаются после одобрения в кабинете
+            "require_approval) VALUES (?,?,?,?,?,?,?)",
             (login, name.strip()[:100], hash_pw(cabinet_password), hash_pw(join_password), idx,
-             max(1, min(max_devices, 253))))
-        services.audit(conn, cur.lastrowid, "company_create", login)
+             max(1, min(max_devices, 253)), approval))
+        services.audit(conn, cur.lastrowid, "company_create", f"{login} approval={bool(approval)}")
         conn.commit()
         services.reconcile(conn)
     return redirect("/admin", f"Компания {login} создана, подсеть 10.66.{idx}.0/24")
@@ -106,12 +109,14 @@ def company_page(request: Request, company_id: int, conn=Depends(require_admin),
 
 @router.post("/companies/{company_id}/update")
 def update_company(company_id: int, name: str = Form(""), max_devices: int = Form(20),
-                   is_active: str = Form(""), conn=Depends(require_admin)):
+                   is_active: str = Form(""), require_approval: str = Form(""), conn=Depends(require_admin)):
     c = get_company(conn, company_id)
     with db.write_lock:
-        conn.execute("UPDATE companies SET name=?, max_devices=?, is_active=? WHERE id=?",
-                     (name.strip()[:100], max(1, min(max_devices, 253)), 1 if is_active else 0, c["id"]))
-        services.audit(conn, c["id"], "company_update", f"active={bool(is_active)} max={max_devices}")
+        conn.execute("UPDATE companies SET name=?, max_devices=?, is_active=?, require_approval=? WHERE id=?",
+                     (name.strip()[:100], max(1, min(max_devices, 253)), 1 if is_active else 0,
+                      1 if require_approval else 0, c["id"]))
+        services.audit(conn, c["id"], "company_update",
+                       f"active={bool(is_active)} max={max_devices} approval={bool(require_approval)}")
         conn.commit()
         services.reconcile(conn)
     return redirect(f"/admin/companies/{c['id']}", "Сохранено")
