@@ -438,3 +438,9 @@ def test_build_conf_format():
     conf = rc.Tunnel.build_conf(cfg, "P" * 43 + "=")
     assert conf.splitlines()[:3] == ["[Interface]", "PrivateKey = " + "P" * 43 + "=", "Address = 10.66.1.2/32"]
     assert "PersistentKeepalive = 25" in conf
+
+
+def test_smb_check_closed_port():
+    # на 127.0.0.1 порт 445 закрыт -> понятная причина, а не пустой ответ
+    msg = rc.smb_check("127.0.0.1", timeout=0.5)
+    assert msg.startswith("Компьютер не отвечает") and "\\\\" not in msg
