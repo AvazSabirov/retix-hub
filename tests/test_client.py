@@ -69,6 +69,16 @@ _n = [0]
 @pytest.fixture()
 def company(server):
     """Новая компания на каждый тест + сессия её кабинета."""
+    return _new_company(server)
+
+
+@pytest.fixture()
+def company2(server):
+    """Вторая компания (переключение между компаниями)."""
+    return _new_company(server)
+
+
+def _new_company(server):
     _n[0] += 1
     login = f"co{_n[0]}"
     server.admin.post(BASE + "/admin/companies", data={"login": login, "name": login, "cabinet_password": "cab123",
@@ -604,7 +614,7 @@ def test_update_with_foreign_signature_rejected(make_client, company, releases, 
     u = releases.updater(c)
     assert u.check() is None and releases.launched == []
     assert c.state.get("update_state") == "error:9.9.9"
-    assert c.state.get("update_pubkey") == ""            # зашитый ключ главнее: сервер его не подменит
+    assert c.state.get("update_pins") == {}               # зашитый ключ главнее: сервер его не подменит
 
 
 def test_update_key_pinned_on_first_contact(make_client, company, releases, monkeypatch):
@@ -613,12 +623,12 @@ def test_update_key_pinned_on_first_contact(make_client, company, releases, monk
     data = releases.upload("9.9.9")
     u = releases.updater(c)
     assert u.check() == "9.9.9" and releases.launched[0].read_bytes() == data
-    assert c.state.get("update_pubkey") == releases.pub                         # запомнен
+    assert c.state.get("update_pins") == {BASE: releases.pub}                   # запомнен для этого сервера
     # сервер сменил ключ (или подменён) — запомненный не меняется, чужая подпись не ставится
     from cryptography.hazmat.primitives import serialization
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
     other = Ed25519PrivateKey.generate().public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
-    c.state.set(update_pubkey=__import__("base64").b64encode(other).decode(), update_attempt={})
+    c.state.set(update_pins={BASE: __import__("base64").b64encode(other).decode()}, update_attempt={})
     assert u.check() is None and len(releases.launched) == 1
     assert c.state.get("update_state") == "error:9.9.9"
 
@@ -680,9 +690,94 @@ def test_update_result_after_restart(tmp_path, monkeypatch):
     assert st.get("update_state") == "installing:99.0.0"
 
 
+# ================================================================== несколько компаний: переключение
+
+def _devices_of(company):
+    return company_peers(company)
+
+
+def test_add_second_company_and_switch(make_client, company, company2):
+    c = make_client(); login(c, company, name="Бух"); c.step(2)
+    ip_a, key_a = c.w.cfg["ip"], c.state.keypair()[1]
+    assert c.w.login(BASE, company2.login, "join123", "Бух", True) is None   # добавить вторую
+    st = c.step(2)
+    assert st["status"] == rc.Status.ONLINE and c.w.cfg["subnet"] != rc.ipaddress.IPv4Network(ip_a + "/24", False).with_prefixlen
+    ip_b, key_b = c.w.cfg["ip"], c.state.keypair()[1]
+    assert key_b != key_a and ip_b.split(".")[2] != ip_a.split(".")[2]      # свой ключ — для сервера другой ПК
+    assert f"Address = {ip_b}/32" in c.tunnel.conf and c.fw[-1][0] == c.w.cfg["subnet"]
+    profiles = c.state.profiles()
+    assert [p["active"] for p in profiles] == [True, False]
+    assert profiles[1]["company_login"] == company.login and profiles[1]["company_name"] == company.login
+    # обратно в первую: тот же ключ, тот же IP, тот же ПК в кабинете — без пароля
+    assert c.w.switch_to(profiles[1]["key"]) is None
+    assert c.step(2)["status"] == rc.Status.ONLINE
+    assert c.w.cfg["ip"] == ip_a and c.state.keypair()[1] == key_a and f"Address = {ip_a}/32" in c.tunnel.conf
+    assert len(_devices_of(company)) == 1 and len(_devices_of(company2)) == 1
+    # и ещё раз во вторую: токен у неё сохранился (ротация не мешает)
+    key2 = next(p["key"] for p in c.state.profiles() if not p["active"])
+    assert c.w.switch_to(key2) is None and c.step(2)["status"] == rc.Status.ONLINE and c.w.cfg["ip"] == ip_b
+
+
+def test_add_company_wrong_password_keeps_current(make_client, company, company2):
+    c = make_client(); login(c, company); c.step(2)
+    ip, token = c.w.cfg["ip"], c.state.get("token")
+    assert "Неверный" in c.w.login(BASE, company2.login, "wrong", "PC", True)
+    assert c.state.get("company_login") == company.login and c.state.get("token") == token
+    assert c.state.profiles() == [p for p in c.state.profiles() if p["active"]]   # ничего лишнего не сохранилось
+    assert c.step()["status"] == rc.Status.ONLINE and c.w.cfg["ip"] == ip
+
+
+def test_login_again_into_listed_company_reuses_key(make_client, company, company2):
+    c = make_client(); login(c, company); c.step(2)
+    key_a = c.state.keypair()[1]
+    c.w.login(BASE, company2.login, "join123", "PC", True); c.step(2)
+    assert c.w.login(BASE, company.login, "join123", "PC", True) is None     # через «Добавить», а она уже есть
+    c.step(2)
+    assert c.state.keypair()[1] == key_a and len(_devices_of(company)) == 1   # не дубль, а тот же ПК
+
+
+def test_forget_company_revokes_its_login(make_client, company, company2):
+    c = make_client(); login(c, company); c.step(2)
+    c.w.login(BASE, company2.login, "join123", "PC", True); c.step(2)
+    saved = next(p for p in c.state.profiles() if not p["active"])
+    old_token = rc.unprotect(c.state.data["profiles"][saved["key"]]["token"])
+    c.w.forget_company(saved["key"])
+    assert [p["company_login"] for p in c.state.profiles()] == [company2.login]
+    assert requests.get(BASE + "/api/me", headers={"Authorization": f"Bearer {old_token}"}).status_code == 401
+    c.w.forget_company(c.state.current_key())                                # текущую так не убрать
+    assert c.state.get("company_login") == company2.login
+
+
+def test_logout_then_login_other_company_works(make_client, company, company2):
+    c = make_client(); login(c, company); c.step(2)
+    c.w.logout()
+    assert c.w.login(BASE, company2.login, "join123", "PC", True) is None    # раньше: 409 «ключ в другой компании»
+    assert c.step(2)["status"] == rc.Status.ONLINE
+    assert [p["company_login"] for p in c.state.profiles()] == [company2.login]   # вышли — в списке не держим
+
+
+def test_update_key_pinned_per_server(tmp_path):
+    st = rc.State(tmp_path / "s.json")
+    st.set(update_pubkey="A" * 43 + "=")                                     # 1.0.6: один запомненный ключ
+    assert (st.get("update_pins") or {}) == {}                                 # ещё не по серверам — берётся старый
+    st.set(update_pins={"https://a": "B" * 43 + "="})
+    assert st.get("update_pins")["https://a"] == "B" * 43 + "="
+
+
 def test_launch_installer_detached(monkeypatch):
     calls = []
     monkeypatch.setattr(rc.subprocess, "Popen", lambda args, **kw: calls.append(args))
     rc.launch_installer(Path("C:/ProgramData/RetixHub/update/RetixHub_Setup_1.0.6.exe"))
     args = calls[0]
     assert args[:4] == ["cmd", "/c", "start", ""] and "/VERYSILENT" in args and args[-1] == "/AUTOUPDATE=1"
+
+
+def test_hidden_peers_in_client(make_client, company):
+    a = make_client("A1"); login(a, company, name="Офис"); a.step(2)
+    b = make_client("B1"); login(b, company, name="Касса"); b.step(2)
+    company.cab.post(BASE + f"/cabinet/devices/{b.w.cfg['device_id']}/peers_off")
+    b.step(); a.step()
+    assert b.w.cfg["show_peers"] is False and [p["name"] for p in b.peers] == ["Касса"]   # только он сам
+    assert {p["name"] for p in a.peers} == {"Офис", "Касса"}
+    assert b.w.send_message(a.w.cfg["device_id"], "привет") and a.w.send_message(b.w.cfg["device_id"], "касса?") is None
+    assert b.step()["status"] == rc.Status.ONLINE                                     # сеть работает как раньше

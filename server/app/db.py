@@ -37,6 +37,7 @@ CREATE TABLE IF NOT EXISTS devices (
     is_share_host   INTEGER NOT NULL DEFAULT 0,
     is_blocked      INTEGER NOT NULL DEFAULT 0,
     is_approved     INTEGER NOT NULL DEFAULT 1,
+    show_peers      INTEGER NOT NULL DEFAULT 1,  -- видит в программе другие ПК компании и может им писать
     client_version  TEXT NOT NULL DEFAULT '',
     last_handshake  INTEGER NOT NULL DEFAULT 0,
     endpoint        TEXT NOT NULL DEFAULT '',
@@ -112,6 +113,7 @@ MIGRATIONS = [
     ("devices", "token_set_at", "INTEGER NOT NULL DEFAULT 0"),
     ("devices", "update_state", "TEXT NOT NULL DEFAULT ''"),
     ("devices", "update_state_at", "TEXT"),
+    ("devices", "show_peers", "INTEGER NOT NULL DEFAULT 1"),
 ]
 
 

@@ -1,6 +1,6 @@
 {% macro devices_table(devices, prefix) %}
 <table>
-  <tr><th>Статус</th><th>Имя</th><th>Компьютер</th><th>IP</th><th>Последняя связь</th><th>Клиент</th><th>Действия</th></tr>
+  <tr><th>Статус</th><th>Имя</th><th>Компьютер</th><th>IP</th><th>Последняя связь</th><th>Клиент</th><th title="Видит ли этот ПК в программе другие компьютеры и может ли им писать. Сеть (папки, Radmin, ping) от этого не меняется">Видит ПК</th><th>Действия</th></tr>
   {% for d in devices %}
   <tr>
     <td>
@@ -17,6 +17,11 @@
     <td><code>{{ d.ip }}</code></td>
     <td class="muted">{{ d.last_handshake | ago }}{% if d.endpoint %}<br><small>{{ d.endpoint }}</small>{% endif %}</td>
     <td class="muted">{{ d.client_version or '—' }}</td>
+    <td>
+      <form method="post" action="{{ prefix }}{{ d.id }}/{{ 'peers_off' if d.show_peers else 'peers_on' }}">
+        <button class="small" title="{{ 'Скрыть другие компьютеры в программе этого ПК (сеть останется)' if d.show_peers else 'Показать этому ПК другие компьютеры в программе' }}">{{ 'да' if d.show_peers else 'нет' }}</button>
+      </form>
+    </td>
     <td class="actions">
       {% if d.status == 'pending' %}
         <form method="post" action="{{ prefix }}{{ d.id }}/approve"><button class="small primary">Одобрить</button></form>
@@ -30,7 +35,7 @@
     </td>
   </tr>
   {% else %}
-  <tr><td colspan="7" class="muted">Устройств пока нет. Установите клиент на компьютер и войдите логином компании.</td></tr>
+  <tr><td colspan="8" class="muted">Устройств пока нет. Установите клиент на компьютер и войдите логином компании.</td></tr>
   {% endfor %}
 </table>
 {% endmacro %}

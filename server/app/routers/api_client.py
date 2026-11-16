@@ -161,9 +161,10 @@ def peers(ctx=Depends(current_device)):
     conn, dev, company = ctx
     if services.device_status(dev) != "active":
         raise HTTPException(403, "Устройство не активно")
+    hidden = not dev["show_peers"]   # нет доступа — в программе только сам ПК (сеть при этом та же)
     result = []
     for d in services.list_devices(conn, company["id"]):
-        if d["status"] != "active":
+        if d["status"] != "active" or (hidden and d["id"] != dev["id"]):
             continue
         result.append({
             "id": d["id"],
@@ -176,7 +177,7 @@ def peers(ctx=Depends(current_device)):
             "is_share_host": bool(d["is_share_host"]),
             "is_me": d["id"] == dev["id"],
         })
-    return {"company": company["name"] or company["login"], "peers": result}
+    return {"company": company["name"] or company["login"], "peers": result, "peers_hidden": hidden}
 
 
 def _require_active(dev):
@@ -189,6 +190,8 @@ def send_message(data: MessageIn, ctx=Depends(current_device)):
     """Сообщение другому ПК своей компании. Доставляется, когда получатель спросит /api/messages."""
     conn, dev, company = ctx
     _require_active(dev)
+    if not dev["show_peers"]:
+        raise HTTPException(403, "Администратор компании не дал этому компьютеру доступ к другим компьютерам")
     text = data.text.strip()
     if not text:
         raise HTTPException(400, "Пустое сообщение")

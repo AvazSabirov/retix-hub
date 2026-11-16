@@ -1,16 +1,16 @@
 name: Клиент Windows
 
-# Сборка RetixHub.exe и установщика RetixHub_Setup_<версия>.exe (client/build.bat).
-#  - push в любую ветку с изменениями в client/ -> установщик в Artifacts запуска;
-#  - push в main с новой VERSION (релиза v<версия> ещё нет) -> GitHub Release v<версия> создаётся сам:
+# Сборка RetixHub.exe и установщика RetixHub_Setup_<версия>.exe (client/build.bat) — ТОЛЬКО для выпуска:
+#  - push в main с новой VERSION (релиза v<версия> ещё нет) -> сборка и GitHub Release v<версия>:
 #    поднять VERSION в client/retixhub_client.py, дописать client/CHANGELOG.md, влить в main;
-#  - тег v<версия> (например v1.0.0) -> ещё и GitHub Release с установщиком;
-#  - Release, созданный вручную на GitHub (Releases -> Draft a new release, тег v<версия>)
-#    -> установщик прикрепляется к нему.
-#    Тег должен совпадать с VERSION в client/retixhub_client.py.
+#    та же версия уже выпущена -> ничего не собирается (без повторных сборок);
+#  - тег v<версия> (например v1.0.0) -> сборка и Release (тег = VERSION);
+#  - Release, созданный вручную на GitHub (тег v<версия>) -> установщик прикрепляется к нему;
+#  - Actions -> «Клиент Windows» -> Run workflow -> сборка в Artifacts (проверить без выпуска).
+# Ветки (кроме main) установщик не собирают.
 on:
   push:
-    branches: ['**']
+    branches: [main]
     tags: ['v*']
     paths:
       - 'client/**'
@@ -20,11 +20,56 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
+  check:
+    # быстро и на Linux: нужна ли сборка вообще
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      build: ${{ steps.v.outputs.build }}
+      release: ${{ steps.v.outputs.release }}
+      tag: ${{ steps.v.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        shell: bash
+        env:
+          REL_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          v=$(sed -n 's/^VERSION = "\([0-9.]*\)"$/\1/p' client/retixhub_client.py | head -n 1)
+          [ -n "$v" ] || { echo "Не найден VERSION в client/retixhub_client.py"; exit 1; }
+          echo "VERSION = $v"
+          build=false; release=false; tag="v$v"
+          case "$GITHUB_EVENT_NAME" in
+            push)
+              if [ "$GITHUB_REF_TYPE" = tag ]; then
+                [ "$GITHUB_REF_NAME" = "v$v" ] || { echo "Тег $GITHUB_REF_NAME не совпадает с VERSION = $v"; exit 1; }
+                build=true; release=true
+              elif git ls-remote --exit-code --tags origin "refs/tags/v$v" >/dev/null; then
+                echo "Релиз v$v уже есть — сборка не нужна. Для выпуска поднимите VERSION."
+              else
+                build=true; release=true
+              fi ;;
+            release)
+              tag="$REL_TAG"
+              [ "$tag" = "v$v" ] || { echo "Тег Release $tag не совпадает с VERSION = $v"; exit 1; }
+              build=true; release=true ;;
+            workflow_dispatch)
+              build=true ;;          # только Artifacts, без выпуска
+          esac
+          { echo "version=$v"; echo "build=$build"; echo "release=$release"; echo "tag=$tag"; } >> "$GITHUB_OUTPUT"
+
   build:
+    needs: check
+    if: needs.check.outputs.build == 'true'
     runs-on: windows-2022
+    permissions:
+      contents: write          # только здесь: создать Release и приложить установщик
+    concurrency:
+      group: client-release-${{ needs.check.outputs.version }}
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
 
@@ -41,31 +86,19 @@ jobs:
           }
           & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /? | Select-Object -First 1
 
-      - name: Версия
-        id: ver
+      - name: Описание релиза
         shell: pwsh
+        env:
+          VER: ${{ needs.check.outputs.version }}
         run: |
-          $v = (Select-String -Path client/retixhub_client.py -Pattern '^VERSION = "([0-9.]+)"').Matches[0].Groups[1].Value
-          "version=$v" >> $env:GITHUB_OUTPUT
-          Write-Host "VERSION = $v"
-          if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -ne "v$v") {
-            throw "Тег $env:GITHUB_REF_NAME не совпадает с VERSION = $v в client/retixhub_client.py"
-          }
-          # релиз: тег v*, опубликованный вручную Release, или новая версия в main
-          $release = 'false'
-          if ($env:GITHUB_REF_TYPE -eq 'tag') { $release = 'true' }
-          elseif ($env:GITHUB_REF -eq 'refs/heads/main' -and $env:GITHUB_EVENT_NAME -eq 'push') {
-            $exists = git ls-remote --tags origin "refs/tags/v$v"
-            if (-not $exists) { $release = 'true' } else { Write-Host "Релиз v$v уже есть — только сборка" }
-          }
-          "release=$release" >> $env:GITHUB_OUTPUT
-          # описание релиза: раздел этой версии из client/CHANGELOG.md
+          $v = $env:VER
+          # раздел этой версии из client/CHANGELOG.md
           $text = Get-Content client/CHANGELOG.md -Raw -Encoding UTF8
           $m = [regex]::Match($text, "(?ms)^## $([regex]::Escape($v))\s*\r?\n(.*?)(?=^## |\z)")
           $notes = if ($m.Success) { $m.Groups[1].Value.Trim() } else { "" }
           $body = "## Что нового`n`n$notes`n`n---`n`nУстановщик клиента Retix Hub для Windows 10/11 (x64). WireGuard внутри — ставится сам, если его нет.`n`n" +
-                  "На сервер: положите ``RetixHub_Setup_$v.exe`` в ``/root/hub/data/downloads/`` — сайт отдаст его по кнопке «Скачать».`n`n" +
-                  "Тихая установка: ``RetixHub_Setup_$v.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART``"
+                  "Выпуск на ПК: суперадмин → **Обновления** → загрузить ``RetixHub_Setup_$v.exe`` → опубликовать. ПК обновятся сами.`n`n" +
+                  "Тихая установка вручную: ``RetixHub_Setup_$v.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART``"
           Set-Content -Path release_notes.md -Value $body -Encoding UTF8
 
       - name: Сборка (build.bat)
@@ -74,16 +107,16 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: RetixHub_Setup_${{ steps.ver.outputs.version }}
+          name: RetixHub_Setup_${{ needs.check.outputs.version }}
           path: client/dist/RetixHub_Setup_*.exe
           if-no-files-found: error
 
       - name: Release
-        if: steps.ver.outputs.release == 'true'
+        if: needs.check.outputs.release == 'true'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v${{ steps.ver.outputs.version }}
+          tag_name: ${{ needs.check.outputs.tag }}
           target_commitish: ${{ github.sha }}
-          name: Retix Hub ${{ steps.ver.outputs.version }}
+          name: Retix Hub ${{ needs.check.outputs.version }}
           files: client/dist/RetixHub_Setup_*.exe
           body_path: release_notes.md
