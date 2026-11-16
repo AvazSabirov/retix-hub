@@ -5,7 +5,7 @@ import sqlite3
 import time
 
 from . import db, wg
-from .config import (NET_PREFIX, ONLINE_SECONDS, RADMIN_PORT, SERVER_IP,
+from .config import (NET_PREFIX, OFFLINE_AFTER_SECONDS, ONLINE_SECONDS, RADMIN_PORT, SERVER_IP,
                      WG_ENDPOINT, WG_KEEPALIVE)
 
 log = logging.getLogger("services")
@@ -48,7 +48,11 @@ def clean_ports(ports: str) -> str | None:
 
 
 def is_online(dev) -> bool:
-    return bool(dev["last_handshake"]) and time.time() - dev["last_handshake"] < ONLINE_SECONDS
+    """В сети = сессия WireGuard жива (handshake) И от ПК недавно приходил трафик.
+    По одному handshake выключенный ПК ещё до 3 минут выглядел бы «в сети»."""
+    now = time.time()
+    return (bool(dev["last_handshake"]) and now - dev["last_handshake"] < ONLINE_SECONDS
+            and now - dev["last_rx_at"] < OFFLINE_AFTER_SECONDS)
 
 
 def device_status(dev) -> str:

@@ -12,13 +12,18 @@ DUMP_EVERY = int(os.getenv("MONITOR_EVERY", "10"))  # сек
 RECONCILE_EVERY = 300  # сек — лечит ручные изменения wg / iptables
 
 
-def update_handshakes(conn, peers: list[dict]) -> int:
-    """Записывает в базу время последнего handshake и endpoint каждого пира."""
+def update_handshakes(conn, peers: list[dict], now: int | None = None) -> int:
+    """Записывает в базу время последнего handshake, endpoint и принятый трафик каждого пира.
+    Счётчик rx изменился — от ПК пришли пакеты (keepalive каждые 25 с), last_rx_at = сейчас."""
     if not peers:
         return 0
+    now = int(time.time()) if now is None else now
     conn.executemany(
-        "UPDATE devices SET last_handshake=?, endpoint=? WHERE public_key=?",
-        [(p["latest_handshake"], p["endpoint"], p["public_key"]) for p in peers])
+        "UPDATE devices SET last_handshake=?, endpoint=?, "
+        "last_rx_at=CASE WHEN ?>0 AND ?<>rx_bytes THEN ? ELSE last_rx_at END, rx_bytes=? "
+        "WHERE public_key=?",
+        [(p["latest_handshake"], p["endpoint"], p["rx"], p["rx"], now, p["rx"], p["public_key"])
+         for p in peers])
     conn.commit()
     return len(peers)
 
