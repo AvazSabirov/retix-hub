@@ -36,7 +36,13 @@ docker logs -f retixhub  # «Retix Hub запущен, server pubkey …»
 ufw allow 51820/udp       # если включён ufw
 ```
 
-nginx: пример в `server/nginx-hub.retix.uz.conf` (SSL через certbot). API слушает только `127.0.0.1:8100`.
+nginx: API слушает только `127.0.0.1:8100`, наружу — через nginx. Конфиг `server/nginx-hub.retix.uz.conf`
+(только HTTP) кладётся отдельным файлом, SSL добавляет certbot — другие сайты на сервере не затрагиваются:
+```bash
+cp server/nginx-hub.retix.uz.conf /etc/nginx/conf.d/hub.retix.uz.conf
+nginx -t && systemctl reload nginx
+certbot --nginx -d hub.retix.uz --redirect
+```
 
 Проверка на сервере:
 ```bash
@@ -63,7 +69,7 @@ sqlite3 /root/hub/vpn.db 'select login, subnet_index from companies'
 | `https://hub.retix.uz/admin` | суперадмин (ссылки на главной нет) |
 | `https://hub.retix.uz/download/client` | скачать клиент — положите `RetixHub_Setup_<версия>.exe` в `/root/hub/downloads/` |
 
-DNS: A-запись `hub.retix.uz` → IP сервера. SSL: `certbot --nginx -d hub.retix.uz`.
+DNS: A-запись `hub.retix.uz` → IP сервера. SSL: см. выше (`certbot --nginx`).
 Порт WireGuard (UDP 51820) идёт на тот же адрес — клиент подключается к `hub.retix.uz:51820`.
 
 ## 2. Кабинеты
