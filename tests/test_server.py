@@ -732,3 +732,43 @@ class TestHardening:
         row = conn.execute("SELECT token_hash, token_next_hash, token_set_at FROM devices").fetchone()
         assert tuple(row) == ("h", None, 0)
         conn.execute("SELECT COUNT(*) FROM token_history").fetchone()
+
+
+class TestAdminApprovalToggle:
+    def _approval(self, cid):
+        from app import db
+        return db.connect().execute("SELECT require_approval FROM companies WHERE id=?", (cid,)).fetchone()[0]
+
+    def test_create_form_has_checkbox_on_by_default(self, ctx):
+        page = ctx.admin.get("/admin").text
+        assert 'name="require_approval" value="1" checked' in page and 'name="approval_form"' in page
+
+    def test_create_with_and_without_approval(self, ctx):
+        base = {"cabinet_password": "cab123", "join_password": "join123", "approval_form": "1"}
+        ctx.admin.post("/admin/companies", data=base | {"login": "withap", "require_approval": "1"})
+        ctx.admin.post("/admin/companies", data=base | {"login": "noap"})          # галочка снята
+        ctx.admin.post("/admin/companies", data={"login": "plain", "cabinet_password": "cab123",
+                                                  "join_password": "join123"})  # без формы — включено
+        from app import db
+        rows = dict(db.connect().execute("SELECT login, require_approval FROM companies").fetchall())
+        assert rows == {"withap": 1, "noap": 0, "plain": 1}
+        assert ctx.register("noap")["status"] == "active"
+        assert ctx.register("withap")["status"] == "pending"
+
+    def test_toggle_on_company_page(self, ctx, net):
+        cid = ctx.company("firma1")                       # одобрение выключено
+        old = ctx.register("firma1", "OLD")
+        page = ctx.admin.get(f"/admin/companies/{cid}").text
+        assert "> Новые ПК ждут одобрения" in page and 'value="1" checked> Новые ПК ждут одобрения' not in page
+        ctx.admin.post(f"/admin/companies/{cid}/update",
+                       data={"name": "firma1", "max_devices": 20, "is_active": "1", "require_approval": "1"})
+        assert self._approval(cid) == 1
+        assert 'value="1" checked> Новые ПК ждут одобрения' in ctx.admin.get(f"/admin/companies/{cid}").text
+        new = ctx.register("firma1", "NEW")
+        assert new["status"] == "pending" and new["_key"] not in net["peers"]
+        assert old["_key"] in net["peers"]                # уже подключённые остаются в сети
+        ctx.admin.post(f"/admin/companies/{cid}/devices/{new['device_id']}/approve")
+        assert new["_key"] in net["peers"]
+        ctx.admin.post(f"/admin/companies/{cid}/update", data={"name": "firma1", "max_devices": 20, "is_active": "1"})
+        assert self._approval(cid) == 0
+        assert "approval=True" in ctx.admin.get(f"/admin/companies/{cid}").text   # в журнале
