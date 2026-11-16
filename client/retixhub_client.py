@@ -37,7 +37,7 @@ import requests
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
 
-VERSION = "1.0.9"
+VERSION = "1.0.10"
 APP_NAME = "RetixHub"          # служебное имя: папки, задачи, мьютекс
 APP_TITLE = "Retix Hub"        # то, что видит пользователь
 TUNNEL = "retixhub"
@@ -1222,9 +1222,11 @@ class Worker(threading.Thread):
 # (в т.ч. after()) может «уронить» программу без следа в журнале.
 
 C = {
-    "bg": "#0d1117", "panel": "#131a23", "head": "#1a2330", "line": "#232e3d", "sel": "#1d4a74",
-    "hover": "#1f2a38", "text": "#e3e9f1", "muted": "#7b889b", "name": "#4fc3f7",
-    "on": "#1e8fe0", "off": "#3a4555", "green": "#22c55e", "orange": "#f59e0b", "red": "#ef4444",
+    "bg": "#0d1117", "panel": "#131a23", "head": "#1a2330", "line": "#232e3d", "sel": "#17462f",
+    "hover": "#1f2a38", "text": "#e3e9f1", "muted": "#7b889b", "name": "#5fd38d",
+    # фирменный тёмно-зелёный Retix Hub (как фон значка): кнопка ON, кнопки окон, рамки
+    "on": "#1e854f", "on_hover": "#25a062",
+    "off": "#3a4555", "green": "#22c55e", "orange": "#f59e0b", "red": "#ef4444",
     "entry": "#0a0e13",
 }
 
@@ -1287,7 +1289,7 @@ def render_power(on: bool, hover: bool = False, size: int = 76):
     k = 4
     S = size * k
     img = Image.new("RGBA", (S, S), (0, 0, 0, 0))
-    accent = (30, 143, 224) if on else (58, 69, 85)
+    accent = tuple(int(C["on"][i:i + 2], 16) for i in (1, 3, 5)) if on else (58, 69, 85)
     if hover:
         accent = tuple(min(255, c + 22) for c in accent)
     if on:  # мягкое свечение вокруг
@@ -1375,9 +1377,10 @@ def setup_style(root: tk.Tk) -> None:
     st.map("TCheckbutton", background=[("active", C["bg"])])
     st.configure("TEntry", fieldbackground=C["entry"], foreground=C["text"], insertcolor=C["text"],
                  bordercolor=C["line"], lightcolor=C["line"], darkcolor=C["line"])
+    st.map("TEntry", bordercolor=[("focus", C["on"])], lightcolor=[("focus", C["on"])])   # рамка в фокусе — зелёная
     st.configure("TButton", background=C["on"], foreground="white", bordercolor=C["on"], focusthickness=0,
                  padding=(10, 5))
-    st.map("TButton", background=[("disabled", C["off"]), ("active", "#3aaef0")])
+    st.map("TButton", background=[("disabled", C["off"]), ("active", C["on_hover"])])
     st.configure("Hub.Treeview", background=C["panel"], fieldbackground=C["panel"], foreground=C["text"],
                  rowheight=24, borderwidth=0, font=("Segoe UI", 9))
     st.map("Hub.Treeview", background=[("selected", C["sel"])], foreground=[("selected", "white")])
@@ -1530,13 +1533,15 @@ class MessageWindow(tk.Toplevel):
         self.destroy()
 
 
-def tray_image(color: str, size: int = 64):
-    """Значок трея целиком в цвете статуса: значок Retix (белая «R»), а фон — цвет статуса."""
+def tray_image(color: str, size: int = 64, original: bool = False):
+    """Значок трея: «в сети» — сам значок Retix Hub (original), иначе — тот же значок с фоном цвета статуса."""
     from PIL import Image
     try:
         icon = Image.open(resource_dir() / "app_icon.ico")
         icon.size = max(icon.info.get("sizes") or [icon.size])
         src = icon.convert("RGBA").resize((size, size), Image.LANCZOS)
+        if original:
+            return src
         cr, cg, cb = (int(color[i:i + 2], 16) for i in (1, 3, 5))
         out = Image.new("RGBA", src.size)
         px, opx = src.load(), out.load()
@@ -1579,7 +1584,7 @@ class Tray:
             log.exception("трей недоступен")
             return
         for key, color in (("green", C["green"]), ("orange", C["orange"]), ("red", C["red"]), ("off", C["red"])):
-            self.images[key] = tray_image(color)
+            self.images[key] = tray_image(color, original=key == "green")
         menu = pystray.Menu(
             pystray.MenuItem("Открыть Retix Hub", lambda: self.ui_q.put(("show", None)), default=True),
             pystray.MenuItem("Подключить / отключить", lambda: self.ui_q.put(("toggle", None))),
