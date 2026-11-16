@@ -15,7 +15,7 @@ devdata/
 # Сборка клиента
 client/build/
 client/dist/
-*.spec
+client/wireguard/
 *.exe
 *.msi
 

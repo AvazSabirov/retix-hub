@@ -538,6 +538,25 @@ class TestPublic:
         finally:
             os.remove(path)
 
+    def test_download_newest_setup(self, ctx):
+        import os
+        from app.config import DOWNLOADS_DIR
+        c = ctx.TestClient(ctx.app)
+        os.makedirs(DOWNLOADS_DIR, exist_ok=True)
+        files = {"RetixHub.exe": b"MZ-old", "RetixHub_Setup_1.0.0.exe": b"MZ-100",
+                 "RetixHub_Setup_1.0.10.exe": b"MZ-1010", "RetixHub_Setup_1.0.9.exe": b"MZ-109"}
+        for name, data in files.items():
+            with open(os.path.join(DOWNLOADS_DIR, name), "wb") as f:
+                f.write(data)
+        try:
+            r = c.get("/download/client")
+            assert r.status_code == 200 and r.content == b"MZ-1010"   # 1.0.10 новее 1.0.9
+            assert "RetixHub_Setup_1.0.10.exe" in r.headers["content-disposition"]
+            assert "Скачать RetixHub_Setup_1.0.10.exe" in c.get("/").text
+        finally:
+            for name in files:
+                os.remove(os.path.join(DOWNLOADS_DIR, name))
+
     def test_download_wireguard_redirect(self, ctx):
         r = ctx.TestClient(ctx.app).get("/download/wireguard", follow_redirects=False)
         assert r.status_code == 302 and "download.wireguard.com" in r.headers["location"]

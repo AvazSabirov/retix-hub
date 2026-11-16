@@ -51,7 +51,7 @@ sqlite3 data/vpn.db 'select login, subnet_index from companies'
 | `https://hub.retix.uz/api/...` | все запросы клиентов (справка: `/api`) |
 | `https://hub.retix.uz/cabinet` | кабинет компании |
 | `https://hub.retix.uz/admin` | суперадмин (ссылки на главной нет) |
-| `https://hub.retix.uz/download/client` | скачать клиент — положите `RetixHub.exe` в `server/data/downloads/` |
+| `https://hub.retix.uz/download/client` | скачать клиент — положите `RetixHub_Setup_<версия>.exe` в `server/data/downloads/` |
 
 DNS: A-запись `hub.retix.uz` → IP сервера. SSL: `certbot --nginx -d hub.retix.uz`.
 Порт WireGuard (UDP 51820) идёт на тот же адрес — клиент подключается к `hub.retix.uz:51820`.
@@ -68,14 +68,44 @@ DNS: A-запись `hub.retix.uz` → IP сервера. SSL: `certbot --nginx 
 
 ## 3. Клиент (Windows)
 
-Сборка на Windows:
+Пользователям раздаётся один файл — установщик `RetixHub_Setup_<версия>.exe`. Внутри: программа,
+`client_config.json` и официальный WireGuard (ставится сам, если его нет).
+
+### Сборка в GitHub
+
+Workflow `.github/workflows/client.yml` собирает установщик на Windows:
+* push с изменениями в `client/` → установщик лежит в **Actions → запуск → Artifacts**;
+* тег `v<версия>` (например `v1.0.0`) → ещё и **Releases** с установщиком.
+  Тег должен совпадать с `VERSION` в `client/retixhub_client.py`.
+
+Выпуск новой версии: поменять `VERSION` в `client/retixhub_client.py`, закоммитить, затем
+```bash
+git tag v1.0.1
+git push origin v1.0.1
+```
+
+### Сборка на своём ПК
+
+Нужны Windows 10/11 x64, Python 3.10+ (64-бит) и [Inno Setup 6.3+](https://jrsoftware.org/isdl.php).
 ```
 cd client
-:: поменяйте server_url в client_config.json
+:: при необходимости поменяйте server_url в client_config.json
 build.bat
 ```
-Раздавать: `dist\RetixHub.exe` + `client_config.json` + `wireguard-amd64-*.msi`
-(с https://download.wireguard.com/windows-client/) — если WireGuard не установлен, клиент поставит его сам.
+`build.bat`: ставит зависимости → PyInstaller (`RetixHub.spec`, onedir) → самопроверка собранного exe
+(`RetixHub.exe --selftest`: Tcl/Tk, cryptography, SSL, иконка) → скачивает WireGuard MSI с проверкой подписи
+(`get_wireguard.ps1`) → Inno Setup (`RetixHub.iss`). Результат: `client\dist\RetixHub_Setup_<версия>.exe`.
+
+### Установщик
+
+* Без вопросов: окно UAC и полоса прогресса. Обновление — тот же установщик поверх; запущенный клиент
+  закрывается (VPN держит служба WireGuard, связь не рвётся). Более старую версию поверх новой не ставит.
+* Ярлыки: рабочий стол и «Пуск». Автозапуск создаёт сам клиент (задача Планировщика).
+* Тихая установка на много ПК: `RetixHub_Setup_<версия>.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART`.
+* Удаление (Параметры → Приложения): снимает туннель, блок в `hosts`, правило firewall и автозапуск.
+  WireGuard и `C:\ProgramData\RetixHub\` остаются — после повторной установки ПК вернётся в сеть сам.
+* На сайт: положите установщик в `server/data/downloads/` — по кнопке «Скачать» отдаётся самый новый
+  `RetixHub_Setup_*.exe`.
 
 Что делает клиент:
 1. Окно входа: сервер, логин компании, пароль компании, имя ПК. Ключ WireGuard генерируется на ПК,
@@ -114,7 +144,7 @@ build.bat
 
 ```bash
 pip install -r server/requirements.txt -r client/requirements.txt pytest httpx
-python -m pytest tests/test_server.py tests/test_client.py -q   # 113 тестов, ~2 мин
+python -m pytest tests/test_server.py tests/test_client.py -q   # 114 тестов, ~2 мин
 sudo python3 tests/e2e_network.py                               # 52 проверки на настоящей сети
 ```
 

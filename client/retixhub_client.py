@@ -65,6 +65,11 @@ def app_dir() -> Path:
     return Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).parent
 
 
+def resource_dir() -> Path:
+    """Файлы, вложенные в сборку (иконка): в onedir-сборке PyInstaller это папка _internal."""
+    return Path(getattr(sys, "_MEIPASS", app_dir()))
+
+
 def run(args: list, timeout: int = 60) -> tuple[int, str]:
     try:
         r = subprocess.run(args, capture_output=True, timeout=timeout, creationflags=CREATE_NO_WINDOW)
@@ -680,6 +685,10 @@ class App(tk.Tk):
         self.last_status = None
 
         self.title(f"{APP_TITLE} {VERSION}")
+        try:
+            self.iconbitmap(str(resource_dir() / "app_icon.ico"))
+        except Exception:
+            pass
         self.geometry("720x460")
         self.minsize(600, 360)
         self.protocol("WM_DELETE_WINDOW", self.iconify)  # крестик — свернуть, туннель работает дальше
@@ -857,7 +866,84 @@ def single_instance() -> bool:
     return ctypes.windll.kernel32.GetLastError() != 183  # ERROR_ALREADY_EXISTS
 
 
+SELFTEST_FILE = "retixhub_selftest.txt"
+
+
+def selftest() -> int:
+    """retixhub.exe --selftest: проверка собранного exe (build.bat запускает её после сборки).
+    Ничего не меняет в системе и прав администратора не просит. Отчёт — retixhub_selftest.txt рядом с exe."""
+    import ssl
+    lines, ok = [f"{APP_TITLE} {VERSION} self-test", f"python {sys.version.split()[0]}, frozen={getattr(sys, 'frozen', False)}"], True
+
+    def check(name, fn):
+        nonlocal ok
+        try:
+            lines.append(f"OK    {name}: {fn() or ''}".rstrip(": "))
+        except Exception as e:  # noqa: BLE001
+            ok = False
+            lines.append(f"FAIL  {name}: {type(e).__name__}: {e}")
+
+    def tk_check():
+        root = tk.Tk()
+        root.withdraw()
+        ttk.Label(root, text="test")
+        version = root.tk.call("info", "patchlevel")
+        root.destroy()
+        return f"Tcl/Tk {version}"
+
+    def crypto_check():
+        key = X25519PrivateKey.generate()
+        pub = key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+        if len(pub) != 32:
+            raise ValueError(f"длина ключа {len(pub)}")
+        return "x25519"
+
+    def ssl_check():
+        import certifi
+        ctx = ssl.create_default_context(cafile=certifi.where())
+        return f"{ssl.OPENSSL_VERSION}, CA: {len(ctx.get_ca_certs())}"
+
+    def config_check():
+        return State._default_server()
+
+    def icon_check():
+        path = resource_dir() / "app_icon.ico"
+        if not path.exists():
+            raise FileNotFoundError(path)
+        return path.name
+
+    check("Tcl/Tk", tk_check)
+    check("cryptography", crypto_check)
+    check("SSL", ssl_check)
+    check("requests", lambda: requests.__version__)
+    check("server_url", config_check)
+    check("icon", icon_check)
+    lines.append("RESULT: " + ("OK" if ok else "FAIL"))
+    try:
+        (app_dir() / SELFTEST_FILE).write_text("\n".join(lines) + "\n", "utf-8")
+    except OSError:
+        pass
+    print("\n".join(lines))
+    return 0 if ok else 1
+
+
+def uninstall_cleanup() -> int:
+    """retixhub.exe --uninstall: вызывает деинсталлятор. Снимает туннель, блок в hosts, правило firewall
+    и автозапуск. WireGuard и %ProgramData%\\RetixHub (ключ и вход) остаются — при повторной установке
+    ПК вернётся в сеть сам."""
+    for step in (Tunnel.uninstall, lambda: update_hosts({}), lambda: ensure_smb_firewall(None), remove_autostart):
+        try:
+            step()
+        except Exception:  # noqa: BLE001
+            log.exception("uninstall")
+    state = State()
+    state.set(last_conf_hash="", fw_subnet="", autostart_done=False)
+    return 0
+
+
 def main():
+    if "--selftest" in sys.argv:
+        sys.exit(selftest())
     if WINDOWS and not is_admin():
         relaunch_as_admin()
         return
@@ -868,6 +954,9 @@ def main():
     if not single_instance():
         messagebox.showinfo(APP_TITLE, "Программа уже запущена (посмотрите на панели задач).")
         return
+    if "--uninstall" in sys.argv:
+        log.info("удаление программы: очистка")
+        sys.exit(uninstall_cleanup())
     log.info("старт %s", VERSION)
     App(State(), minimized="--minimized" in sys.argv).mainloop()
 
