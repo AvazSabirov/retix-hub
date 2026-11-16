@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 import requests
 
-from conftest import ROOT, new_pubkey
+from conftest import ROOT, fake_setup, new_pubkey
 
 # tkinter может отсутствовать на Linux-сервере сборки — для логики клиента он не нужен
 try:
@@ -551,50 +551,118 @@ def test_ping_does_not_use_shell(monkeypatch):
 
 
 @pytest.fixture()
-def updater(server, tmp_path, monkeypatch):
-    downloads = Path(server.data) / "downloads"
-    downloads.mkdir(exist_ok=True)
+def releases(server, tmp_path, monkeypatch):
+    """Выпуски через суперадмина на живом сервере; после теста — удалить."""
+    import re
     monkeypatch.setattr(rc, "UPDATE_DIR", tmp_path / "update")
-    state = rc.State(tmp_path / "upd_state.json"); state.set(server_url=BASE)
-    u = types.SimpleNamespace(state=state, launched=[], notified=[], downloads=downloads)
-    u.make = lambda: rc.Updater(state, on_update=u.notified.append, launcher=u.launched.append)
-    yield u
-    for f in downloads.glob("RetixHub_Setup_*.exe"):
-        f.unlink()
+    page = server.admin.get(BASE + "/admin/updates").text
+    ns = types.SimpleNamespace(pub=re.search(r'id="pubkey">([^<]+)<', page).group(1),
+                               csrf=re.search(r'name="csrf" value="([^"]+)"', page).group(1), launched=[], notified=[])
+    monkeypatch.setattr(rc, "UPDATE_PUBLIC_KEYS", [ns.pub])
+
+    def upload(version="9.9.9", publish=True):
+        data = fake_setup(version)
+        r = server.admin.post(BASE + "/admin/updates", data={"csrf": ns.csrf, **({"publish": "1"} if publish else {})},
+                              files={"file": ("setup.exe", data, "application/octet-stream")})
+        assert f"Версия {version} загружена" in r.text, r.text[:300]
+        return data
+
+    def updater(c):
+        u = rc.Updater(c.state, c.w.api, on_update=ns.notified.append, launcher=ns.launched.append)
+        c.w.api.on_hint = u.note_hint
+        return u
+    ns.upload, ns.updater = upload, updater
+    yield ns
+    page = server.admin.get(BASE + "/admin/updates").text
+    for rid in set(re.findall(r"/admin/updates/(\d+)/file", page)):
+        server.admin.post(BASE + f"/admin/updates/{rid}/delete", data={"csrf": ns.csrf})
 
 
-def test_autoupdate_installs_newer_version(updater):
-    data = b"MZ-new-setup" * 1000
-    (updater.downloads / "RetixHub_Setup_9.9.9.exe").write_bytes(data)
-    assert updater.make().check() == "9.9.9"
-    assert updater.launched[0].name == "RetixHub_Setup_9.9.9.exe" and updater.launched[0].read_bytes() == data
-    assert updater.launched[0].parent == rc.UPDATE_DIR and updater.notified == ["9.9.9"]
-    assert updater.make().check() is None and len(updater.launched) == 1   # не встала — не раньше чем через час
+def test_update_end_to_end(make_client, company, releases, server):
+    c = make_client(); login(c, company); c.step(2)
+    u = releases.updater(c)
+    assert u.check() is None and c.state.get("update_state") == "none"          # обновлять нечего
+    data = releases.upload("9.9.9")
+    c.step()                                                                    # подсказка в обычном ответе
+    assert u.wake.is_set() and u.last_hint == "9.9.9"
+    assert u.check() == "9.9.9"
+    path = releases.launched[0]
+    assert path.read_bytes() == data and path.parent == rc.UPDATE_DIR and releases.notified == ["9.9.9"]
+    assert c.state.get("update_state") == "installing:9.9.9"
+    c.step()                                                                    # состояние ушло на сервер
+    assert "устанавливает 9.9.9" in server.admin.get(BASE + "/admin/updates").text
+    assert u.check() is None and len(releases.launched) == 1                    # не встала — не раньше чем через час
 
 
-def test_autoupdate_ignores_same_or_older(updater):
+def test_update_with_foreign_signature_rejected(make_client, company, releases, monkeypatch):
+    c = make_client(); login(c, company); c.step(2)
+    releases.upload("9.9.9")
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    other = Ed25519PrivateKey.generate().public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+    monkeypatch.setattr(rc, "UPDATE_PUBLIC_KEYS", [__import__("base64").b64encode(other).decode()])
+    u = releases.updater(c)
+    assert u.check() is None and releases.launched == []
+    assert c.state.get("update_state") == "error:9.9.9"
+    monkeypatch.setattr(rc, "UPDATE_PUBLIC_KEYS", [])                           # ключа нет — сам не обновляется
+    assert u.check() is None and releases.launched == []
+
+
+def test_update_tampered_manifest_rejected(releases):
+    import base64
+    import json
+    good = {"app": "Retix Hub", "kind": "retixhub-update", "version": "9.9.9", "size": 10, "sha256": "a" * 64}
+    body = base64.b64encode(json.dumps(good).encode()).decode()
+    with pytest.raises(rc.UpdateError):                                         # подпись от другого тела
+        rc.verify_manifest({"manifest": body, "signature": base64.b64encode(b"x" * 64).decode()}, [releases.pub])
+    with pytest.raises(rc.UpdateError):
+        rc.verify_manifest({"manifest": "!!", "signature": ""}, [releases.pub])
+
+
+def test_update_resumes_partial_download(make_client, company, releases):
+    c = make_client(); login(c, company); c.step(2)
+    data = releases.upload("9.9.9")
     rc.UPDATE_DIR.mkdir(parents=True)
-    (rc.UPDATE_DIR / "RetixHub_Setup_1.0.4.exe").write_bytes(b"old")
-    (updater.downloads / f"RetixHub_Setup_{rc.VERSION}.exe").write_bytes(b"MZ")
-    (updater.downloads / "RetixHub_Setup_1.0.0.exe").write_bytes(b"MZ")
-    assert updater.make().check() is None and updater.launched == []
-    assert list(rc.UPDATE_DIR.iterdir()) == []            # установщик прошлого обновления удалён
+    (rc.UPDATE_DIR / "RetixHub_Setup_9.9.9.part").write_bytes(data[:100_000])  # оборвалось на трети
+    (rc.UPDATE_DIR / "RetixHub_Setup_9.9.8.exe").write_bytes(b"old")           # прошлая версия — удалится
+    u = releases.updater(c)
+    assert u.check() == "9.9.9"
+    assert releases.launched[0].read_bytes() == data
+    assert sorted(f.name for f in rc.UPDATE_DIR.iterdir()) == ["RetixHub_Setup_9.9.9.exe"]
 
 
-def test_autoupdate_rejects_bad_download(updater):
-    (updater.downloads / "RetixHub_Setup_9.9.9.exe").write_bytes(b"MZ-data")
-    u = updater.make()
-    assert u._download(BASE + "/download/client", "9.9.9", "0" * 64, 7) is None     # sha256 не тот
-    assert u._download(BASE + "/download/client", "9.9.9", "0" * 64, 3) is None     # больше заявленного
-    assert list(rc.UPDATE_DIR.iterdir()) == []
+def test_update_corrupted_partial_retried(make_client, company, releases):
+    c = make_client(); login(c, company); c.step(2)
+    data = releases.upload("9.9.9")
+    rc.UPDATE_DIR.mkdir(parents=True)
+    (rc.UPDATE_DIR / "RetixHub_Setup_9.9.9.part").write_bytes(b"X" * 100_000)  # испорченный кусок
+    u = releases.updater(c)
+    assert u.check() is None and c.state.get("update_state") == "error:9.9.9"
+    assert not (rc.UPDATE_DIR / "RetixHub_Setup_9.9.9.part").exists()          # испорченное удалено
+    assert u.check() == "9.9.9" and releases.launched[0].read_bytes() == data
 
 
-def test_autoupdate_only_over_https(updater):
-    (updater.downloads / "RetixHub_Setup_9.9.9.exe").write_bytes(b"MZ")
-    updater.state.set(server_url="http://hub.example.invalid")
-    assert updater.make().check() is None and updater.launched == []
-    updater.state.set(server_url=BASE, auto_update=False)
-    assert updater.make().check() is None
+def test_update_draft_and_same_version_ignored(make_client, company, releases):
+    c = make_client(); login(c, company); c.step(2)
+    releases.upload("9.9.9", publish=False)
+    releases.upload(rc.VERSION)
+    u = releases.updater(c)
+    assert u.check() is None and releases.launched == []
+
+
+def test_update_result_after_restart(tmp_path, monkeypatch):
+    monkeypatch.setattr(rc, "UPDATE_DIR", tmp_path / "update")
+    st = rc.State(tmp_path / "s.json")
+    st.set(update_attempt={"version": rc.VERSION, "at": int(time.time())}, update_state="installing:" + rc.VERSION)
+    rc.UPDATE_DIR.mkdir(); (rc.UPDATE_DIR / "RetixHub_Setup_x.exe").write_bytes(b"MZ")
+    rc.Updater(st, api=None)                                                    # встало
+    assert st.get("update_state") == "none" and st.get("update_attempt") == {} and not any(rc.UPDATE_DIR.iterdir())
+    st.set(update_attempt={"version": "99.0.0", "at": int(time.time()) - 3600})
+    rc.Updater(st, api=None)                                                    # версия так и старая
+    assert st.get("update_state") == "failed:99.0.0"
+    st.set(update_attempt={"version": "99.0.0", "at": int(time.time())}, update_state="installing:99.0.0")
+    rc.Updater(st, api=None)                                                    # установщик ещё работает
+    assert st.get("update_state") == "installing:99.0.0"
 
 
 def test_launch_installer_detached(monkeypatch):

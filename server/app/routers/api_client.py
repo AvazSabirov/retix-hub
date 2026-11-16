@@ -4,7 +4,7 @@ import time
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel, Field
 
-from .. import db, services, wg
+from .. import db, services, updates, wg
 from ..auth import check_pw, client_ip, limiter, new_token, sha256
 from ..config import TOKEN_ROTATE_SECONDS
 
@@ -80,6 +80,7 @@ def current_device(request: Request, response: Response, conn=Depends(db.get_db)
     company = conn.execute("SELECT * FROM companies WHERE id=?", (dev["company_id"],)).fetchone()
     if not company["is_active"]:
         raise HTTPException(403, "Компания отключена")
+    updates.note_device(conn, dev, request, response)   # версия ПК, состояние обновления, подсказка
     if dev["token_hash"] == token_hash and now - dev["token_set_at"] >= TOKEN_ROTATE_SECONDS \
             and (not dev["token_next_hash"] or now - dev["token_next_at"] >= NEXT_TOKEN_RETRY):
         token, next_hash = new_token()

@@ -63,7 +63,7 @@ def index(request: Request, conn=Depends(require_admin), msg: str = "", err: int
                           "online": sum(d["online"] for d in devs),
                           "pending": sum(d["status"] == "pending" for d in devs)})
     return templates.TemplateResponse(request, "admin.html", {
-        "title": "Компании", "companies": companies, "logout_url": "/admin/logout",
+        "title": "Компании", "companies": companies, "logout_url": "/admin/logout", "admin_nav": "companies",
         "msg": msg, "err": err})
 
 
@@ -103,7 +103,7 @@ def company_page(request: Request, company_id: int, conn=Depends(require_admin),
     return templates.TemplateResponse(request, "admin_company.html", {
         "title": c["login"], "company": c, "subnet": services.subnet(c), "devices": devices,
         "online": sum(d["online"] for d in devices), "log": log,
-        "action_prefix": f"/admin/companies/{c['id']}/devices/", "logout_url": "/admin/logout",
+        "action_prefix": f"/admin/companies/{c['id']}/devices/", "logout_url": "/admin/logout", "admin_nav": "companies",
         "msg": msg, "err": err})
 
 

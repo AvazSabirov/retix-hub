@@ -16,8 +16,9 @@
 ;   - автозапуск сразу при установке: задача Планировщика «RetixHub» с правами
 ;     администратора (без UAC при каждом входе в Windows), окно — в трее;
 ;   - после установки клиент запускается (кроме /SILENT и /VERYSILENT);
-;   - автообновление: клиент сам запускает новый установщик с /VERYSILENT /AUTOUPDATE=1,
-;     после установки клиент запускается снова (в трее);
+;   - автообновление: версию публикует суперадмин (/admin/updates), клиент проверяет подпись
+;     и сам запускает установщик с /VERYSILENT /AUTOUPDATE=1 — после установки клиент
+;     запускается снова (в трее);
 ;   - данные в %ProgramData%\RetixHub (ключ, вход) и журнал {app}\logs установщик
 ;     при обновлении не трогает (журнал удаляется вместе с программой);
 ;   - при удалении: туннель, правила firewall и автозапуск
@@ -137,6 +138,7 @@ end;
 
 { Закрыть клиент. Крестик окна у клиента только сворачивает, поэтому сразу
   taskkill /F: туннель — служба WireGuard, она продолжает работать.
+  Без /T: запущенные из клиента Radmin Viewer, RDP и ping не закрываются.
   True — клиента нет. }
 function CloseClient: Boolean;
 var
@@ -145,7 +147,7 @@ begin
   Result := not IsClientRunning;
   if Result then
     Exit;
-  Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /T /IM {#AppExe}', '', SW_HIDE,
+  Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /IM {#AppExe}', '', SW_HIDE,
        ewWaitUntilTerminated, RC);
   for I := 1 to KillWaitSec do
   begin
