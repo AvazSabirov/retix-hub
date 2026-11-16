@@ -2,21 +2,23 @@
 {% block content %}
 <div class="card">
   <h2>Компании</h2>
-  <table>
-    <tr><th>Логин</th><th>Название</th><th>Подсеть</th><th>Онлайн</th><th>Ждут</th><th>Одобрение</th><th>Лимит</th><th>Статус</th><th></th></tr>
+  <table class="cards">
+    <thead><tr><th>Логин</th><th>Название</th><th>Подсеть</th><th>Онлайн</th><th>Ждут</th><th>Одобрение</th><th>Лимит</th><th>Статус</th><th></th></tr></thead>
+    <tbody>
     {% for c in companies %}
     <tr>
-      <td><b>{{ c.login }}</b></td><td>{{ c.name }}</td><td><code>{{ c.subnet }}</code></td>
-      <td>{{ c.online }} / {{ c.total }}</td>
-      <td>{% if c.pending %}<span class="tag warn">{{ c.pending }}</span>{% else %}—{% endif %}</td>
-      <td>{{ 'да' if c.require_approval else 'нет' }}</td>
-      <td>{{ c.max_devices }}</td>
-      <td>{% if c.is_active %}<span class="tag share">активна</span>{% else %}<span class="tag bad">отключена</span>{% endif %}</td>
-      <td><a class="btn" href="/admin/companies/{{ c.id }}">Открыть</a></td>
+      <td class="card-title"><b>{{ c.login }}</b></td><td data-label="Название">{{ c.name or '—' }}</td><td data-label="Подсеть"><code>{{ c.subnet }}</code></td>
+      <td data-label="Онлайн">{{ c.online }} / {{ c.total }}</td>
+      <td data-label="Ждут одобрения">{% if c.pending %}<span class="tag warn">{{ c.pending }}</span>{% else %}—{% endif %}</td>
+      <td data-label="Одобрение">{{ 'да' if c.require_approval else 'нет' }}</td>
+      <td data-label="Лимит">{{ c.max_devices }}</td>
+      <td data-label="Статус">{% if c.is_active %}<span class="tag share">активна</span>{% else %}<span class="tag bad">отключена</span>{% endif %}</td>
+      <td class="actions"><a class="btn" href="/admin/companies/{{ c.id }}">Открыть</a></td>
     </tr>
     {% else %}
-    <tr><td colspan="9" class="muted">Компаний пока нет</td></tr>
+    <tr class="empty-row"><td colspan="9" class="muted empty">Компаний пока нет</td></tr>
     {% endfor %}
+    </tbody>
   </table>
 </div>
 <div class="card" style="max-width:520px">

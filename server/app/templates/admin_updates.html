@@ -53,18 +53,19 @@
 
 <div class="card">
   <h2>Версии</h2>
-  <div class="tbl-wrap"><table>
-    <tr><th>Версия</th><th>Статус</th><th>Кому</th><th>Файл</th><th>ПК</th><th></th></tr>
+  <div class="tbl-wrap"><table class="cards">
+    <thead><tr><th>Версия</th><th>Статус</th><th>Кому</th><th>Файл</th><th>ПК</th><th></th></tr></thead>
+    <tbody>
     {% for r in releases %}
-    <tr>
-      <td><b>{{ r.version }}</b>{% if r.version == site_version %} <span class="tag share">на сайте</span>{% endif %}
+    <tr class="joined">
+      <td class="card-title"><b>{{ r.version }}</b>{% if r.version == site_version %} <span class="tag share">на сайте</span>{% endif %}
         <div class="muted small nowrap">загружена {{ r.created_at|dt }}</div></td>
-      <td class="nowrap">{% if r.published %}<span class="tag share">опубликована</span><div class="muted small">{{ r.published_at|dt }}</div>{% elif r.publish_at %}<span class="tag warn">по расписанию</span><div class="muted small">опубликуется {{ r.publish_at|dt }}</div>{% else %}<span class="tag">черновик</span>{% endif %}</td>
-      <td>{{ r.scope_text }}</td>
-      <td><a href="/admin/updates/{{ r.id }}/file">{{ r.file_name }}</a>
+      <td data-label="Статус" class="nowrap">{% if r.published %}<span class="tag share">опубликована</span><div class="muted small">{{ r.published_at|dt }}</div>{% elif r.publish_at %}<span class="tag warn">по расписанию</span><div class="muted small">опубликуется {{ r.publish_at|dt }}</div>{% else %}<span class="tag">черновик</span>{% endif %}</td>
+      <td data-label="Кому">{{ r.scope_text }}</td>
+      <td data-label="Файл"><a href="/admin/updates/{{ r.id }}/file">{{ r.file_name }}</a>
         <div class="muted small nowrap">{{ (r.size / 1048576)|round(1) }} МБ · SHA-256 <code title="{{ r.sha256 }}">{{ r.sha256[:12] }}…</code></div></td>
-      <td class="nowrap small">на версии: <b>{{ r.on_version }}</b><br>ждут её: <b>{{ r.waiting }}</b><br>скачиваний: {{ r.downloads }}{% if r.site_downloads %}<br>с сайта: {{ r.site_downloads }}{% endif %}</td>
-      <td><div class="actions">
+      <td data-label="ПК" class="nowrap small">на версии: <b>{{ r.on_version }}</b><br>ждут её: <b>{{ r.waiting }}</b><br>скачиваний: {{ r.downloads }}{% if r.site_downloads %}<br>с сайта: {{ r.site_downloads }}{% endif %}</td>
+      <td class="release-actions"><div class="actions">
         <form class="inline" method="post" action="/admin/updates/{{ r.id }}"
               {% if not r.published %}data-confirm="Опубликовать {{ r.version }}? ПК ({{ r.scope_text }}) обновятся сами в течение 10 минут."{% endif %}>
           <input type="hidden" name="csrf" value="{{ csrf }}">
@@ -99,25 +100,28 @@
         </form>
       </details>
     </td></tr>
-    {% else %}<tr><td colspan="6" class="muted">Обновлений ещё не загружали</td></tr>{% endfor %}
+    {% else %}<tr class="empty-row"><td colspan="6" class="muted empty">Обновлений ещё не загружали</td></tr>{% endfor %}
+    </tbody>
   </table></div>
 </div>
 
 <div class="card">
   <h2>Компьютеры</h2>
   <p class="small">{% for v, n in versions %}<span class="tag">{{ v }} — {{ n }}</span> {% else %}<span class="muted">ПК нет</span>{% endfor %}</p>
-  <div class="tbl-wrap"><table>
-    <tr><th>Компания</th><th>ПК</th><th>IP</th><th>Версия</th><th>Обновление</th><th>Последняя связь</th></tr>
+  <div class="tbl-wrap"><table class="cards">
+    <thead><tr><th>Компания</th><th>ПК</th><th>IP</th><th>Версия</th><th>Обновление</th><th>Последняя связь</th></tr></thead>
+    <tbody>
     {% for d in devices %}
     <tr>
-      <td>{{ d.company_name or d.company_login }}</td>
-      <td>{{ d.name }}</td>
-      <td><code>{{ d.ip }}</code></td>
-      <td class="nowrap">{{ d.client_version or '?' }}</td>
-      <td>{% if d.target %}→ {{ d.target }}{% if d.state_text %}<div class="muted small">{{ d.state_text }} · {{ d.update_state_at|dt }}</div>{% endif %}{% elif d.state_text %}<span class="muted small">{{ d.state_text }}</span>{% else %}<span class="muted">последняя</span>{% endif %}</td>
-      <td class="nowrap muted">{{ (d.last_rx_at or d.last_handshake) | ago }}</td>
+      <td data-label="Компания">{{ d.company_name or d.company_login }}</td>
+      <td class="card-title">{{ d.name }}</td>
+      <td data-label="IP"><code>{{ d.ip }}</code></td>
+      <td data-label="Версия" class="nowrap">{{ d.client_version or '?' }}</td>
+      <td data-label="Обновление">{% if d.target %}→ {{ d.target }}{% if d.state_text %}<div class="muted small">{{ d.state_text }} · {{ d.update_state_at|dt }}</div>{% endif %}{% elif d.state_text %}<span class="muted small">{{ d.state_text }}</span>{% else %}<span class="muted">последняя</span>{% endif %}</td>
+      <td data-label="Последняя связь" class="nowrap muted">{{ (d.last_rx_at or d.last_handshake) | ago }}</td>
     </tr>
-    {% else %}<tr><td colspan="6" class="muted">ПК нет</td></tr>{% endfor %}
+    {% else %}<tr class="empty-row"><td colspan="6" class="muted empty">ПК нет</td></tr>{% endfor %}
+    </tbody>
   </table></div>
 </div>
 {% endblock %}
