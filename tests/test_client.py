@@ -604,8 +604,23 @@ def test_update_with_foreign_signature_rejected(make_client, company, releases, 
     u = releases.updater(c)
     assert u.check() is None and releases.launched == []
     assert c.state.get("update_state") == "error:9.9.9"
-    monkeypatch.setattr(rc, "UPDATE_PUBLIC_KEYS", [])                           # ключа нет — сам не обновляется
-    assert u.check() is None and releases.launched == []
+    assert c.state.get("update_pubkey") == ""            # зашитый ключ главнее: сервер его не подменит
+
+
+def test_update_key_pinned_on_first_contact(make_client, company, releases, monkeypatch):
+    c = make_client(); login(c, company); c.step(2)
+    monkeypatch.setattr(rc, "UPDATE_PUBLIC_KEYS", [])                           # ключ в клиент не вписан
+    data = releases.upload("9.9.9")
+    u = releases.updater(c)
+    assert u.check() == "9.9.9" and releases.launched[0].read_bytes() == data
+    assert c.state.get("update_pubkey") == releases.pub                         # запомнен
+    # сервер сменил ключ (или подменён) — запомненный не меняется, чужая подпись не ставится
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    other = Ed25519PrivateKey.generate().public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+    c.state.set(update_pubkey=__import__("base64").b64encode(other).decode(), update_attempt={})
+    assert u.check() is None and len(releases.launched) == 1
+    assert c.state.get("update_state") == "error:9.9.9"
 
 
 def test_update_tampered_manifest_rejected(releases):

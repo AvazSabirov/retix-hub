@@ -919,6 +919,25 @@ class TestUpdates:
         assert "RetixHub_Setup_1.0.6.exe" in c.get("/").text
         assert "на сайте" in ctx.admin.get("/admin/updates").text
 
+    def test_legacy_version_for_clients_1_0_5(self, ctx):
+        import hashlib
+        a_id = ctx.company("firma1")
+        c = ctx.TestClient(ctx.app)
+        assert c.get("/api/client/version").json() == {"version": None}
+        self.upload(ctx, fake_setup("1.0.7"), scope="some", companies=[str(a_id)])   # пилот 1.0.5 не видит
+        assert c.get("/api/client/version").json() == {"version": None}
+        data = fake_setup("1.0.6")
+        self.upload(ctx, data)
+        info = c.get("/api/client/version").json()
+        assert info["version"] == "1.0.6" and info["size"] == len(data)
+        assert info["sha256"] == hashlib.sha256(data).hexdigest() == hashlib.sha256(c.get(info["url"]).content).hexdigest()
+
+    def test_update_answer_has_public_key(self, ctx):
+        ctx.company("firma1")
+        d = self.device(ctx, "firma1")
+        pub = re.search(r'id="pubkey">([^<]+)<', ctx.admin.get("/admin/updates").text).group(1)
+        assert ctx.api.get("/api/update", headers=d["h"]).json()["public_key"] == pub
+
     def test_save_notes_scope_and_delete(self, ctx):
         import os
         from app import updates
