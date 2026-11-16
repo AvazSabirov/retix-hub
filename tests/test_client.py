@@ -90,34 +90,87 @@ def _new_company(server):
     return types.SimpleNamespace(login=login, cab=cab)
 
 
-class FakeTunnel:
-    """Ведёт себя как служба WireGuardTunnel$retixhub."""
+class FakeLan:
+    """Локальная сеть для FakeTunnel: какой туннель на каком «ip:порт» и что заблокировано."""
 
     def __init__(self):
+        self.hosts = {}        # "192.168.1.10:51001" -> FakeTunnel
+        self.blocked = False   # пакеты по локальной сети не проходят (firewall, изоляция Wi-Fi)
+
+
+class FakeTunnel:
+    """Ведёт себя как служба WireGuardTunnel$retixhub (и wg show / wg set для прямых путей)."""
+
+    def __init__(self, lan=None, lan_ip="", port=0):
         self.state = "missing"; self.hs = 0; self.installs = 0; self.starts = 0; self.conf = ""
         self.handshake_works = True; self.wg_installed = True; self.probe_ok = True
+        self.lan, self.port, self.key = lan, port, ""
+        self.peers = {}                    # прямые пиры: ключ -> {endpoint, allowed_ips, handshake, rx}
+        self.sets = []                     # вызовы wg set (для проверок)
+        if lan is not None and lan_ip:
+            lan.hosts[f"{lan_ip}:{port}"] = self
 
     def installed(self): return self.wg_installed
     build_conf = staticmethod(rc.Tunnel.build_conf)
     def service_state(self): return self.state
 
     def install(self, conf):
-        self.state = "running"; self.installs += 1; self.conf = conf
+        self.state = "running"; self.installs += 1; self.conf = conf; self.peers = {}
         self.hs = int(time.time()) if self.handshake_works else 0
 
-    def uninstall(self): self.state = "missing"; self.hs = 0
+    def uninstall(self): self.state = "missing"; self.hs = 0; self.peers = {}
     def start(self): self.starts += 1; self.state = "running"
-    def last_handshake(self): return self.hs
+
+    def last_handshake(self, key=""):
+        assert key, "handshake сервера — по ключу сервера, а не самый свежий из всех пиров"
+        return self.hs
+
     def probe(self, ip): return self.state == "running" and self.probe_ok and self.hs > 0
+
+    # --- wg show dump / wg set
+    def _exchange(self):
+        """Handshake и keepalive по локальной сети: оба знают друг друга, адрес верный, сеть не закрыта."""
+        now = int(time.time())
+        for key, p in self.peers.items():
+            other = self.lan.hosts.get(p["endpoint"]) if self.lan else None
+            if (other and not self.lan.blocked and other.state == "running" and other.key == key
+                    and self.key in other.peers):
+                p["handshake"] = other.peers[self.key]["handshake"] = now
+                p["rx"] += 32; other.peers[self.key]["rx"] += 32
+                mine = next((ep for ep, t in self.lan.hosts.items() if t is self), "")
+                other.peers[self.key]["endpoint"] = mine     # роуминг WireGuard: адрес, откуда пришло
+
+    def dump(self):
+        if self.state != "running":
+            return None
+        self._exchange()
+        return {"listen_port": self.port, "peers": {k: dict(v) for k, v in self.peers.items()}}
+
+    def set_peer(self, key, endpoint="", allowed_ips=None, keepalive=None):
+        self.sets.append((key, endpoint, allowed_ips, keepalive))
+        p = self.peers.setdefault(key, {"endpoint": "", "allowed_ips": "", "handshake": 0, "rx": 0})
+        if endpoint:
+            p["endpoint"] = endpoint
+        if allowed_ips is not None:
+            p["allowed_ips"] = allowed_ips
+        return True
+
+    def remove_peer(self, key): self.peers.pop(key, None)
+    def set_listen_port(self, port): self.port = port; return True
+
+
+LAN_NOW = {"addrs": []}   # что вернёт local_addresses() — адреса того ПК, чей шаг идёт
+REAL_LOCAL_ADDRESSES = rc.local_addresses
 
 
 class Client:
     """Один «компьютер»: своё состояние и свой туннель."""
 
-    def __init__(self, tmp: Path, hostname="BUH-01"):
+    def __init__(self, tmp: Path, hostname="BUH-01", lan=None, lan_ip="", port=0):
         tmp.mkdir(parents=True, exist_ok=True)
         self.state = rc.State(tmp / "state.json"); self.state.set(server_url=BASE)
-        self.tunnel = FakeTunnel()
+        self.tunnel = FakeTunnel(lan, lan_ip, port)
+        self.lan_addrs = [f"{lan_ip}/24"] if lan_ip else []
         self.fw = []
         self.hostname = hostname
         self.events_seen = []
@@ -125,7 +178,10 @@ class Client:
 
     def step(self, n=1):
         for _ in range(n):
+            LAN_NOW["addrs"] = self.lan_addrs
+            self.w.lan_checked = 0          # адреса перечитываются на каждом шаге
             self.w.step()
+            self.tunnel.key = self.state.keypair()[1]
         return self.last()
 
     def last(self):
@@ -144,6 +200,7 @@ class Client:
 def patch_windows(monkeypatch):
     calls = []
     monkeypatch.setattr(rc, "run", lambda args, timeout=60: (calls.append(args), (0, ""))[1])
+    monkeypatch.setattr(rc, "local_addresses", lambda: list(LAN_NOW["addrs"]))
     monkeypatch.setattr(rc, "ensure_autostart", lambda: calls.append(["autostart"]))
     return calls
 
@@ -154,8 +211,8 @@ def make_client(tmp_path, monkeypatch):
     monkeypatch.setattr(rc, "ensure_firewall", lambda subnet, ports="445": fw.append((subnet, ports)))
     clients = []
 
-    def make(hostname="BUH-01"):
-        c = Client(tmp_path / f"c{len(clients)}", hostname)
+    def make(hostname="BUH-01", lan=None, lan_ip="", port=0):
+        c = Client(tmp_path / f"c{len(clients)}", hostname, lan, lan_ip, port)
         c.fw = fw
         clients.append(c)
         monkeypatch.setattr(rc.socket, "gethostname", lambda: hostname)
@@ -781,3 +838,194 @@ def test_hidden_peers_in_client(make_client, company):
     assert {p["name"] for p in a.peers} == {"Офис", "Касса"}
     assert b.w.send_message(a.w.cfg["device_id"], "привет") and a.w.send_message(b.w.cfg["device_id"], "касса?") is None
     assert b.step()["status"] == rc.Status.ONLINE                                     # сеть работает как раньше
+
+
+# ================================================================== прямой путь по локальной сети
+
+def mark_online(server, public_ip="203.0.113.5", names=None):
+    """Как будто монитор сервера видит пакеты WireGuard от ПК: он онлайн и выходит в интернет с public_ip
+    (один офис за одним роутером — один внешний IP)."""
+    import sqlite3
+    conn = sqlite3.connect(Path(server.data) / "vpn.db", timeout=10)
+    now = int(time.time())
+    where, args = ("", ()) if names is None else (f" WHERE name IN ({','.join('?' * len(names))})", tuple(names))
+    conn.execute("UPDATE devices SET endpoint=?||':'||(40000+id), last_handshake=?, last_rx_at=?" + where,
+                 (public_ip, now, now) + args)
+    conn.commit(); conn.close()
+
+
+def full_lan(company, on=True):
+    data = {"share_name": "share", "share_ports": "445"} | ({"full_lan": "1"} if on else {})
+    company.cab.post(BASE + "/cabinet/settings", data=data)
+
+
+def lan_pair(make_client, company, server, lan=None, public_ip="203.0.113.5"):
+    """Два ПК одного офиса: 192.168.1.10 и .11, компания с «любым трафиком между ПК»."""
+    lan = lan or FakeLan()
+    full_lan(company)
+    a = make_client("PC1", lan, "192.168.1.10", 51001); login(a, company, name="Склад"); a.step(2)
+    b = make_client("PC2", lan, "192.168.1.11", 51002); login(b, company, name="Бухгалтерия"); b.step(2)
+    mark_online(server, public_ip)
+    return lan, a, b
+
+
+def direct_peer(c, other):
+    return c.tunnel.peers.get(other.state.keypair()[1])
+
+
+def test_direct_path_same_lan(make_client, company, server):
+    """ПК одного офиса: после handshake по локальной сети трафик к соседу идёт напрямую (AllowedIPs /32),
+    а пир сервера не меняется — остальные ПК по-прежнему через сервер."""
+    lan, a, b = lan_pair(make_client, company, server)
+    a.step(); b.step(); a.step(); b.step()
+    pa, pb = direct_peer(a, b), direct_peer(b, a)
+    assert pa and pa["allowed_ips"] == f"{b.w.cfg['ip']}/32" and pa["endpoint"] == "192.168.1.11:51002"
+    assert pb and pb["allowed_ips"] == f"{a.w.cfg['ip']}/32"
+    assert a.w.direct.active_ids() == [b.w.cfg["device_id"]] and b.w.direct.active_ids() == [a.w.cfg["device_id"]]
+    assert a.w.cfg["server_public_key"] not in a.tunnel.peers               # пира сервера не трогаем
+    assert any(k == b.state.keypair()[1] and ka == rc.DIRECT_KEEPALIVE for k, _, _, ka in a.tunnel.sets)
+    assert a.tunnel.installs == 1                                           # без переустановки туннеля
+    peers = {p["name"]: p for p in a.peers}
+    assert peers["Бухгалтерия"]["direct"] and not peers["Склад"]["direct"]
+    # сервер знает о прямом пути — видно в кабинете
+    mark_online(server)
+    assert "напрямую: Бухгалтерия" in company.cab.get(BASE + "/cabinet").text
+    # firewall: входящие UDP на порт туннеля из локальной сети
+    assert a.state.get("fw_direct") == 51001
+
+
+def test_direct_needs_full_lan(make_client, company, server, patch_windows):
+    """Без «любого трафика между ПК» прямых путей нет: правила сервера (ping, папки, Radmin) обходить нельзя.
+    Адреса локальной сети серверу при этом не отправляются."""
+    lan = FakeLan()
+    a = make_client("PC1", lan, "192.168.1.10", 51001); login(a, company, name="A"); a.step(2)
+    b = make_client("PC2", lan, "192.168.1.11", 51002); login(b, company, name="B"); b.step(2)
+    mark_online(server)
+    a.step(2); b.step(2)
+    assert a.w.cfg["direct"] == [] and not a.tunnel.peers and not b.tunnel.peers
+    assert a.w.lan == [] and not a.state.get("fw_direct")
+
+
+def test_direct_turned_off_returns_to_server(make_client, company, server):
+    lan, a, b = lan_pair(make_client, company, server)
+    a.step(); b.step(); a.step(); b.step()
+    assert direct_peer(a, b)["allowed_ips"]
+    full_lan(company, on=False)
+    a.step(); b.step()
+    assert not a.tunnel.peers and not b.tunnel.peers and a.w.direct.active_ids() == []
+    assert a.state.get("fw_direct") == 0
+
+
+def test_direct_other_office_not_neighbors(make_client, company, server):
+    """Другой внешний IP — другой офис: в 192.168.1.0/24 там совсем другие компьютеры."""
+    lan, a, b = lan_pair(make_client, company, server)
+    mark_online(server, "198.51.100.7", names=["Бухгалтерия"])
+    a.step(); b.step()
+    assert a.w.cfg["direct"] == [] and not a.tunnel.peers and not b.tunnel.peers
+
+
+def test_direct_lan_blocked_falls_back(make_client, company, server, monkeypatch):
+    """Пакеты по локальной сети не проходят (изоляция Wi-Fi, чужой firewall): сосед удаляется,
+    трафик остаётся через сервер, новая попытка — не сразу."""
+    monkeypatch.setattr(rc, "DIRECT_PROBE_SECONDS", -1)
+    lan, a, b = lan_pair(make_client, company, server)
+    lan.blocked = True
+    a.step()
+    assert direct_peer(a, b) and not direct_peer(a, b)["allowed_ips"]   # проверка: трафик ещё через сервер
+    a.step()
+    assert not a.tunnel.peers and a.w.direct.active_ids() == []
+    a.step()
+    assert not a.tunnel.peers                                          # повтор — после DIRECT_RETRY_FAILED
+
+
+def test_direct_lost_falls_back(make_client, company, server, monkeypatch):
+    """Прямой путь работал и пропал (ноутбук ушёл из офиса): от соседа нет пакетов — снова через сервер."""
+    lan, a, b = lan_pair(make_client, company, server)
+    a.step(); b.step(); a.step()
+    assert direct_peer(a, b)["allowed_ips"]
+    lan.blocked = True
+    monkeypatch.setattr(rc, "DIRECT_RX_TIMEOUT", -1)
+    a.step()
+    assert not a.tunnel.peers and a.w.direct.active_ids() == []
+
+
+def test_direct_neighbor_blocked_is_removed(make_client, company, server):
+    lan, a, b = lan_pair(make_client, company, server)
+    a.step(); b.step(); a.step()
+    assert direct_peer(a, b)["allowed_ips"]
+    company.cab.post(BASE + f"/cabinet/devices/{b.w.cfg['device_id']}/block")
+    a.step()
+    assert not a.tunnel.peers
+
+
+def test_direct_survives_server_outage(make_client, company, server):
+    """Сервер лёг — прямые пути остаются: ПК одного офиса продолжают видеть друг друга."""
+    lan, a, b = lan_pair(make_client, company, server)
+    a.step(); b.step(); a.step()
+    server.stop()
+    try:
+        st = a.step()
+        assert st["status"] == rc.Status.SERVER_DOWN and direct_peer(a, b)["allowed_ips"]
+    finally:
+        server.start()
+
+
+def test_direct_reset_on_reinstall(make_client, company, server):
+    lan, a, b = lan_pair(make_client, company, server)
+    a.step(); b.step(); a.step()
+    assert a.w.direct.active_ids()
+    a.w.force_reconnect(); a.step()                        # туннель переустановлен — пиров в нём нет
+    assert a.w.direct.active_ids() == [] and not a.tunnel.peers
+    a.step(); b.step(); a.step()
+    assert direct_peer(a, b)["allowed_ips"]
+
+
+def test_direct_neighbors_validation():
+    cfg = {"direct_enabled": True, "ip": "10.66.3.2", "subnet": "10.66.3.0/24", "server_ip": "10.66.0.1",
+           "server_public_key": "S" * 43 + "="}
+    good = {"id": 5, "public_key": "A" * 43 + "=", "ip": "10.66.3.7", "endpoints": ["192.168.1.11:51002"]}
+    assert rc.direct_neighbors(cfg | {"direct": [good]}) == [good]
+    assert rc.direct_neighbors(cfg | {"direct_enabled": False, "direct": [good]}) == []
+    bad = [
+        good | {"ip": "10.66.4.7"},                        # чужая подсеть
+        good | {"ip": "10.66.3.2"},                        # свой адрес
+        good | {"ip": "10.66.0.1"},                        # сервер
+        good | {"public_key": "S" * 43 + "="},             # ключ сервера
+        good | {"public_key": "x\nAllowedIPs=0.0.0.0/0"},
+        good | {"endpoints": ["8.8.8.8:53"]},              # интернет — не локальная сеть
+        good | {"endpoints": ["10.66.3.9:51820"]},          # сеть Retix Hub
+        good | {"endpoints": ["127.0.0.1:51820", "169.254.1.1:1"]},
+        good | {"endpoints": ["192.168.1.11:0"]},
+        good | {"endpoints": ["192.168.1.11"]},
+        {"id": 1},
+    ]
+    assert rc.direct_neighbors(cfg | {"direct": bad}) == []
+    assert rc.direct_neighbors(cfg | {"direct": [good]}, own_key=good["public_key"]) == []
+    mixed = rc.direct_neighbors(cfg | {"direct": [good | {"endpoints": ["8.8.8.8:1", "10.0.5.3:51002"]}]})
+    assert mixed[0]["endpoints"] == ["10.0.5.3:51002"]
+
+
+def test_wg_dump_and_handshake_parsing(monkeypatch):
+    out = ("PRIV\tPUB\t51234\toff\n"
+           "SRV=\t(none)\t203.0.113.1:51820\t10.66.3.0/24,10.66.0.1/32\t1700000000\t100\t200\t25\n"
+           "NB=\t(none)\t(none)\t(none)\t0\t0\t0\t10\n")
+    d = rc.parse_wg_dump(out)
+    assert d["listen_port"] == 51234
+    assert d["peers"]["NB="] == {"endpoint": "", "allowed_ips": "", "handshake": 0, "rx": 0}
+    assert d["peers"]["SRV="]["handshake"] == 1700000000
+    monkeypatch.setattr(rc, "run", lambda args, timeout=60: (0, "SRV=\t1700000000\nNB=\t1800000000\n"))
+    assert rc.Tunnel.last_handshake("SRV=") == 1700000000      # прямой сосед не маскирует связь с сервером
+    assert rc.Tunnel.last_handshake("GONE=") == 0
+    assert rc.Tunnel.last_handshake() == 1800000000
+
+
+def test_local_addresses_filter(monkeypatch):
+    out = ("1: lo    inet 127.0.0.1/8 scope host lo\n"
+           "2: eth0    inet 192.168.1.15/24 brd 192.168.1.255 scope global eth0\n"
+           "3: wifi    inet 169.254.3.4/16 scope link wifi\n"
+           "4: retixhub    inet 10.66.3.2/32 scope global retixhub\n"
+           "5: wan    inet 8.8.4.4/24 scope global wan\n"
+           "6: office    inet 10.1.2.3/8 scope global office\n")
+    monkeypatch.setattr(rc, "WINDOWS", False)
+    monkeypatch.setattr(rc, "run", lambda args, timeout=60: (0, out))
+    assert REAL_LOCAL_ADDRESSES() == ["192.168.1.15/24", "10.1.2.3/8"]

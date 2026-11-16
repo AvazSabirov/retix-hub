@@ -1,4 +1,6 @@
 """Бизнес-логика, общая для API клиента, кабинета компании и суперадмина."""
+import ipaddress
+import json
 import logging
 import re
 import sqlite3
@@ -71,13 +73,112 @@ def audit(conn, company_id, action: str, details: str = "") -> None:
 def list_devices(conn, company_id: int) -> list[dict]:
     rows = conn.execute("SELECT * FROM devices WHERE company_id=? ORDER BY is_share_host DESC, name",
                         (company_id,)).fetchall()
-    return [dict(r, online=is_online(r), status=device_status(r)) for r in rows]
+    names = {r["id"]: r["name"] for r in rows}
+    full_lan = bool((conn.execute("SELECT full_lan FROM companies WHERE id=?", (company_id,)).fetchone()
+                     or {"full_lan": 0})["full_lan"])
+    out = []
+    for r in rows:
+        online = is_online(r)
+        direct = [names[i] for i in _json_ints(r["direct_ids"]) if i in names] \
+            if full_lan and online and time.time() - r["lan_at"] < LAN_FRESH_SECONDS else []
+        out.append(dict(r, online=online, status=device_status(r), direct_peers=direct))
+    return out
 
 
 def share_host(conn, company_id: int):
     return conn.execute(
         "SELECT * FROM devices WHERE company_id=? AND is_share_host=1 AND is_blocked=0 "
         "AND is_approved=1 ORDER BY id LIMIT 1", (company_id,)).fetchone()
+
+
+# ---------- прямой путь по локальной сети ----------
+# Компания с «любым трафиком между ПК» (full_lan): ПК одной локальной сети шлют друг другу пакеты
+# WireGuard напрямую, а не через сервер. Сервер только сводит соседей: каждый ПК сообщает адреса своей
+# локальной сети и UDP-порт WireGuard (heartbeat), а в /api/me получает список соседей. Сам путь клиент
+# проверяет: сосед становится «прямым», только когда с ним прошёл handshake, иначе трафик идёт через сервер.
+# Правила ping/папки/Radmin на сервере прямой трафик обошёл бы — поэтому только при full_lan.
+
+LAN_FRESH_SECONDS = 300   # адреса локальной сети старше — не верим (ПК их шлёт раз в минуту)
+LAN_MAX_ADDRS = 16
+VPN_NET = ipaddress.IPv4Network(f"{NET_PREFIX}.0.0/16")
+
+
+def _json_ints(value) -> list[int]:
+    try:
+        data = json.loads(value or "[]")
+        return [int(x) for x in data if isinstance(x, int)] if isinstance(data, list) else []
+    except (ValueError, TypeError):
+        return []
+
+
+def clean_lan(addrs) -> list[str]:
+    """Только частные IPv4 локальной сети вида 192.168.1.15/24: без 127.*, 169.254.*, 10.66.* и интернета."""
+    out = []
+    for a in addrs or []:
+        try:
+            iface = ipaddress.IPv4Interface(str(a).strip())
+        except ValueError:
+            continue
+        ip = iface.ip
+        net = iface.network
+        if (not ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_unspecified
+                or ip in VPN_NET or net.prefixlen < 8
+                or (net.prefixlen < 31 and ip in (net.network_address, net.broadcast_address))):
+            continue
+        if str(iface) not in out:
+            out.append(str(iface))
+    return out[:LAN_MAX_ADDRS]
+
+
+def _lan(dev) -> list[ipaddress.IPv4Interface]:
+    try:
+        return [ipaddress.IPv4Interface(a) for a in clean_lan(json.loads(dev["lan_addrs"] or "[]"))]
+    except (ValueError, TypeError):
+        return []
+
+
+def _public_ip(endpoint: str) -> str:
+    """'203.0.113.5:51234' -> '203.0.113.5' (откуда сервер видит пакеты WireGuard этого ПК)."""
+    host = (endpoint or "").rsplit(":", 1)[0].strip("[]")
+    return host if ":" in endpoint else ""
+
+
+def _lan_ready(dev, now: float) -> bool:
+    return bool(dev["wg_port"]) and now - dev["lan_at"] < LAN_FRESH_SECONDS
+
+
+def direct_neighbors(conn, dev, company) -> list[dict]:
+    """Соседи по локальной сети, с которыми ПК может связываться напрямую.
+    Соседи — ПК той же компании, которые выходят в интернет с того же внешнего IP (один офис за одним
+    роутером) или, если NAT нет вовсе, стоят в одной подсети. Адреса соседа: сначала из общей подсети."""
+    now = time.time()
+    if not company["full_lan"] or device_status(dev) != "active" or not dev["token_hash"] \
+            or not _lan_ready(dev, now):
+        return []
+    mine = _lan(dev)
+    my_ips = {m.ip for m in mine}
+    my_pub = _public_ip(dev["endpoint"])
+    if not mine or not my_pub:
+        return []
+    result = []
+    rows = conn.execute("SELECT * FROM devices WHERE company_id=? AND id<>? AND is_blocked=0 AND is_approved=1 "
+                        "AND token_hash IS NOT NULL ORDER BY id", (company["id"], dev["id"])).fetchall()
+    for o in rows:
+        if not is_online(o) or not _lan_ready(o, now):
+            continue
+        theirs = [t for t in _lan(o) if t.ip not in my_ips]
+        their_pub = _public_ip(o["endpoint"])
+        shared = [t for t in theirs if any(t.ip in m.network for m in mine)]
+        if their_pub and their_pub == my_pub:          # один офис за одним роутером
+            candidates = shared + [t for t in theirs if t not in shared]
+        elif my_pub in {str(i) for i in my_ips} and their_pub in {str(t.ip) for t in _lan(o)}:
+            candidates = shared                         # без NAT: ПК и сервер в одной сети
+        else:
+            continue
+        if candidates:
+            result.append({"id": o["id"], "public_key": o["public_key"], "ip": o["ip"],
+                           "endpoints": [f"{t.ip}:{o['wg_port']}" for t in candidates[:4]]})
+    return result
 
 
 def client_config(conn, dev, company) -> dict:
@@ -105,6 +206,9 @@ def client_config(conn, dev, company) -> dict:
             "hostname": share["hostname"],
             "name": company["share_name"],
         } if share else None,
+        # прямой путь по локальной сети: включён ли в компании и с кем можно попробовать
+        "direct_enabled": bool(company["full_lan"]),
+        "direct": direct_neighbors(conn, dev, company),
     }
 
 

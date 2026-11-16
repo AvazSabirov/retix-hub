@@ -1,4 +1,5 @@
 """API для Windows-клиента."""
+import json
 import time
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
@@ -36,6 +37,11 @@ MESSAGES_KEEP_DAYS = 7
 
 class HeartbeatIn(BaseModel):
     client_version: str = Field(default="", max_length=32)
+    # прямой путь по локальной сети (клиенты 1.0.11+): адреса ПК в локальной сети, порт WireGuard
+    # и с какими ПК связь сейчас идёт напрямую. Старые клиенты эти поля не шлют.
+    lan: list[str] | None = Field(default=None, max_length=services.LAN_MAX_ADDRS)
+    wg_port: int = Field(default=0, ge=0, le=65535)
+    direct: list[int] = Field(default_factory=list, max_length=254)
 
 
 def _token_reused(conn, device_id: int, now: int) -> None:
@@ -243,5 +249,9 @@ def heartbeat(data: HeartbeatIn, ctx=Depends(current_device)):
     conn, dev, _ = ctx
     conn.execute("UPDATE devices SET last_seen=CURRENT_TIMESTAMP, client_version=? WHERE id=?",
                  (data.client_version, dev["id"]))
+    if data.lan is not None:
+        conn.execute("UPDATE devices SET lan_addrs=?, wg_port=?, lan_at=?, direct_ids=? WHERE id=?",
+                     (json.dumps(services.clean_lan(data.lan)), data.wg_port, int(time.time()),
+                      json.dumps(sorted(set(data.direct))), dev["id"]))
     conn.commit()
     return {"ok": True}
