@@ -142,8 +142,13 @@ build.bat
    (онлайн сверху, полоски сигнала / серый крестик). Крестик окна прячет программу в трей (значок возле часов,
    цвет точки — статус), VPN работает дальше. Двойной щелчок по значку — окно.
    Повторный запуск программы (ярлык) просто показывает окно.
-5. Двойной щелчок по компьютеру — его общие папки (`\\10.66.N.x`). Правый щелчок: «Подключить сетевой диск…»
-   (`net use` + логин через `cmdkey`), «Ping», «Копировать IP».
+5. Двойной щелчок по компьютеру — его общие папки (`\\10.66.N.x`). Правый щелчок, как в Radmin:
+   * «Сообщение» — переписка с этим ПК (через сервер, только внутри компании; входящее всплывает поверх окон
+     и уведомлением в трее);
+   * «Копировать IP-адрес», «Пинг», «Общие папки», «Подключить сетевой диск…» (`net use` + логин через `cmdkey`);
+   * «Удалённый рабочий стол» — `mstsc` (RDP): на том ПК должен быть включён удалённый рабочий стол (Windows Pro),
+     а в кабинете компании открыт порт 3389 (поле портов `445,3389` или «любой трафик между ПК»);
+   * «Свойства» — имя, компьютер, IP, последняя связь, версия Retix Hub.
 6. На каждом ПК добавляет в firewall Windows правила «RetixHub SMB» и «RetixHub Ping» (только из подсети
    компании) — иначе Windows закрывает общие папки на интерфейсе VPN. Файл `hosts` не трогает.
 7. Кнопка OFF снимает туннель (и после перезагрузки остаётся выключенным), ON — подключает без пароля.
@@ -175,7 +180,7 @@ build.bat
 
 ```bash
 pip install -r server/requirements.txt -r client/requirements.txt pytest httpx
-python -m pytest tests/test_server.py tests/test_client.py -q   # 115 тестов, ~2 мин
+python -m pytest tests/test_server.py tests/test_client.py -q   # 119 тестов, ~2 мин
 sudo python3 tests/e2e_network.py                               # 50 проверок на настоящей сети
 ```
 
@@ -196,4 +201,4 @@ DATA_DIR=./devdata WG_DRY_RUN=1 COOKIE_SECURE=0 SUPERADMIN_PASSWORD=test python 
 ```
 `WG_DRY_RUN=1` — wg и iptables не вызываются, команды только пишутся в лог.
 
-API клиента: `POST /api/register`, `GET /api/me`, `GET /api/peers`, `POST /api/heartbeat`, `GET /api/ping`.
+API клиента: `POST /api/register`, `GET /api/me`, `GET /api/peers`, `POST /api/heartbeat`, `POST /api/messages`, `GET /api/messages`, `GET /api/ping`.

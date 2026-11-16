@@ -106,6 +106,7 @@ class Client:
         self.tunnel = FakeTunnel()
         self.fw = []
         self.hostname = hostname
+        self.events_seen = []
         self.w = rc.Worker(self.state, queue.Queue(), tunnel=self.tunnel)
 
     def step(self, n=1):
@@ -117,6 +118,7 @@ class Client:
         st = None
         while not self.w.events.empty():
             kind, data = self.w.events.get()
+            self.events_seen.append((kind, data))
             if kind == "status":
                 st = data
             elif kind == "peers":
@@ -392,6 +394,19 @@ def test_power_off_and_on(make_client, company):
     c.step()
     assert c.step()["status"] == rc.Status.ONLINE and c.tunnel.installs == 2
     assert c.state.get("token")                          # вход сохранён — пароль не нужен
+
+
+def test_messages_between_pcs(make_client, company):
+    a = make_client("PC1"); login(a, company, name="Склад"); a.step(2)
+    b = make_client("PC2"); login(b, company, name="Бухгалтерия"); b.step(2)
+    assert a.w.send_message(b.w.cfg["device_id"], "Отчёт готов") is None
+    b.step()
+    msgs = [d for k, d in b.events_seen if k == "messages"]
+    assert msgs and msgs[-1]["messages"][0]["text"] == "Отчёт готов"
+    assert msgs[-1]["messages"][0]["from_name"] == "Склад"
+    b.step()
+    assert len([1 for k, _ in b.events_seen if k == "messages"]) == 1      # повторно не приходит
+    assert "не найден" in a.w.send_message(999999, "x")
 
 
 def test_natural_sort():
