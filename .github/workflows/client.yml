@@ -2,7 +2,9 @@ name: Клиент Windows
 
 # Сборка RetixHub.exe и установщика RetixHub_Setup_<версия>.exe (client/build.bat).
 #  - push в любую ветку с изменениями в client/ -> установщик в Artifacts запуска;
-#  - тег v<версия> (например v1.0.0) -> ещё и GitHub Release с установщиком.
+#  - тег v<версия> (например v1.0.0) -> ещё и GitHub Release с установщиком;
+#  - Release, созданный вручную на GitHub (Releases -> Draft a new release, тег v<версия>)
+#    -> установщик прикрепляется к нему.
 #    Тег должен совпадать с VERSION в client/retixhub_client.py.
 on:
   push:
@@ -11,6 +13,8 @@ on:
     paths:
       - 'client/**'
       - '.github/workflows/client.yml'
+  release:
+    types: [published]
   workflow_dispatch:
 
 permissions:

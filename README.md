@@ -78,11 +78,13 @@ Workflow `.github/workflows/client.yml` собирает установщик н
 * тег `v<версия>` (например `v1.0.0`) → ещё и **Releases** с установщиком.
   Тег должен совпадать с `VERSION` в `client/retixhub_client.py`.
 
-Выпуск новой версии: поменять `VERSION` в `client/retixhub_client.py`, закоммитить, затем
+Выпуск новой версии: поменять `VERSION` в `client/retixhub_client.py`, закоммитить, затем либо
 ```bash
 git tag v1.0.1
 git push origin v1.0.1
 ```
+либо на GitHub: **Releases → Draft a new release** → тег `v1.0.1` → **Publish release** — установщик
+соберётся и прикрепится к релизу сам (через 3–5 минут).
 
 ### Сборка на своём ПК
 
