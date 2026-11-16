@@ -19,6 +19,15 @@ class RegisterIn(BaseModel):
     client_version: str = Field(default="", max_length=32)
 
 
+class MessageIn(BaseModel):
+    to: int
+    text: str = Field(min_length=1, max_length=2000)
+
+
+MESSAGES_PER_MINUTE = 30
+MESSAGES_KEEP_DAYS = 7
+
+
 class HeartbeatIn(BaseModel):
     client_version: str = Field(default="", max_length=32)
 
@@ -114,10 +123,55 @@ def peers(ctx=Depends(current_device)):
             "ip": d["ip"],
             "online": d["online"],
             "last_handshake": d["last_handshake"],
+            "client_version": d["client_version"],
             "is_share_host": bool(d["is_share_host"]),
             "is_me": d["id"] == dev["id"],
         })
     return {"company": company["name"] or company["login"], "peers": result}
+
+
+def _require_active(dev):
+    if services.device_status(dev) != "active":
+        raise HTTPException(403, "Устройство не активно")
+
+
+@router.post("/messages")
+def send_message(data: MessageIn, ctx=Depends(current_device)):
+    """Сообщение другому ПК своей компании. Доставляется, когда получатель спросит /api/messages."""
+    conn, dev, company = ctx
+    _require_active(dev)
+    text = data.text.strip()
+    if not text:
+        raise HTTPException(400, "Пустое сообщение")
+    target = conn.execute("SELECT * FROM devices WHERE id=? AND company_id=?", (data.to, company["id"])).fetchone()
+    if not target or services.device_status(target) != "active":
+        raise HTTPException(404, "Получатель не найден")
+    now = int(time.time())
+    sent = conn.execute("SELECT COUNT(*) FROM messages WHERE from_device_id=? AND created_at>?",
+                        (dev["id"], now - 60)).fetchone()[0]
+    if sent >= MESSAGES_PER_MINUTE:
+        raise HTTPException(429, "Слишком много сообщений, подождите минуту")
+    conn.execute("INSERT INTO messages(company_id, from_device_id, to_device_id, text, created_at) VALUES (?,?,?,?,?)",
+                 (company["id"], dev["id"], target["id"], text, now))
+    conn.execute("DELETE FROM messages WHERE created_at<?", (now - MESSAGES_KEEP_DAYS * 86400,))
+    conn.commit()
+    return {"ok": True}
+
+
+@router.get("/messages")
+def get_messages(ctx=Depends(current_device)):
+    """Новые сообщения этому ПК; каждое отдаётся один раз."""
+    conn, dev, _ = ctx
+    _require_active(dev)
+    rows = conn.execute(
+        "SELECT m.id, m.from_device_id, m.text, m.created_at, d.name AS from_name, d.ip AS from_ip "
+        "FROM messages m LEFT JOIN devices d ON d.id=m.from_device_id "
+        "WHERE m.to_device_id=? AND m.delivered=0 ORDER BY m.id LIMIT 50", (dev["id"],)).fetchall()
+    if rows:
+        conn.executemany("UPDATE messages SET delivered=1 WHERE id=?", [(r["id"],) for r in rows])
+        conn.commit()
+    return {"messages": [{"id": r["id"], "from_id": r["from_device_id"], "from_name": r["from_name"] or "—",
+                          "from_ip": r["from_ip"] or "", "text": r["text"], "time": r["created_at"]} for r in rows]}
 
 
 @router.post("/heartbeat")

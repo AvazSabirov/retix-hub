@@ -257,6 +257,12 @@ class Api:
     def heartbeat(self):
         return self._req("POST", "/api/heartbeat", json={"client_version": VERSION})
 
+    def send_message(self, to: int, text: str):
+        return self._req("POST", "/api/messages", json={"to": to, "text": text})
+
+    def messages(self):
+        return self._req("GET", "/api/messages")
+
 
 # ====================================================================== WireGuard
 
@@ -449,6 +455,16 @@ class Worker(threading.Thread):
         self.state.set(last_conf_hash="")
         self.wake.set()
 
+    def send_message(self, to: int, text: str) -> str | None:
+        """Отправить сообщение ПК своей компании (из потока окна). None — отправлено, иначе текст ошибки."""
+        try:
+            self.api.send_message(to, text)
+        except ApiError as e:
+            return e.detail
+        except ServerUnreachable:
+            return "Сервер недоступен, сообщение не отправлено."
+        return None
+
     # --- внутреннее
     def _register(self, password: str):
         _, pub = self.state.keypair()
@@ -586,6 +602,15 @@ class Worker(threading.Thread):
         except (ApiError, ServerUnreachable):
             peers = []
         self.emit("peers", peers=peers)
+
+        # 6. новые сообщения от других ПК
+        try:
+            msgs = self.api.messages()["messages"]
+            if msgs:
+                log.info("сообщений: %d", len(msgs))
+                self.emit("messages", messages=msgs)
+        except (ApiError, ServerUnreachable):
+            pass
 
         if now - self.last_heartbeat > HEARTBEAT_EVERY:
             try:
@@ -746,6 +771,75 @@ class LoginDialog(tk.Toplevel):
             self.close()
 
 
+class MessageWindow(tk.Toplevel):
+    """Переписка с одним компьютером: входящие показываются здесь, отсюда же — ответ."""
+
+    def __init__(self, app: "App", peer: dict):
+        super().__init__(app)
+        self.app, self.peer = app, peer
+        self.title(f"Сообщения — {peer['name']}")
+        self.configure(bg=C["bg"])
+        self.geometry("380x360")
+        self.minsize(300, 240)
+        try:
+            self.iconbitmap(str(resource_dir() / "app_icon.ico"))
+        except Exception:  # noqa: BLE001
+            pass
+        head = tk.Label(self, text=f"{peer['name']}   {peer.get('ip', '')}", bg=C["head"], fg=C["text"],
+                        font=("Segoe UI", 10, "bold"), anchor="w", padx=10, pady=6)
+        head.pack(fill="x")
+        self.log = tk.Text(self, bg=C["panel"], fg=C["text"], relief="flat", wrap="word", height=10,
+                           font=("Segoe UI", 10), padx=8, pady=6, state="disabled", cursor="arrow",
+                           highlightthickness=0)
+        self.log.tag_configure("me", foreground=C["name"], font=("Segoe UI", 9, "bold"))
+        self.log.tag_configure("them", foreground=C["green"], font=("Segoe UI", 9, "bold"))
+        self.log.tag_configure("err", foreground=C["red"])
+        self.log.pack(fill="both", expand=True, padx=8, pady=(8, 4))
+        bottom = tk.Frame(self, bg=C["bg"])
+        bottom.pack(fill="x", padx=8, pady=(0, 8))
+        self.btn = ttk.Button(bottom, text="Отправить", command=self.send)
+        self.btn.pack(side="right", padx=(6, 0), fill="y")
+        self.entry = tk.Text(bottom, height=3, bg=C["entry"], fg=C["text"], insertbackground=C["text"],
+                             relief="flat", wrap="word", font=("Segoe UI", 10), padx=6, pady=4,
+                             highlightthickness=1, highlightbackground=C["line"], highlightcolor=C["on"])
+        self.entry.pack(side="left", fill="both", expand=True)
+        self.entry.bind("<Return>", self._enter)
+        self.entry.focus_set()
+        self.protocol("WM_DELETE_WINDOW", self.close)
+
+    def _enter(self, event):
+        if event.state & 0x1:  # Shift+Enter — новая строка
+            return None
+        self.send()
+        return "break"
+
+    def add(self, who: str, text: str, ts: float | None = None, tag: str = "them"):
+        stamp = time.strftime("%H:%M", time.localtime(ts or time.time()))
+        self.log.config(state="normal")
+        self.log.insert("end", f"{who}  {stamp}\n", tag)
+        self.log.insert("end", text.rstrip() + "\n\n", "err" if tag == "err" else ())
+        self.log.config(state="disabled")
+        self.log.see("end")
+
+    def send(self):
+        text = self.entry.get("1.0", "end").strip()
+        if not text:
+            return
+        self.entry.delete("1.0", "end")
+        self.add("Я", text, tag="me")
+        peer_id = self.peer["id"]
+
+        def work():
+            err = self.app.worker.send_message(peer_id, text)
+            if err:
+                self.app.ui_q.put(("msg_error", (peer_id, err)))
+        threading.Thread(target=work, daemon=True, name="message").start()
+
+    def close(self):
+        self.app.chats.pop(self.peer["id"], None)
+        self.destroy()
+
+
 class Tray:
     """Значок в области уведомлений (pystray, свой поток). Команды — в очередь главного потока."""
 
@@ -798,6 +892,14 @@ class Tray:
         except Exception:  # noqa: BLE001
             log.exception("трей: обновление")
 
+    def notify(self, title: str, text: str):
+        if not self.icon:
+            return
+        try:
+            self.icon.notify(text or " ", title)
+        except Exception:  # noqa: BLE001
+            log.debug("трей: уведомление не показано", exc_info=True)
+
     def stop(self):
         if self.icon:
             try:
@@ -820,6 +922,7 @@ class App(tk.Tk):
         self.last_status = None
         self.status_now = None
         self.collapsed = False
+        self.chats: dict[int, MessageWindow] = {}
 
         self.title(APP_TITLE)
         try:
@@ -919,11 +1022,16 @@ class App(tk.Tk):
         self.tree.bind("<Button-3>", self.peer_menu)
 
         self.ctx = tk.Menu(self, tearoff=0)
-        self.ctx.add_command(label="Открыть общие папки", command=self.open_shares)
-        self.ctx.add_command(label="Подключить сетевой диск…", command=self.map_drive)
+        self.ctx.add_command(label="Сообщение", command=self.message)
         self.ctx.add_separator()
-        self.ctx.add_command(label="Ping", command=self.ping)
-        self.ctx.add_command(label="Копировать IP", command=self.copy_ip)
+        self.ctx.add_command(label="Копировать IP-адрес", command=self.copy_ip)
+        self.ctx.add_separator()
+        self.ctx.add_command(label="Пинг", command=self.ping)
+        self.ctx.add_command(label="Общие папки", command=self.open_shares, font=("Segoe UI", 9, "bold"))
+        self.ctx.add_command(label="Подключить сетевой диск…", command=self.map_drive)
+        self.ctx.add_command(label="Удалённый рабочий стол", command=self.remote_desktop)
+        self.ctx.add_separator()
+        self.ctx.add_command(label="Свойства", command=self.properties)
 
         self.msg_lbl = tk.Label(self, text="", bg=C["bg"], fg=C["muted"], anchor="w", justify="left",
                                 wraplength=330, padx=10)
@@ -951,6 +1059,8 @@ class App(tk.Tk):
                     self._on_status(**data)
                 elif kind == "peers":
                     self._on_peers(data["peers"])
+                elif kind == "messages":
+                    self._on_messages(data["messages"])
         except queue.Empty:
             pass
         try:
@@ -977,6 +1087,10 @@ class App(tk.Tk):
             messagebox.showinfo(APP_TITLE, data, parent=self)
         elif kind == "error":
             messagebox.showerror(APP_TITLE, data, parent=self)
+        elif kind == "msg_error":
+            peer_id, err = data
+            if peer_id in self.chats:
+                self.chats[peer_id].add("Не отправлено", err, tag="err")
 
     def _on_status(self, status, text, cfg):
         self.status_now = status
@@ -1112,6 +1226,66 @@ class App(tk.Tk):
         if p and WINDOWS:
             subprocess.Popen(["cmd", "/k", f"title Ping {p['name']} & ping -t {p['ip']}"],
                              creationflags=subprocess.CREATE_NEW_CONSOLE)
+
+    def _on_messages(self, msgs):
+        for m in msgs:
+            peer = next((p for p in self.peers if p["id"] == m["from_id"]), None) or \
+                {"id": m["from_id"] or -m["id"], "name": m["from_name"], "ip": m["from_ip"]}
+            win = self.open_chat(peer)
+            win.add(peer["name"], m["text"], m["time"])
+        if msgs:
+            # окно сообщения — поверх всех, чтобы его увидели (даже если программа в трее)
+            last = msgs[-1]
+            win = self.chats.get(last["from_id"])
+            if win:
+                win.deiconify()
+                win.lift()
+                win.attributes("-topmost", True)
+                win.after(1500, lambda w=win: w.winfo_exists() and w.attributes("-topmost", False))
+                if WINDOWS:
+                    win.bell()
+            self.tray.notify(f"Сообщение от {last['from_name']}", last["text"][:200])
+
+    def open_chat(self, peer: dict) -> "MessageWindow":
+        win = self.chats.get(peer["id"])
+        if not win or not win.winfo_exists():
+            win = MessageWindow(self, peer)
+            self.chats[peer["id"]] = win
+        return win
+
+    def message(self):
+        p = self.selected_peer()
+        if p:
+            win = self.open_chat(p)
+            win.deiconify()
+            win.lift()
+            win.entry.focus_set()
+
+    def remote_desktop(self):
+        """Удалённый рабочий стол Windows (RDP). На том ПК он должен быть включён (Windows Pro),
+        а в кабинете компании открыт порт 3389 (или «любой трафик между ПК»)."""
+        p = self.selected_peer()
+        if not p:
+            return
+        if WINDOWS:
+            subprocess.Popen(["mstsc", f"/v:{p['ip']}"])
+
+    def properties(self):
+        p = self.selected_peer()
+        if not p:
+            return
+        hs = p.get("last_handshake") or 0
+        seen = time.strftime("%d.%m.%Y %H:%M", time.localtime(hs)) if hs else "—"
+        messagebox.showinfo(f"Свойства — {p['name']}", "\n".join([
+            f"Имя:  {p['name']}",
+            f"Компьютер:  {p.get('hostname') or '—'}",
+            f"IP-адрес:  {p['ip']}",
+            f"Статус:  {'в сети' if p['online'] else 'не в сети'}",
+            f"Последняя связь:  {seen}",
+            f"Версия Retix Hub:  {p.get('client_version') or '—'}",
+            "",
+            f"Общие папки:  \\\\{p['ip']}",
+        ]), parent=self)
 
     def copy_ip(self):
         p = self.selected_peer()

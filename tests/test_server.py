@@ -245,6 +245,36 @@ class TestIsolation:
         assert "отключена" in ctx.TestClient(ctx.app).post(
             "/cabinet/login", data={"login": "login1", "password": "cab123"}).text
 
+    def test_messages_within_company(self, ctx):
+        a1, a2, b1 = self.setup_two(ctx)
+        h1, h2, hb = ctx.h(a1["token"]), ctx.h(a2["token"]), ctx.h(b1["token"])
+        assert ctx.api.post("/api/messages", headers=h1, json={"to": a2["device_id"], "text": " Привет "}).status_code == 200
+        msgs = ctx.api.get("/api/messages", headers=h2).json()["messages"]
+        assert [(m["from_name"], m["from_ip"], m["text"]) for m in msgs] == [("A-PC1", a1["ip"], "Привет")]
+        assert ctx.api.get("/api/messages", headers=h2).json()["messages"] == []   # отдаётся один раз
+        # в чужую компанию нельзя — и не видно, что такой ПК есть
+        assert ctx.api.post("/api/messages", headers=hb, json={"to": a1["device_id"], "text": "x"}).status_code == 404
+        assert ctx.api.post("/api/messages", headers=h1, json={"to": b1["device_id"], "text": "x"}).status_code == 404
+        assert ctx.api.get("/api/messages", headers=hb).json()["messages"] == []
+        assert ctx.api.post("/api/messages", headers=h1, json={"to": a2["device_id"], "text": "   "}).status_code == 400
+        assert ctx.api.post("/api/messages", headers=h1, json={"to": a2["device_id"], "text": "x" * 2001}).status_code == 422
+        assert ctx.api.post("/api/messages", json={"to": a2["device_id"], "text": "x"}).status_code == 401
+
+    def test_messages_rate_limit(self, ctx):
+        a1, a2, _ = self.setup_two(ctx)
+        h1 = ctx.h(a1["token"])
+        codes = [ctx.api.post("/api/messages", headers=h1, json={"to": a2["device_id"], "text": str(i)}).status_code
+                 for i in range(32)]
+        assert codes.count(200) == 30 and codes[-1] == 429
+
+    def test_blocked_device_cannot_message(self, ctx):
+        a1, a2, _ = self.setup_two(ctx)
+        ctx.cabinet("login1").post(f"/cabinet/devices/{a1['device_id']}/block")
+        r = ctx.api.post("/api/messages", headers=ctx.h(a1["token"]), json={"to": a2["device_id"], "text": "x"})
+        assert r.status_code == 403
+        r = ctx.api.post("/api/messages", headers=ctx.h(a2["token"]), json={"to": a1["device_id"], "text": "x"})
+        assert r.status_code == 404
+
     def test_firewall_rules_per_company(self, ctx, net):
         a1, a2, b1 = self.setup_two(ctx)
         rules = net["rules"]
