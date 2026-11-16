@@ -2,7 +2,7 @@
 # Сборка и запуск (или обновление) Retix Hub в Docker — без docker compose.
 #   cd server && cp .env.example .env && nano .env && ./run.sh
 # Повторный запуск = обновление: образ пересобирается, контейнер пересоздаётся.
-# Данные (база, ключи, downloads/) — на хосте в HUB_DATA из .env, по умолчанию /root/hub.
+# Данные (база, ключи, downloads/) — на хосте в HUB_DATA из .env, по умолчанию /root/hub/data.
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -11,7 +11,7 @@ if [ ! -f .env ]; then
     exit 1
 fi
 HUB_DATA=$(grep -E '^HUB_DATA=' .env | tail -n 1 | cut -d= -f2- || true)
-HUB_DATA=${HUB_DATA:-/root/hub}
+HUB_DATA=${HUB_DATA:-/root/hub/data}
 mkdir -p "$HUB_DATA"
 
 docker build -t retixhub .
