@@ -10,7 +10,7 @@ os.makedirs(DATA_DIR, exist_ok=True)
 
 DB_PATH = os.path.join(DATA_DIR, "vpn.db")
 SERVER_KEY_FILE = os.path.join(DATA_DIR, "server.key")
-DOWNLOADS_DIR = os.path.join(DATA_DIR, "downloads")  # сюда кладётся RetixHub.exe для скачивания
+DOWNLOADS_DIR = os.path.join(DATA_DIR, "downloads")  # сюда кладётся RetixHub_Setup_<версия>.exe (или RetixHub.exe) для скачивания
 
 # WireGuard
 WG_IF = os.getenv("WG_IF", "wg0")
