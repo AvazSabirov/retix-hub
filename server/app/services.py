@@ -93,6 +93,7 @@ def client_config(conn, dev, company) -> dict:
         "allowed_ips": f"{subnet(company)}, {SERVER_IP}/32",
         "keepalive": WG_KEEPALIVE,
         "is_share_host": bool(dev["is_share_host"]),
+        "show_peers": bool(dev["show_peers"]),
         "share_ports": company["share_ports"],
         "radmin_port": RADMIN_PORT,
         "share": {
@@ -187,6 +188,11 @@ def device_action(conn, company_id: int, device_id: int, action: str, value: str
         elif action == "unshare":
             conn.execute("UPDATE devices SET is_share_host=0 WHERE id=?", (device_id,))
             msg = "Отметка общей папки снята"
+        elif action in ("peers_on", "peers_off"):
+            # только то, что видно в программе: сеть (ping, папки, Radmin) не меняется
+            conn.execute("UPDATE devices SET show_peers=? WHERE id=?", (1 if action == "peers_on" else 0, device_id))
+            msg = (f"{dev['name']} видит другие компьютеры в программе" if action == "peers_on" else
+                   f"{dev['name']} больше не видит другие компьютеры в программе (сеть не изменилась)")
         elif action == "rename":
             name = (value or "").strip()[:64]
             if not name:

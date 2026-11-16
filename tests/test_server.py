@@ -959,3 +959,46 @@ class TestUpdates:
         page = ctx.admin.get("/admin").text
         assert 'href="/admin/updates"' in page
         assert "Обновления клиента" in ctx.admin.get("/admin/updates").text
+
+
+# ---------------------------------------------------------------- доступ «видит другие ПК» (только в программе)
+
+class TestPeerAccess:
+    def test_hidden_list_and_no_sending_but_network_same(self, ctx, net):
+        ctx.company("firma1")
+        a, b = ctx.register("firma1", "Офис"), ctx.register("firma1", "Касса")
+        ha, hb = ctx.h(a["token"]), ctx.h(b["token"])
+        assert {p["name"] for p in ctx.api.get("/api/peers", headers=hb).json()["peers"]} == {"Офис", "Касса"}
+        assert ctx.api.get("/api/me", headers=hb).json()["show_peers"] is True     # по умолчанию — видит
+        rules_before = list(net["rules"])
+        cab = ctx.cabinet("firma1")
+        assert "больше не видит" in cab.post(f"/cabinet/devices/{b['device_id']}/peers_off").text
+        r = ctx.api.get("/api/peers", headers=hb).json()
+        assert [p["name"] for p in r["peers"]] == ["Касса"] and r["peers"][0]["is_me"] and r["peers_hidden"] is True
+        assert ctx.api.get("/api/me", headers=hb).json()["show_peers"] is False
+        # писать нельзя, получать — можно (офис пишет кассе)
+        r = ctx.api.post("/api/messages", headers=hb, json={"to": a["device_id"], "text": "привет"})
+        assert r.status_code == 403 and "доступ" in r.json()["detail"]
+        assert ctx.api.post("/api/messages", headers=ha, json={"to": b["device_id"], "text": "касса?"}).status_code == 200
+        assert [m["text"] for m in ctx.api.get("/api/messages", headers=hb).json()["messages"]] == ["касса?"]
+        # остальные его по-прежнему видят; сеть не изменилась
+        assert "Касса" in {p["name"] for p in ctx.api.get("/api/peers", headers=ha).json()["peers"]}
+        assert b["_key"] in net["peers"] and net["rules"] == rules_before
+        cab.post(f"/cabinet/devices/{b['device_id']}/peers_on")
+        assert len(ctx.api.get("/api/peers", headers=hb).json()["peers"]) == 2
+
+    def test_toggle_in_cabinet_and_admin_pages(self, ctx):
+        cid = ctx.company("firma1")
+        d = ctx.register("firma1")
+        page = ctx.cabinet("firma1").get("/cabinet").text
+        assert "Видит ПК" in page and f"/cabinet/devices/{d['device_id']}/peers_off" in page
+        ctx.admin.post(f"/admin/companies/{cid}/devices/{d['device_id']}/peers_off")
+        assert f"/admin/companies/{cid}/devices/{d['device_id']}/peers_on" in ctx.admin.get(f"/admin/companies/{cid}").text
+        assert "device_peers_off" in ctx.admin.get(f"/admin/companies/{cid}").text      # в журнале
+
+    def test_other_company_cannot_toggle(self, ctx):
+        ctx.company("firma1"); ctx.company("firma2")
+        d = ctx.register("firma2")
+        r = ctx.cabinet("firma1").post(f"/cabinet/devices/{d['device_id']}/peers_off")
+        assert "не найдено" in r.text
+        assert ctx.api.get("/api/me", headers=ctx.h(d["token"])).json()["show_peers"] is True
