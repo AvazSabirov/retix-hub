@@ -12,9 +12,9 @@
 ;     связь при обновлении не рвётся;
 ;   - старые файлы программы (_internal) удаляются, копируется новая сборка;
 ;   - WireGuard ставится из вложенного MSI, если его ещё нет;
-;   - ярлыки: рабочий стол и меню «Пуск». Автозапуск создаёт сам клиент
-;     (задача Планировщика «RetixHub» с правами администратора — без UAC
-;     при каждом входе в Windows);
+;   - ярлыки: рабочий стол и меню «Пуск»;
+;   - автозапуск сразу при установке: задача Планировщика «RetixHub» с правами
+;     администратора (без UAC при каждом входе в Windows), окно — в трее;
 ;   - после установки клиент запускается (кроме /SILENT и /VERYSILENT);
 ;   - данные в %ProgramData%\RetixHub (ключ, вход) и журнал {app}\logs установщик
 ;     при обновлении не трогает (журнал удаляется вместе с программой);
@@ -95,6 +95,9 @@ Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExe}"; WorkingDir: "{app
 Name: "{autoprograms}\{#AppName}"; Filename: "{app}\{#AppExe}"; WorkingDir: "{app}"
 
 [Run]
+; автозапуск при входе в Windows — сразу при установке: задача Планировщика с наивысшими правами
+; (программе нужны права администратора, а задача запускает её без окна UAC), окно — свёрнутым в трей
+Filename: "{sys}\schtasks.exe"; Parameters: "/Create /F /TN ""RetixHub"" /SC ONLOGON /RL HIGHEST /TR ""\""{app}\{#AppExe}\"" --minimized"""; Flags: runhidden waituntilterminated; StatusMsg: "Автозапуск при входе в Windows…"
 ; установщик уже с правами администратора — клиент стартует без второго окна UAC
 Filename: "{app}\{#AppExe}"; WorkingDir: "{app}"; Flags: nowait skipifsilent
 
