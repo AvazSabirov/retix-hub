@@ -69,6 +69,6 @@ jobs:
           body: |
             Установщик клиента Retix Hub для Windows 10/11 (x64). WireGuard внутри — ставится сам, если его нет.
 
-            На сервер: положите `RetixHub_Setup_${{ steps.ver.outputs.version }}.exe` в `/root/hub/downloads/` — сайт отдаст его по кнопке «Скачать».
+            На сервер: положите `RetixHub_Setup_${{ steps.ver.outputs.version }}.exe` в `/root/hub/data/downloads/` — сайт отдаст его по кнопке «Скачать».
 
             Тихая установка: `RetixHub_Setup_${{ steps.ver.outputs.version }}.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART`

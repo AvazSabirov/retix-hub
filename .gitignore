@@ -8,6 +8,7 @@ venv/
 # Секреты и данные сервера (база, ключи WireGuard, secret.key)
 .env
 server/data/
+/data/
 devdata/
 *.db
 *.key
