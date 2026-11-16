@@ -12,9 +12,9 @@ from conftest import new_pubkey
 class TestAdmin:
     def test_login_wrong_and_right(self, ctx):
         c = ctx.TestClient(ctx.app)
-        assert "err=1" in c.post("/admin/login", data={"login": "avaz", "password": "x"}, follow_redirects=False).headers["location"]
+        assert "err=1" in c.post("/admin/login", data={"login": "admin", "password": "x"}, follow_redirects=False).headers["location"]
         assert "err=1" in c.post("/admin/login", data={"login": "AVAZ", "password": "supersecret"}, follow_redirects=False).headers["location"]
-        assert c.post("/admin/login", data={"login": "avaz", "password": "supersecret"}, follow_redirects=False).headers["location"] == "/admin"
+        assert c.post("/admin/login", data={"login": "admin", "password": "supersecret"}, follow_redirects=False).headers["location"] == "/admin"
 
     def test_pages_require_login(self, ctx):
         c = ctx.TestClient(ctx.app)
