@@ -370,13 +370,13 @@ def test_hosts_never_touched(make_client, company, patch_windows):
 def test_firewall_on_every_pc(make_client, company):
     """Общие папки и ping открыты из подсети компании на каждом ПК, без отметки «ПК с папкой»."""
     a = make_client("PC1"); login(a, company, name="Склад"); a.step(2)
-    assert a.fw[-1] == (a.w.cfg["subnet"], "445")
+    assert a.fw[-1] == (a.w.cfg["subnet"], "445,4899")      # общие папки + Radmin Server
     n = len(a.fw)
     a.step(2)
     assert len(a.fw) == n                                 # без изменений — не трогаем
     company.cab.post(BASE + "/cabinet/settings", data={"share_name": "share", "share_ports": "445,139"})
     a.step()
-    assert a.fw[-1] == (a.w.cfg["subnet"], "445,139")
+    assert a.fw[-1] == (a.w.cfg["subnet"], "445,139,4899")
     a.w.logout()
     assert a.fw[-1][0] is None
 
@@ -444,3 +444,14 @@ def test_smb_check_closed_port():
     # на 127.0.0.1 порт 445 закрыт -> понятная причина, а не пустой ответ
     msg = rc.smb_check("127.0.0.1", timeout=0.5)
     assert msg.startswith("Компьютер не отвечает") and "\\\\" not in msg
+
+
+def test_radmin_ports_and_command(tmp_path):
+    assert rc.lan_ports({"share_ports": "445", "radmin_port": 4899}) == "445,4899"
+    assert rc.lan_ports({"share_ports": "445,4899"}) == "445,4899"           # без повтора
+    assert rc.lan_ports({}) == "445,4899"
+    exe = tmp_path / "Radmin.exe"; exe.write_bytes(b"MZ")
+    assert rc.find_radmin_viewer(str(exe)) == exe                            # сохранённый путь
+    assert rc.radmin_args(exe, "10.66.1.5", "full") == [str(exe), "/connect:10.66.1.5:4899"]
+    assert rc.radmin_args(exe, "10.66.1.5", "view")[-1] == "/noinput"
+    assert rc.radmin_args(exe, "10.66.1.5", "files")[-1] == "/file"

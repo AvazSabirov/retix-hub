@@ -25,6 +25,11 @@ SERVER_CIDR = f"{SERVER_IP}/16"
 
 # Через сколько секунд без handshake устройство считается offline
 ONLINE_SECONDS = int(os.getenv("ONLINE_SECONDS", "180"))
+# Radmin Server: Radmin Viewer подключается к нему по TCP 4899 — открыт между ПК компании всегда
+RADMIN_PORT = int(os.getenv("RADMIN_PORT", "4899"))
+
+# Журнал: по умолчанию только ошибки и предупреждения (+ одна строка о запуске). INFO — для разбора проблем.
+LOG_LEVEL = os.getenv("LOG_LEVEL", "WARNING").upper()
 
 # API (слушает только localhost, наружу — через nginx)
 API_HOST = os.getenv("API_HOST", "127.0.0.1")
