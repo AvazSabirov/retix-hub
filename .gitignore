@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Секреты и данные сервера (база, ключи WireGuard, secret.key)
+.env
+server/data/
+devdata/
+*.db
+*.key
+
+# Сборка клиента
+client/build/
+client/dist/
+*.spec
+*.exe
+*.msi
+
+# IDE / ОС
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
