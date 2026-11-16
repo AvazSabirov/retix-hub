@@ -37,7 +37,7 @@ import requests
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
 
-VERSION = "1.0.8"
+VERSION = "1.0.9"
 APP_NAME = "RetixHub"          # служебное имя: папки, задачи, мьютекс
 APP_TITLE = "Retix Hub"        # то, что видит пользователь
 TUNNEL = "retixhub"
@@ -1403,14 +1403,15 @@ class LoginDialog(tk.Toplevel):
         frm = ttk.Frame(self, padding=16)
         frm.pack(fill="both")
         self.vars = {
-            "server": tk.StringVar(value=st.get("server_url")),
+            "server": tk.StringVar(value=st.get("server_url") or State._default_server()),   # не показывается
             "company": tk.StringVar(value="" if add else st.get("company_login")),
             "password": tk.StringVar(),
             "device": tk.StringVar(value=st.get("device_name") or socket.gethostname()),
             "remember": tk.BooleanVar(value=True),
         }
-        rows = [("Сервер", "server", ""), ("Логин компании", "company", ""),
-                ("Пароль подключения", "password", "•"), ("Имя этого компьютера", "device", "")]
+        # адрес сервера зашит в программу (client_config.json) — его не спрашиваем
+        rows = [("Логин компании", "company", ""), ("Пароль подключения", "password", "•"),
+                ("Имя этого компьютера", "device", "")]
         for i, (label, key, show) in enumerate(rows):
             ttk.Label(frm, text=label).grid(row=i * 2, column=0, sticky="w", pady=(6 if i else 0, 2))
             e = ttk.Entry(frm, textvariable=self.vars[key], width=36, show=show)
@@ -1425,9 +1426,10 @@ class LoginDialog(tk.Toplevel):
         self.btn.grid(row=10, column=0, pady=(10, 0), sticky="ew")
         self.bind("<Return>", lambda _e: self.submit())
         self.protocol("WM_DELETE_WINDOW", self.close)
-        self.update_idletasks()   # по центру над главным окном
-        x = app.winfo_rootx() + (app.winfo_width() - self.winfo_reqwidth()) // 2
-        y = app.winfo_rooty() + 60
+        self.update_idletasks()   # по центру над главным окном (оно — в правом нижнем углу)
+        ax, ay, aw, _ = app.frame_box()
+        x = ax + (aw - self.winfo_reqwidth()) // 2
+        y = ay + 60
         self.geometry(f"+{max(0, x)}+{max(0, y)}")
         dark_titlebar(self)
         self.grab_set()
@@ -1438,7 +1440,7 @@ class LoginDialog(tk.Toplevel):
 
     def submit(self):
         v = {k: var.get() for k, var in self.vars.items()}
-        if not all(str(v[k]).strip() for k in ("server", "company", "password", "device")):
+        if not all(str(v[k]).strip() for k in ("company", "password", "device")):
             self.err.config(text="Заполните все поля")
             return
         self.btn.config(state="disabled", text="Подключение…")
@@ -1464,7 +1466,9 @@ class MessageWindow(tk.Toplevel):
         self.app, self.peer = app, peer
         self.title(f"Сообщения — {peer['name']}")
         self.configure(bg=C["bg"])
-        self.geometry("380x360")
+        ax, ay, _, ah = app.frame_box()
+        left, top, _, bottom = work_area(app)
+        self.geometry(f"380x360+{max(left, ax - 380 - 24)}+{max(top, min(ay + ah - 360, bottom - 360 - 40))}")
         self.minsize(300, 240)
         try:
             self.iconbitmap(str(resource_dir() / "app_icon.ico"))
@@ -1527,8 +1531,24 @@ class MessageWindow(tk.Toplevel):
 
 
 def tray_image(color: str, size: int = 64):
-    """Значок трея целиком в цвете статуса: как значок программы (узлы сети), только фон — цвет статуса."""
-    from PIL import Image, ImageDraw
+    """Значок трея целиком в цвете статуса: значок Retix (белая «R»), а фон — цвет статуса."""
+    from PIL import Image
+    try:
+        icon = Image.open(resource_dir() / "app_icon.ico")
+        icon.size = max(icon.info.get("sizes") or [icon.size])
+        src = icon.convert("RGBA").resize((size, size), Image.LANCZOS)
+        cr, cg, cb = (int(color[i:i + 2], 16) for i in (1, 3, 5))
+        out = Image.new("RGBA", src.size)
+        px, opx = src.load(), out.load()
+        for yy in range(src.size[1]):
+            for xx in range(src.size[0]):
+                r, g, b, a = px[xx, yy]
+                t = max(0.0, min(1.0, (min(r, g, b) - 90) / 150))   # белая буква — белая, фон — цвет
+                opx[xx, yy] = (int(cr + (255 - cr) * t), int(cg + (255 - cg) * t), int(cb + (255 - cb) * t), a)
+        return out
+    except Exception:  # noqa: BLE001 — нет значка: рисуем узлы сети
+        log.debug("значок трея из app_icon.ico не собран", exc_info=True)
+    from PIL import ImageDraw
     k = 4
     S = size * k
     img = Image.new("RGBA", (S, S), (0, 0, 0, 0))
@@ -1565,7 +1585,7 @@ class Tray:
             pystray.MenuItem("Подключить / отключить", lambda: self.ui_q.put(("toggle", None))),
             pystray.MenuItem("Переподключить", lambda: self.ui_q.put(("reconnect", None))),
             pystray.Menu.SEPARATOR,
-            pystray.MenuItem("Выход (VPN продолжит работать)", lambda: self.ui_q.put(("quit", None))),
+            pystray.MenuItem("Выход (VPN продолжит работать)", lambda: self.ui_q.put(("ask_quit", None))),
         )
         self.icon = pystray.Icon(APP_NAME, self.images["off"], APP_TITLE, menu)
         threading.Thread(target=self._run, daemon=True, name="tray").start()
@@ -1607,8 +1627,13 @@ class Tray:
 
 
 class App(tk.Tk):
-    def __init__(self, state: State, minimized: bool = True, announce: bool = False):
+    def __init__(self, state: State, minimized: bool = True):
         super().__init__()
+        self.withdraw()   # до сборки — невидимо: иначе окно на миг появляется в левом верхнем углу
+        self._size = (360, 620)
+        self._pos: tuple[int, int] | None = None
+        self.net_up: bool | None = None      # для уведомлений «сеть пропала / подключено»
+        self._lost_job = None
         self.report_callback_exception = self._tk_error   # ошибки в обработчиках окна — в журнал
         self.state_ = state
         self.events: queue.Queue = queue.Queue()   # от Worker
@@ -1637,13 +1662,10 @@ class App(tk.Tk):
         # крестик — спрятать в трей (VPN работает дальше); без трея — свернуть
         self.protocol("WM_DELETE_WINDOW", self.hide)
         self.bind("<Unmap>", self._on_unmap)   # кнопка «свернуть» — тоже в трей, а не на панель задач
-        if minimized:   # программа запускается в трей; окно — двойным щелчком по значку у часов
-            self.after(100, self.hide)
-        else:
-            self.after(50, self.place_corner)
-        if announce:    # запустили ярлыком — подсказать, где программа (при автозапуске — молча)
-            self.after(1500, lambda: self.tray.notify(
-                APP_TITLE, "Retix Hub работает в трее (значок у часов). Двойной щелчок — открыть окно."))
+        if not minimized:   # иначе — сразу в трее; окно — двойным щелчком по значку у часов
+            self.after(0, self.show)
+        elif not self.tray.ok:   # трея нет — хотя бы на панели задач, иначе программу не открыть
+            self.after(0, lambda: (self.place_corner(), self.iconify()))
         dark_titlebar(self)
         no_maximize_button(self)
         self.worker.start()
@@ -1671,7 +1693,7 @@ class App(tk.Tk):
         m.add_command(label="Открыть журнал", command=self.open_log)
         m.add_command(label="Папка журнала", command=lambda: self.open_path(log_dir()))
         m.add_separator()
-        m.add_command(label="Выход (VPN продолжит работать)", command=self.quit_app)
+        m.add_command(label="Выход (VPN продолжит работать)", command=self.ask_quit)
         h = dark_menu(self)
         h.add_command(label="Как открыть доступ к папке…", command=self.help_share)
         h.add_command(label="О программе", command=self.about)
@@ -1822,6 +1844,8 @@ class App(tk.Tk):
             self.worker.force_reconnect()
         elif kind == "quit":
             self.quit_app()
+        elif kind == "ask_quit":
+            self.ask_quit()
         elif kind == "update":
             # установщик уже запущен: закрываемся, он поставит новую версию и запустит её
             self.tray.notify(APP_TITLE, f"Обновление до версии {data}…")
@@ -1837,6 +1861,34 @@ class App(tk.Tk):
             peer_id, err = data
             if peer_id in self.chats:
                 self.chats[peer_id].add("Не отправлено", err, tag="err")
+
+    LOST_AFTER_MS = 20000   # короткие переподключения (смена настроек, переустановка туннеля) — без уведомления
+
+    def _net_notify(self, status):
+        """Уведомление в трее: «Подключено к сети …» и «Сеть … недоступна» — только при смене состояния."""
+        company = (self.cfg or {}).get("company") or self.state_.get("company_name") or self.state_.get("company_login")
+        if status == Status.ONLINE:
+            if self._lost_job:
+                self.after_cancel(self._lost_job)
+                self._lost_job = None
+            if self.net_up is not True or company != getattr(self, "_net_company", company):   # или сменили компанию
+                self.tray.notify("Подключено к сети", f"«{company}» · {(self.cfg or {}).get('ip', '')}".rstrip(" ·"))
+            self.net_up = True
+            self._net_company = company
+            return
+        if status in (Status.OFF, Status.NEED_LOGIN):   # выключили сами / вышли — это не «пропала»
+            if self._lost_job:
+                self.after_cancel(self._lost_job)
+                self._lost_job = None
+            self.net_up = False
+            return
+        if self.net_up and not self._lost_job:
+            def lost():
+                self._lost_job = None
+                if self.status_now != Status.ONLINE and self.net_up:
+                    self.net_up = False
+                    self.tray.notify("Сеть недоступна", f"Нет связи с сетью «{company}». Переподключаемся…")
+            self._lost_job = self.after(0 if status == Status.BLOCKED else self.LOST_AFTER_MS, lost)
 
     def _on_status(self, status, text, cfg):
         self.status_now = status
@@ -1865,11 +1917,13 @@ class App(tk.Tk):
             else:
                 self.msg_lbl.pack_forget()
             self.update_idletasks()
-            self.geometry(f"{max(self.winfo_width(), 320)}x{self.winfo_reqheight()}")
+            self._size = (max(self.winfo_width(), 320), self.winfo_reqheight())
+            self.geometry(f"{self._size[0]}x{self._size[1]}")
             if self.state() == "normal":
                 self.place_corner()
         # значок в трее: зелёный — в сети, жёлтый — подключается, красный — VPN не работает (выключен, нет входа,
         # сервер недоступен, блок, ошибка)
+        self._net_notify(status)
         tray_color = {C["green"]: "green", C["orange"]: "orange"}.get(color, "red")
         ip = (c or {}).get("ip", "")
         self.tray.update(tray_color, f"{APP_TITLE} — {label}" + (f" · {ip}" if ip and status == Status.ONLINE else ""))
@@ -1898,8 +1952,9 @@ class App(tk.Tk):
 
     # --- окно и трей
     def show(self):
-        self.deiconify()
         self.place_corner()
+        self.deiconify()
+        self.after(30, self.place_corner)   # рамка окна известна только после показа
         self.lift()
         try:
             self.attributes("-topmost", True)
@@ -1912,20 +1967,26 @@ class App(tk.Tk):
         """Окно — в правый нижний угол рабочей области (над панелью задач), как у программ из трея."""
         try:
             self.update_idletasks()
-            w = max(self.winfo_width(), self.winfo_reqwidth()) if self.winfo_ismapped() else self.winfo_reqwidth()
-            h = self.winfo_height() if self.winfo_ismapped() and self.winfo_height() > 1 else self.winfo_reqheight()
-            g = re.match(r"(\d+)x(\d+)", self.geometry())
-            if g and int(g.group(1)) > 1:
-                w, h = int(g.group(1)), int(g.group(2))
-            # рамка окна Windows: заголовок и края (у невидимого окна берём обычные размеры)
-            border = max(self.winfo_rootx() - self.winfo_x(), 0) or 8
-            title = max(self.winfo_rooty() - self.winfo_y(), 0) or 31
+            mapped = self.winfo_ismapped() and self.winfo_width() > 1
+            w, h = (self.winfo_width(), self.winfo_height()) if mapped else self._size
+            self._size = (w, h)
+            # рамка окна Windows: заголовок и края (пока окно не показано — обычные размеры)
+            border = (max(self.winfo_rootx() - self.winfo_x(), 0) if mapped else 0) or 8
+            title = (max(self.winfo_rooty() - self.winfo_y(), 0) if mapped else 0) or 31
             left, top, right, bottom = work_area(self)
             x = max(left, right - w - 2 * border - 4)
             y = max(top, bottom - h - title - border - 4)
-            self.geometry(f"+{x}+{y}")
+            self._pos = (x, y)
+            self.geometry(f"{w}x{h}+{x}+{y}")
         except tk.TclError:
             pass
+
+    def frame_box(self) -> tuple[int, int, int, int]:
+        """Где главное окно (x, y, ширина, высота) — даже если оно ещё не показано."""
+        if self._pos is None:
+            self.place_corner()
+        x, y = self._pos or (0, 0)
+        return x, y, self._size[0], self._size[1]
 
     def set_compact(self, compact: bool):
         """Нет доступа к списку ПК — окно ниже: только шапка (кнопка, имя, IP, статус) и строка сообщений."""
@@ -1938,12 +1999,14 @@ class App(tk.Tk):
             self.resizable(False, False)
             self.minsize(320, 1)
             self.update_idletasks()
-            self.geometry(f"{width}x{self.winfo_reqheight()}")
+            self._size = (width, self.winfo_reqheight())
+            self.geometry(f"{width}x{self._size[1]}")
         else:
             self.list_box.pack(fill="both", expand=True, padx=8, pady=(0, 4), after=self.top_frame)
             self.msg_lbl.pack(fill="x", pady=(0, 6))
             self.minsize(320, 380)
             self.resizable(False, True)
+            self._size = (width, 620)
             self.geometry(f"{width}x620")
         if self.state() == "normal":
             self.place_corner()
@@ -2246,6 +2309,11 @@ class App(tk.Tk):
         messagebox.showinfo(APP_TITLE, f"{APP_TITLE} {VERSION}\n\nСервер: {self.state_.get('server_url')}\n"
                                        f"Журнал: {log_dir() / 'client.log'}", parent=self)
 
+    def ask_quit(self):
+        if messagebox.askyesno(APP_TITLE, "Закрыть программу Retix Hub?\n\nVPN продолжит работать — его держит "
+                                          "служба WireGuard. Отключить сеть — кнопка OFF.", parent=self):
+            self.quit_app()
+
     def quit_app(self):
         log.info("выход из программы (VPN продолжает работать)")
         self.worker.stop_flag = True
@@ -2453,7 +2521,7 @@ def main():
     log.info("старт %s (%s)", VERSION, " ".join(sys.argv[1:]) or "без параметров")
     show_event = create_show_event() if WINDOWS else None
     # всегда в трей (окно — из трея); --show — открыть окно сразу. Нужен вход — окно входа покажется само.
-    app = App(State(), minimized="--show" not in sys.argv, announce="--minimized" not in sys.argv)
+    app = App(State(), minimized="--show" not in sys.argv)
     if show_event:
         watch_show_event(show_event, app.ui_q)
     try:
