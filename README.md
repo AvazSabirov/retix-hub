@@ -19,14 +19,20 @@ client/   Python-клиент для Windows (Tkinter), сборка в RetixHub
 
 ## 1. Сервер
 
-Требования: Ubuntu 20.04+ (модуль WireGuard в ядре), Docker + compose, nginx.
+Требования: Ubuntu 20.04+ (модуль WireGuard в ядре), Docker, nginx.
 
 ```bash
 cd server
 cp .env.example .env      # укажите WG_ENDPOINT, SUPERADMIN_PASSWORD
-docker compose up -d --build
+./run.sh                  # сборка образа и запуск контейнера (без compose)
 docker logs -f retixhub  # «Retix Hub запущен, server pubkey …»
+```
 
+Обновление сервера: `git pull && ./run.sh` — образ пересобирается, контейнер пересоздаётся, данные в `/root/hub` остаются.
+Остановить: `docker stop retixhub`, запустить снова: `docker start retixhub`. После перезагрузки хоста контейнер
+поднимается сам (`--restart unless-stopped`).
+
+```bash
 ufw allow 51820/udp       # если включён ufw
 ```
 
@@ -45,7 +51,7 @@ sqlite3 /root/hub/vpn.db 'select login, subnet_index from companies'
 > переподключаться.
 >
 > Сервер уже работал с данными в `server/data/`? Перенесите их один раз:
-> `docker compose down && mkdir -p /root/hub && cp -a data/. /root/hub/ && docker compose up -d`
+> `docker rm -f retixhub && mkdir -p /root/hub && cp -a data/. /root/hub/ && ./run.sh`
 
 ### Адреса на hub.retix.uz
 
