@@ -423,7 +423,7 @@ def devices_overview(conn) -> list[dict]:
     activate_due(conn)
     rows = conn.execute(
         "SELECT d.id, d.company_id, d.name, d.ip, d.client_version, d.update_state, d.update_state_at, "
-        "d.last_handshake, d.last_seen, c.login AS company_login, c.name AS company_name "
+        "d.last_handshake, d.last_rx_at, d.last_seen, c.login AS company_login, c.name AS company_name "
         "FROM devices d JOIN companies c ON c.id=d.company_id "
         "WHERE c.is_active=1 AND d.is_blocked=0 ORDER BY c.login, d.name").fetchall()
     releases = conn.execute("SELECT * FROM app_releases WHERE published=1").fetchall()
