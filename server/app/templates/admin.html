@@ -1,0 +1,32 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="card">
+  <h2>Компании</h2>
+  <table>
+    <tr><th>Логин</th><th>Название</th><th>Подсеть</th><th>Онлайн</th><th>Ждут</th><th>Лимит</th><th>Статус</th><th></th></tr>
+    {% for c in companies %}
+    <tr>
+      <td><b>{{ c.login }}</b></td><td>{{ c.name }}</td><td><code>{{ c.subnet }}</code></td>
+      <td>{{ c.online }} / {{ c.total }}</td>
+      <td>{% if c.pending %}<span class="tag warn">{{ c.pending }}</span>{% else %}—{% endif %}</td>
+      <td>{{ c.max_devices }}</td>
+      <td>{% if c.is_active %}<span class="tag share">активна</span>{% else %}<span class="tag bad">отключена</span>{% endif %}</td>
+      <td><a class="btn" href="/admin/companies/{{ c.id }}">Открыть</a></td>
+    </tr>
+    {% else %}
+    <tr><td colspan="8" class="muted">Компаний пока нет</td></tr>
+    {% endfor %}
+  </table>
+</div>
+<div class="card" style="max-width:520px">
+  <h2>Новая компания</h2>
+  <form method="post" action="/admin/companies">
+    <label><span>Логин (латиница, 3–32)</span><input type="text" name="login" required pattern="[A-Za-z0-9_.\-]{3,32}"></label>
+    <label><span>Название</span><input type="text" name="name"></label>
+    <label><span>Пароль кабинета (для админа компании)</span><input type="password" name="cabinet_password" minlength="6" required></label>
+    <label><span>Пароль подключения (вводят в клиенте на ПК)</span><input type="password" name="join_password" minlength="6" required></label>
+    <label><span>Лимит устройств</span><input type="number" name="max_devices" value="20" min="1" max="253"></label>
+    <button class="primary">Создать</button>
+  </form>
+</div>
+{% endblock %}
