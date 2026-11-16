@@ -111,11 +111,11 @@ def build_forward_rules(conn) -> list[str]:
         if c["full_lan"]:
             rules.append(f"-A RETIX_FWD -s {sub} -d {sub} -j ACCEPT")
             continue
+        # по умолчанию между всеми ПК компании: ping и общие папки Windows (SMB).
+        # Что именно открыто, решает сам пользователь ПК: какие папки он расшарил.
         rules.append(f"-A RETIX_FWD -s {sub} -d {sub} -p icmp -j ACCEPT")
         ports = clean_ports(c["share_ports"]) or "445"
-        for h in conn.execute("SELECT ip FROM devices WHERE company_id=? AND is_share_host=1 "
-                              "AND is_blocked=0 AND is_approved=1", (c["id"],)):
-            rules.append(f"-A RETIX_FWD -s {sub} -d {h['ip']} -p tcp -m multiport --dports {ports} -j ACCEPT")
+        rules.append(f"-A RETIX_FWD -s {sub} -d {sub} -p tcp -m multiport --dports {ports} -j ACCEPT")
     return rules
 
 

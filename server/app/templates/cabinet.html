@@ -8,7 +8,6 @@
     <div><span class="muted">Онлайн</span><b>{{ online }} / {{ devices|length }}</b></div>
     <div><span class="muted">Лимит устройств</span><b>{{ company.max_devices }}</b></div>
     <div><span class="muted">Подсеть</span><b>{{ subnet }}</b></div>
-    <div><span class="muted">Общая папка</span><b>{{ company.share_name }}</b></div>
   </div>
 </div>
 
@@ -23,8 +22,9 @@
     <form method="post" action="/cabinet/settings">
       <label class="check"><input type="checkbox" name="require_approval" value="1" {{ 'checked' if company.require_approval }}> Новые ПК ждут одобрения</label>
       <label class="check"><input type="checkbox" name="full_lan" value="1" {{ 'checked' if company.full_lan }}> Разрешить любой трафик между ПК компании</label>
-      <label><span>Имя общей папки (\\ПК\<b>имя</b>)</span><input type="text" name="share_name" value="{{ company.share_name }}"></label>
-      <label><span>Порты к ПК с папкой (если выключено «любой трафик»)</span><input type="text" name="share_ports" value="{{ company.share_ports }}"></label>
+      <input type="hidden" name="share_name" value="{{ company.share_name }}">
+      <label><span>Порты между ПК, если «любой трафик» выключен (общие папки Windows — 445)</span><input type="text" name="share_ports" value="{{ company.share_ports }}"></label>
+      <p class="muted">По умолчанию ПК компании видят друг друга (ping) и общие папки — те, к которым пользователь ПК сам открыл доступ.</p>
       <button class="primary">Сохранить</button>
     </form>
   </div>

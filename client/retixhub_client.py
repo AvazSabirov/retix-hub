@@ -1,15 +1,18 @@
 """
-Retix Hub — клиент для Windows.
+Retix Hub — клиент для Windows (окно, значок в трее).
 
 * регистрируется на сервере по логину/паролю компании (ключ генерируется локально);
 * ставит туннель через официальный WireGuard for Windows (служба WireGuardTunnel$retixhub);
 * следит за сервером: если сервер пропал — ждёт, когда появится — переподключается;
-* показывает других пользователей компании, пишет их имена в hosts (\\\\pc1\\share работает по имени);
-* открывает общую папку / подключает сетевой диск.
+* показывает компьютеры компании (online/offline), открывает их общие папки (\\\\10.66.x.y),
+  подключает сетевой диск; файл hosts не трогает;
+* открывает в firewall Windows общие папки (SMB) и ping из подсети компании.
 
-Запуск требует прав администратора (сборка PyInstaller с --uac-admin).
+Работает с правами администратора (перезапускает себя через UAC).
+Журнал: <папка программы>\\logs\\client.log, аварийные падения — logs\\crash.log.
 """
 import base64
+import faulthandler
 import ctypes
 import hashlib
 import json
@@ -31,7 +34,7 @@ import requests
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
 
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 APP_NAME = "RetixHub"          # служебное имя: папки, задачи, мьютекс
 APP_TITLE = "Retix Hub"        # то, что видит пользователь
 TUNNEL = "retixhub"
@@ -43,26 +46,29 @@ CREATE_NO_WINDOW = 0x08000000 if WINDOWS else 0
 DATA_DIR = Path(os.environ.get("PROGRAMDATA", r"C:\ProgramData")) / APP_NAME
 STATE_FILE = DATA_DIR / "state.json"
 CONF_FILE = DATA_DIR / f"{TUNNEL}.conf"
-LOG_FILE = DATA_DIR / "client.log"
 
 WG_DIR = Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "WireGuard"
 WIREGUARD_EXE = WG_DIR / "wireguard.exe"
 WG_EXE = WG_DIR / "wg.exe"
 SERVICE = f"WireGuardTunnel${TUNNEL}"
-HOSTS_FILE = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "drivers" / "etc" / "hosts"
-HOSTS_BEGIN, HOSTS_END = "# RetixHub BEGIN", "# RetixHub END"
-FW_RULE = "RetixHub SMB"
+FW_RULE = "RetixHub SMB"          # входящие общие папки (SMB) из подсети компании
+FW_RULE_PING = "RetixHub Ping"    # входящий ping из подсети компании
 
 CHECK_EVERY = 8          # сек — основной цикл
 HANDSHAKE_OK = 180       # сек — handshake свежее этого = туннель жив
 HEARTBEAT_EVERY = 60
-HOSTNAME_RE = re.compile(r"^[A-Za-z0-9-]{1,63}$")
 
 log = logging.getLogger("retixhub")
 
 
 def app_dir() -> Path:
     return Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).parent
+
+
+def log_dir() -> Path:
+    """Журнал — рядом с программой (C:\\Program Files\\RetixHub\\logs): его легко найти и открыть
+    без прав администратора. При запуске из исходников — %ProgramData%\\RetixHub\\logs."""
+    return app_dir() / "logs" if getattr(sys, "frozen", False) else DATA_DIR / "logs"
 
 
 def resource_dir() -> Path:
@@ -136,7 +142,7 @@ class State:
 
     FIELDS = {"server_url": "", "company_login": "", "device_name": "", "token": "",
               "private_key": "", "join_password": "", "last_conf_hash": "", "fw_subnet": "",
-              "autostart_done": False}
+              "autostart_done": False, "enabled": True}
 
     def __init__(self, path: Path | None = None):
         self.path = path or STATE_FILE
@@ -171,7 +177,14 @@ class State:
                 self.data[k] = protect(v) if k in ("token", "private_key", "join_password") else v
             tmp = self.path.with_suffix(".tmp")
             tmp.write_text(json.dumps(self.data, ensure_ascii=False, indent=2), "utf-8")
-            tmp.replace(self.path)
+            for attempt in range(5):  # антивирус может на миг держать файл
+                try:
+                    tmp.replace(self.path)
+                    break
+                except PermissionError:
+                    if attempt == 4:
+                        raise
+                    time.sleep(0.2)
 
     def keypair(self) -> tuple[str, str]:
         priv_b64 = self.get("private_key")
@@ -328,40 +341,19 @@ def install_wireguard_if_needed() -> bool:
     return Tunnel.installed()
 
 
-# ====================================================================== Windows: hosts, firewall, автозапуск
+# ====================================================================== Windows: firewall, автозапуск
 
-def update_hosts(entries: dict[str, str], hosts_file: Path | None = None) -> bool:
-    """entries: hostname -> ip. Пишет свой блок в hosts, только если что-то изменилось."""
-    hosts_file = hosts_file or HOSTS_FILE
-    try:
-        text = hosts_file.read_text("utf-8", errors="ignore")
-    except OSError:
-        return False
-    head = re.sub(rf"\r?\n?{re.escape(HOSTS_BEGIN)}.*?{re.escape(HOSTS_END)}\r?\n?", "\n", text, flags=re.S).rstrip()
-    block = ""
-    if entries:
-        lines = [f"{ip}\t{name}" for name, ip in sorted(entries.items())]
-        block = "\n".join([HOSTS_BEGIN, *lines, HOSTS_END])
-    new = (head + "\n\n" + block + "\n") if block else (head + "\n")
-    if new.replace("\r\n", "\n") == text.replace("\r\n", "\n"):
-        return True
-    try:
-        hosts_file.write_text(new, "utf-8")
-        run(["ipconfig", "/flushdns"], timeout=15)
-        log.info("hosts обновлён: %s", entries)
-        return True
-    except OSError:
-        log.exception("не удалось записать hosts")
-        return False
-
-
-def ensure_smb_firewall(subnet: str | None, ports: str = "445") -> None:
-    """На ПК с общей папкой разрешаем SMB из подсети VPN (WG-интерфейс Windows считает «общественным»)."""
-    run(["netsh", "advfirewall", "firewall", "delete", "rule", f"name={FW_RULE}"])
+def ensure_firewall(subnet: str | None, ports: str = "445") -> None:
+    """Входящие из подсети компании: общие папки (SMB) и ping. Интерфейс WireGuard Windows считает
+    «общественной» сетью и без этих правил закрывает общие папки и ping даже на ПК, где доступ открыт."""
+    for name in (FW_RULE, FW_RULE_PING):
+        run(["netsh", "advfirewall", "firewall", "delete", "rule", f"name={name}"])
     if subnet:
         run(["netsh", "advfirewall", "firewall", "add", "rule", f"name={FW_RULE}", "dir=in", "action=allow",
              "protocol=TCP", f"localport={ports}", f"remoteip={subnet}", "profile=any"])
-        log.info("firewall: SMB разрешён из %s", subnet)
+        run(["netsh", "advfirewall", "firewall", "add", "rule", f"name={FW_RULE_PING}", "dir=in", "action=allow",
+             "protocol=icmpv4:8,any", f"remoteip={subnet}", "profile=any"])
+        log.info("firewall: общие папки (%s) и ping разрешены из %s", ports, subnet)
 
 
 def ensure_autostart() -> None:
@@ -392,16 +384,16 @@ class Status:
     PENDING = "pending"
     BLOCKED = "blocked"
     ERROR = "error"
+    OFF = "off"            # пользователь выключил кнопкой (туннель снят, вход сохранён)
 
 
 class Worker(threading.Thread):
-    """Фоновый цикл: держит туннель в рабочем состоянии и сообщает статус в GUI."""
+    """Фоновый цикл: держит туннель в рабочем состоянии и сообщает статус в GUI (только через очередь)."""
 
-    def __init__(self, state: State, events: queue.Queue, tunnel=None, hosts_file: Path | None = None):
+    def __init__(self, state: State, events: queue.Queue, tunnel=None):
         super().__init__(daemon=True, name="worker")
         self.state, self.events = state, events
         self.tunnel = tunnel or Tunnel          # в тестах подменяется
-        self.hosts_file = hosts_file or HOSTS_FILE
         self.api = Api(state)
         self.wake = threading.Event()
         self.stop_flag = False
@@ -429,7 +421,7 @@ class Worker(threading.Thread):
             return e.detail
         except ServerUnreachable:
             return "Сервер недоступен. Проверьте адрес и интернет."
-        self.state.set(join_password=password if remember else "")
+        self.state.set(join_password=password if remember else "", enabled=True)
         self.paused = False
         self.wake.set()
         return None
@@ -440,12 +432,18 @@ class Worker(threading.Thread):
         try:
             self.tunnel.uninstall()
         finally:
-            update_hosts({}, self.hosts_file)
             if self.state.get("fw_subnet"):
-                ensure_smb_firewall(None)
+                ensure_firewall(None)
                 self.state.set(fw_subnet="")
         self.cfg = None
+        self.emit("peers", peers=[])
         self.status(Status.NEED_LOGIN)
+
+    def set_enabled(self, enabled: bool):
+        """Кнопка ON/OFF: OFF снимает туннель (и после перезагрузки остаётся выключенным), вход сохраняется."""
+        self.state.set(enabled=enabled, last_conf_hash="")
+        log.info("пользователь %s сеть", "включил" if enabled else "выключил")
+        self.wake.set()
 
     def force_reconnect(self):
         self.state.set(last_conf_hash="")
@@ -476,6 +474,14 @@ class Worker(threading.Thread):
     def step(self):
         if not self.tunnel.installed() and not install_wireguard_if_needed():
             self.status(Status.ERROR, "WireGuard не установлен. Установите WireGuard for Windows.")
+            return
+
+        # 0. выключено кнопкой
+        if self.state.get("enabled") is False:
+            if self.tunnel.service_state() != "missing":
+                self.tunnel.uninstall()
+            self.emit("peers", peers=[])
+            self.status(Status.OFF, "Отключено. Нажмите кнопку, чтобы подключиться.")
             return
 
         # 1. нет токена -> регистрация (если сохранён пароль) или окно входа
@@ -567,21 +573,18 @@ class Worker(threading.Thread):
         if alive:
             self.reinstall_backoff = 60
 
-        # 4. ПК с общей папкой — открываем SMB в firewall
-        want_fw = self.cfg["subnet"] if self.cfg["is_share_host"] else ""
+        # 4. firewall: общие папки и ping из подсети компании — на каждом ПК
+        ports = self.cfg.get("share_ports") or "445"
+        want_fw = f"{self.cfg['subnet']}|{ports}"
         if want_fw != self.state.get("fw_subnet"):
-            ensure_smb_firewall(want_fw or None, self.cfg.get("share_ports") or "445")
+            ensure_firewall(self.cfg["subnet"], ports)
             self.state.set(fw_subnet=want_fw)
 
-        # 5. список пользователей + hosts
+        # 5. список компьютеров компании
         try:
             peers = self.api.peers()["peers"]
         except (ApiError, ServerUnreachable):
             peers = []
-        me_host = socket.gethostname().lower()
-        hosts = {p["hostname"].lower(): p["ip"] for p in peers
-                 if p["hostname"] and HOSTNAME_RE.match(p["hostname"]) and p["hostname"].lower() != me_host}
-        update_hosts(hosts, self.hosts_file)
         self.emit("peers", peers=peers)
 
         if now - self.last_heartbeat > HEARTBEAT_EVERY:
@@ -602,16 +605,77 @@ class Worker(threading.Thread):
 
 
 # ====================================================================== GUI
+# Правило: к Tk обращается только главный поток. Фоновые потоки (Worker, трей, диалоги с net use)
+# кладут события в очереди, главный поток забирает их в _poll. Вызов Tk из другого потока
+# (в т.ч. after()) может «уронить» программу без следа в журнале.
 
-STATUS_VIEW = {
-    Status.ONLINE: ("●  Подключено", "#16a34a"),
-    Status.CONNECTING: ("●  Подключение…", "#d97706"),
-    Status.SERVER_DOWN: ("●  Сервер недоступен", "#dc2626"),
-    Status.PENDING: ("●  Ждёт одобрения", "#d97706"),
-    Status.BLOCKED: ("●  Заблокировано", "#dc2626"),
-    Status.NEED_LOGIN: ("●  Не подключено", "#6b7280"),
-    Status.ERROR: ("●  Ошибка", "#dc2626"),
+C = {
+    "bg": "#1b2431", "panel": "#232f3f", "head": "#2c3a4e", "line": "#334257", "sel": "#2f5d8a",
+    "text": "#e6ebf2", "muted": "#8fa0b5", "name": "#5cc8f5",
+    "on": "#2b9bd8", "off": "#5b6778", "green": "#22c55e", "orange": "#f59e0b", "red": "#ef4444",
+    "entry": "#141b26",
 }
+
+# статус -> (текст плашки, цвет)
+STATUS_VIEW = {
+    Status.ONLINE: ("В сети", C["green"]),
+    Status.CONNECTING: ("Подключение…", C["orange"]),
+    Status.SERVER_DOWN: ("Сервер недоступен", C["red"]),
+    Status.PENDING: ("Ждёт одобрения", C["orange"]),
+    Status.BLOCKED: ("Заблокировано", C["red"]),
+    Status.NEED_LOGIN: ("Не подключено", C["off"]),
+    Status.ERROR: ("Ошибка", C["red"]),
+    Status.OFF: ("Отключено", C["off"]),
+}
+
+
+def natural_key(text: str):
+    """«2 касса» раньше «10 касса»."""
+    return [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", (text or "").lower())]
+
+
+def make_signal_image(online: bool) -> "tk.PhotoImage":
+    """Значок уровня сигнала: 4 зелёные полоски или серый крестик."""
+    w, h = 18, 14
+    img = tk.PhotoImage(width=w, height=h)
+    if online:
+        for i in range(4):
+            bh = 4 + i * 3
+            x0 = 1 + i * 4
+            img.put(C["green"], to=(x0, h - bh, x0 + 3, h))
+    else:
+        for i in range(7):
+            img.put(C["muted"], to=(5 + i, 4 + i, 7 + i, 6 + i))
+            img.put(C["muted"], to=(11 - i, 4 + i, 13 - i, 6 + i))
+    return img
+
+
+def setup_style(root: tk.Tk) -> None:
+    st = ttk.Style(root)
+    try:
+        st.theme_use("clam")
+    except tk.TclError:
+        pass
+    root.configure(bg=C["bg"])
+    st.configure(".", background=C["bg"], foreground=C["text"], font=("Segoe UI", 9))
+    st.configure("TFrame", background=C["bg"])
+    st.configure("TLabel", background=C["bg"], foreground=C["text"])
+    st.configure("Muted.TLabel", foreground=C["muted"])
+    st.configure("Err.TLabel", foreground=C["red"])
+    st.configure("TCheckbutton", background=C["bg"], foreground=C["text"])
+    st.map("TCheckbutton", background=[("active", C["bg"])])
+    st.configure("TEntry", fieldbackground=C["entry"], foreground=C["text"], insertcolor=C["text"],
+                 bordercolor=C["line"], lightcolor=C["line"], darkcolor=C["line"])
+    st.configure("TButton", background=C["on"], foreground="white", bordercolor=C["on"], focusthickness=0,
+                 padding=(10, 5))
+    st.map("TButton", background=[("disabled", C["off"]), ("active", "#3aaef0")])
+    st.configure("Hub.Treeview", background=C["panel"], fieldbackground=C["panel"], foreground=C["text"],
+                 rowheight=24, borderwidth=0, font=("Segoe UI", 9))
+    st.map("Hub.Treeview", background=[("selected", C["sel"])], foreground=[("selected", "white")])
+    st.layout("Hub.Treeview", [("Treeview.treearea", {"sticky": "nswe"})])
+    st.configure("Hub.Vertical.TScrollbar", background=C["line"], troughcolor=C["panel"], bordercolor=C["panel"],
+                 arrowcolor=C["muted"], lightcolor=C["line"], darkcolor=C["line"], gripcount=0, arrowsize=12)
+    st.map("Hub.Vertical.TScrollbar", background=[("active", C["muted"])])
 
 
 class LoginDialog(tk.Toplevel):
@@ -619,9 +683,13 @@ class LoginDialog(tk.Toplevel):
         super().__init__(app)
         self.app = app
         self.title("Подключение к сети компании")
+        self.configure(bg=C["bg"])
         self.resizable(False, False)
         self.transient(app)
-        self.grab_set()
+        try:
+            self.iconbitmap(str(resource_dir() / "app_icon.ico"))
+        except Exception:  # noqa: BLE001
+            pass
         st = app.state_
         frm = ttk.Frame(self, padding=16)
         frm.pack(fill="both")
@@ -633,21 +701,26 @@ class LoginDialog(tk.Toplevel):
             "remember": tk.BooleanVar(value=True),
         }
         rows = [("Сервер", "server", ""), ("Логин компании", "company", ""),
-                ("Пароль компании", "password", "•"), ("Имя этого компьютера", "device", "")]
+                ("Пароль подключения", "password", "•"), ("Имя этого компьютера", "device", "")]
         for i, (label, key, show) in enumerate(rows):
-            ttk.Label(frm, text=label).grid(row=i, column=0, sticky="w", pady=4)
-            e = ttk.Entry(frm, textvariable=self.vars[key], width=34, show=show)
-            e.grid(row=i, column=1, pady=4)
+            ttk.Label(frm, text=label).grid(row=i * 2, column=0, sticky="w", pady=(6 if i else 0, 2))
+            e = ttk.Entry(frm, textvariable=self.vars[key], width=36, show=show)
+            e.grid(row=i * 2 + 1, column=0, sticky="ew")
             if key == ("password" if self.vars["company"].get() else "company"):
                 e.focus_set()
-        ttk.Checkbutton(frm, text="Запомнить пароль (автоподключение после сбоев)",
-                        variable=self.vars["remember"]).grid(row=4, column=0, columnspan=2, sticky="w", pady=6)
-        self.err = ttk.Label(frm, text=error, foreground="#dc2626", wraplength=380)
-        self.err.grid(row=5, column=0, columnspan=2, sticky="w")
+        ttk.Checkbutton(frm, text="Запомнить пароль (подключаться автоматически)",
+                        variable=self.vars["remember"]).grid(row=8, column=0, sticky="w", pady=(10, 4))
+        self.err = ttk.Label(frm, text=error, style="Err.TLabel", wraplength=300)
+        self.err.grid(row=9, column=0, sticky="w")
         self.btn = ttk.Button(frm, text="Подключиться", command=self.submit)
-        self.btn.grid(row=6, column=0, columnspan=2, pady=(10, 0), sticky="ew")
+        self.btn.grid(row=10, column=0, pady=(10, 0), sticky="ew")
         self.bind("<Return>", lambda _e: self.submit())
         self.protocol("WM_DELETE_WINDOW", self.close)
+        self.update_idletasks()   # по центру над главным окном
+        x = app.winfo_rootx() + (app.winfo_width() - self.winfo_reqwidth()) // 2
+        y = app.winfo_rooty() + 60
+        self.geometry(f"+{max(0, x)}+{max(0, y)}")
+        self.grab_set()
 
     def close(self):
         self.app.login_dialog = None
@@ -662,79 +735,214 @@ class LoginDialog(tk.Toplevel):
 
         def work():
             err = self.app.worker.login(v["server"], v["company"], v["password"], v["device"], v["remember"])
-            self.app.after(0, lambda: self.done(err))
-        threading.Thread(target=work, daemon=True).start()
+            self.app.ui_q.put(("login_done", err))   # результат — главному потоку через очередь
+        threading.Thread(target=work, daemon=True, name="login").start()
 
     def done(self, err):
         if err:
             self.err.config(text=err)
             self.btn.config(state="normal", text="Подключиться")
         else:
-            self.app.login_dialog = None
-            self.destroy()
+            self.close()
+
+
+class Tray:
+    """Значок в области уведомлений (pystray, свой поток). Команды — в очередь главного потока."""
+
+    def __init__(self, ui_q: queue.Queue):
+        self.ui_q = ui_q
+        self.icon = None
+        self.images: dict[str, object] = {}
+        try:
+            import pystray
+            from PIL import Image, ImageDraw
+        except Exception:  # noqa: BLE001
+            log.exception("трей недоступен")
+            return
+        try:
+            base = Image.open(resource_dir() / "app_icon.ico").convert("RGBA").resize((64, 64))
+        except Exception:  # noqa: BLE001
+            base = Image.new("RGBA", (64, 64), C["on"])
+        for key, color in (("green", C["green"]), ("orange", C["orange"]), ("red", C["red"]), ("off", C["off"])):
+            img = base.copy()
+            d = ImageDraw.Draw(img)
+            d.ellipse((38, 38, 63, 63), fill=color, outline="white", width=3)
+            self.images[key] = img
+        menu = pystray.Menu(
+            pystray.MenuItem("Открыть Retix Hub", lambda: self.ui_q.put(("show", None)), default=True),
+            pystray.MenuItem("Подключить / отключить", lambda: self.ui_q.put(("toggle", None))),
+            pystray.MenuItem("Переподключить", lambda: self.ui_q.put(("reconnect", None))),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Выход (VPN продолжит работать)", lambda: self.ui_q.put(("quit", None))),
+        )
+        self.icon = pystray.Icon(APP_NAME, self.images["off"], APP_TITLE, menu)
+        threading.Thread(target=self._run, daemon=True, name="tray").start()
+
+    def _run(self):
+        try:
+            self.icon.run()
+        except Exception:  # noqa: BLE001
+            log.exception("трей остановился")
+            self.icon = None
+
+    @property
+    def ok(self) -> bool:
+        return self.icon is not None
+
+    def update(self, color_key: str, title: str):
+        if not self.icon:
+            return
+        try:
+            self.icon.icon = self.images.get(color_key, self.images["off"])
+            self.icon.title = title[:127]
+        except Exception:  # noqa: BLE001
+            log.exception("трей: обновление")
+
+    def stop(self):
+        if self.icon:
+            try:
+                self.icon.stop()
+            except Exception:  # noqa: BLE001
+                pass
 
 
 class App(tk.Tk):
     def __init__(self, state: State, minimized: bool):
         super().__init__()
+        self.report_callback_exception = self._tk_error   # ошибки в обработчиках окна — в журнал
         self.state_ = state
-        self.events: queue.Queue = queue.Queue()
+        self.events: queue.Queue = queue.Queue()   # от Worker
+        self.ui_q: queue.Queue = queue.Queue()     # от трея, диалогов, второго запуска программы
         self.worker = Worker(state, self.events)
         self.cfg = None
+        self.peers: list[dict] = []
         self.login_dialog: LoginDialog | None = None
         self.last_status = None
+        self.status_now = None
+        self.collapsed = False
 
-        self.title(f"{APP_TITLE} {VERSION}")
+        self.title(APP_TITLE)
         try:
             self.iconbitmap(str(resource_dir() / "app_icon.ico"))
-        except Exception:
+        except Exception:  # noqa: BLE001
             pass
-        self.geometry("720x460")
-        self.minsize(600, 360)
-        self.protocol("WM_DELETE_WINDOW", self.iconify)  # крестик — свернуть, туннель работает дальше
+        setup_style(self)
+        self.geometry("360x620")
+        self.minsize(320, 380)
+        self.img_on, self.img_off = make_signal_image(True), make_signal_image(False)
         self._build()
+        self.tray = Tray(self.ui_q)
+        # крестик — спрятать в трей (VPN работает дальше); без трея — свернуть
+        self.protocol("WM_DELETE_WINDOW", self.hide)
         if minimized:
-            self.iconify()
+            self.after(100, self.hide)
         self.worker.start()
         self.after(200, self._poll)
 
+    # --- журнал ошибок окна
+    def _tk_error(self, exc, val, tb):
+        log.error("ошибка в окне", exc_info=(exc, val, tb))
+
+    # --- построение окна
     def _build(self):
-        top = ttk.Frame(self, padding=(14, 12))
-        top.pack(fill="x")
-        self.status_lbl = tk.Label(top, text="●  Запуск…", font=("Segoe UI", 13, "bold"), fg="#6b7280")
-        self.status_lbl.pack(anchor="w")
-        self.info_lbl = ttk.Label(top, text="", foreground="#6b7280")
-        self.info_lbl.pack(anchor="w")
-
-        btns = ttk.Frame(self, padding=(14, 0))
-        btns.pack(fill="x")
-        self.open_btn = ttk.Button(btns, text="📁  Открыть общую папку", command=self.open_share)
-        self.open_btn.pack(side="left")
-        ttk.Button(btns, text="Подключить диск…", command=self.map_drive).pack(side="left", padx=6)
-        ttk.Button(btns, text="Переподключить", command=self.worker.force_reconnect).pack(side="left")
-        ttk.Button(btns, text="Выйти из сети", command=self.logout).pack(side="right")
-
-        cols = ("status", "name", "host", "ip", "share")
-        self.tree = ttk.Treeview(self, columns=cols, show="headings", height=12)
-        for col, title, w in (("status", "Статус", 90), ("name", "Пользователь", 200), ("host", "Компьютер", 140),
-                              ("ip", "IP", 110), ("share", "", 120)):
-            self.tree.heading(col, text=title)
-            self.tree.column(col, width=w, anchor="w")
-        self.tree.tag_configure("off", foreground="#9ca3af")
-        self.tree.tag_configure("me", font=("Segoe UI", 9, "bold"))
-        self.tree.pack(fill="both", expand=True, padx=14, pady=12)
-        self.tree.bind("<Double-1>", self.open_peer)
-
         menu = tk.Menu(self)
         m = tk.Menu(menu, tearoff=0)
-        m.add_command(label="Войти / сменить компанию…", command=self.show_login)
-        m.add_command(label="Открыть журнал", command=lambda: os.startfile(LOG_FILE) if WINDOWS else None)
+        m.add_command(label="Подключить / отключить", command=self.toggle)
+        m.add_command(label="Переподключить", command=self.worker.force_reconnect)
         m.add_separator()
-        m.add_command(label="Закрыть программу (VPN продолжит работать)", command=self.quit_app)
-        menu.add_cascade(label="Меню", menu=m)
+        m.add_command(label="Войти в другую компанию…", command=self.show_login)
+        m.add_command(label="Выйти из сети компании", command=self.logout)
+        m.add_separator()
+        m.add_command(label="Открыть журнал", command=self.open_log)
+        m.add_command(label="Папка журнала", command=lambda: self.open_path(log_dir()))
+        m.add_separator()
+        m.add_command(label="Выход (VPN продолжит работать)", command=self.quit_app)
+        menu.add_cascade(label="Система", menu=m)
+        h = tk.Menu(menu, tearoff=0)
+        h.add_command(label="Как открыть доступ к папке…", command=self.help_share)
+        h.add_command(label="О программе", command=self.about)
+        menu.add_cascade(label="Справка", menu=h)
         self.config(menu=menu)
 
-    # --- события от Worker
+        # шапка: кнопка ON/OFF, имя ПК, IP, статус
+        top = tk.Frame(self, bg=C["panel"], highlightthickness=1, highlightbackground=C["line"])
+        top.pack(fill="x", padx=8, pady=(8, 6))
+        self.power = tk.Canvas(top, width=72, height=72, bg=C["panel"], highlightthickness=0, cursor="hand2")
+        self.power.pack(side="left", padx=10, pady=10)
+        self.power.bind("<Button-1>", lambda _e: self.toggle())
+        info = tk.Frame(top, bg=C["panel"])
+        info.pack(side="left", fill="x", expand=True, pady=10)
+        self.name_lbl = tk.Label(info, text=self.state_.get("device_name") or socket.gethostname(), bg=C["panel"],
+                                 fg=C["name"], font=("Segoe UI", 12, "bold"), anchor="w")
+        self.name_lbl.pack(fill="x")
+        self.ip_lbl = tk.Label(info, text="—", bg=C["panel"], fg=C["text"], font=("Segoe UI", 11, "bold"),
+                               anchor="w")
+        self.ip_lbl.pack(fill="x")
+        self.badge = tk.Label(info, text="Запуск…", bg=C["off"], fg="white", font=("Segoe UI", 9, "bold"),
+                              padx=8, pady=2)
+        self.badge.pack(anchor="w", pady=(4, 0))
+        self._draw_power(False)
+
+        # сеть компании: заголовок группы + список компьютеров
+        box = tk.Frame(self, bg=C["panel"], highlightthickness=1, highlightbackground=C["line"])
+        box.pack(fill="both", expand=True, padx=8, pady=(0, 4))
+        self.group = tk.Frame(box, bg=C["head"], cursor="hand2")
+        self.group.pack(fill="x")
+        self.group_lbl = tk.Label(self.group, text="▼  —", bg=C["head"], fg=C["text"],
+                                  font=("Segoe UI", 10, "bold"), anchor="w", padx=8, pady=4)
+        self.group_lbl.pack(side="left", fill="x", expand=True)
+        self.count_lbl = tk.Label(self.group, text="", bg=C["head"], fg=C["muted"], padx=8)
+        self.count_lbl.pack(side="right")
+        for w in (self.group, self.group_lbl, self.count_lbl):
+            w.bind("<Button-1>", lambda _e: self.toggle_group())
+
+        self.list_frame = tk.Frame(box, bg=C["panel"])
+        self.list_frame.pack(fill="both", expand=True)
+        self.tree = ttk.Treeview(self.list_frame, columns=("ip",), show="tree", style="Hub.Treeview",
+                                 selectmode="browse")
+        self.tree.column("#0", width=200, stretch=True)
+        self.tree.column("ip", width=92, stretch=False, anchor="e")
+        self.tree.tag_configure("off", foreground=C["muted"])
+        sb = ttk.Scrollbar(self.list_frame, orient="vertical", command=self.tree.yview,
+                           style="Hub.Vertical.TScrollbar")
+
+        def autohide(first, last):  # полоса прокрутки — только когда список не помещается
+            if float(first) <= 0 and float(last) >= 1:
+                sb.pack_forget()
+            elif not sb.winfo_ismapped():
+                sb.pack(side="right", fill="y", before=self.tree)
+            sb.set(first, last)
+        self.tree.configure(yscrollcommand=autohide)
+        self.tree.pack(side="left", fill="both", expand=True)
+        self.tree.bind("<Double-1>", lambda _e: self.open_shares())
+        self.tree.bind("<Return>", lambda _e: self.open_shares())
+        self.tree.bind("<Button-3>", self.peer_menu)
+
+        self.ctx = tk.Menu(self, tearoff=0)
+        self.ctx.add_command(label="Открыть общие папки", command=self.open_shares)
+        self.ctx.add_command(label="Подключить сетевой диск…", command=self.map_drive)
+        self.ctx.add_separator()
+        self.ctx.add_command(label="Ping", command=self.ping)
+        self.ctx.add_command(label="Копировать IP", command=self.copy_ip)
+
+        self.msg_lbl = tk.Label(self, text="", bg=C["bg"], fg=C["muted"], anchor="w", justify="left",
+                                wraplength=330, padx=10)
+        self.msg_lbl.pack(fill="x", pady=(0, 6))
+        self.bind("<Configure>", lambda e: self.msg_lbl.config(wraplength=max(200, e.width - 20))
+                  if e.widget is self else None)
+
+    def _draw_power(self, on: bool):
+        cv = self.power
+        cv.delete("all")
+        color = C["on"] if on else C["off"]
+        cv.create_oval(3, 3, 69, 69, fill="#dfe7f0", outline="")
+        cv.create_oval(9, 9, 63, 63, fill=color, outline="")
+        # значок питания
+        cv.create_arc(22, 18, 50, 46, start=120, extent=300, style="arc", outline="white", width=3)
+        cv.create_line(36, 14, 36, 31, fill="white", width=3, capstyle="round")
+        cv.create_text(36, 54, text="ON" if on else "OFF", fill="white", font=("Segoe UI", 9, "bold"))
+
+    # --- события
     def _poll(self):
         try:
             while True:
@@ -745,107 +953,229 @@ class App(tk.Tk):
                     self._on_peers(data["peers"])
         except queue.Empty:
             pass
-        self.after(300, self._poll)
+        try:
+            while True:
+                kind, data = self.ui_q.get_nowait()
+                self._on_ui(kind, data)
+        except queue.Empty:
+            pass
+        self.after(250, self._poll)
+
+    def _on_ui(self, kind, data):
+        if kind == "show":
+            self.show()
+        elif kind == "toggle":
+            self.toggle()
+        elif kind == "reconnect":
+            self.worker.force_reconnect()
+        elif kind == "quit":
+            self.quit_app()
+        elif kind == "login_done":
+            if self.login_dialog:
+                self.login_dialog.done(data)
+        elif kind == "info":
+            messagebox.showinfo(APP_TITLE, data, parent=self)
+        elif kind == "error":
+            messagebox.showerror(APP_TITLE, data, parent=self)
 
     def _on_status(self, status, text, cfg):
-        self.cfg = cfg
-        label, color = STATUS_VIEW.get(status, ("●", "#6b7280"))
-        self.status_lbl.config(text=label, fg=color)
-        info = text
+        self.status_now = status
         if cfg:
-            info = f"{cfg['company']} · {cfg['device_name']} · {cfg['ip']}" + (f"   —   {text}" if text else "")
-        self.info_lbl.config(text=info)
-        self.open_btn.config(state="normal" if cfg and cfg.get("share") else "disabled")
+            self.cfg = cfg
+        label, color = STATUS_VIEW.get(status, ("—", C["off"]))
+        self.badge.config(text=label, bg=color)
+        enabled = self.state_.get("enabled") is not False and status not in (Status.NEED_LOGIN, Status.OFF)
+        self._draw_power(enabled)
+        c = self.cfg
+        if c and status != Status.NEED_LOGIN:
+            self.name_lbl.config(text=c.get("device_name") or socket.gethostname())
+            self.ip_lbl.config(text=c.get("ip") or "—")
+            self.group_lbl.config(text=("▶  " if self.collapsed else "▼  ") + (c.get("company") or "—"))
+        elif status == Status.NEED_LOGIN:
+            self.ip_lbl.config(text="—")
+            self.group_lbl.config(text="▼  —")
+        self.msg_lbl.config(text="" if status == Status.ONLINE else (text or ""))
+        tray_color = {C["green"]: "green", C["orange"]: "orange", C["red"]: "red"}.get(color, "off")
+        ip = (c or {}).get("ip", "")
+        self.tray.update(tray_color, f"{APP_TITLE} — {label}" + (f" · {ip}" if ip and status == Status.ONLINE else ""))
         if status == Status.NEED_LOGIN and self.last_status != Status.NEED_LOGIN and not self.login_dialog:
             self.show_login(text)
         if status in (Status.SERVER_DOWN, Status.BLOCKED):
             for i in self.tree.get_children():
-                self.tree.item(i, tags=("off",))
+                self.tree.item(i, image=self.img_off, tags=("off",))
         self.last_status = status
 
     def _on_peers(self, peers):
+        self.peers = peers
+        sel = self.tree.selection()
         self.tree.delete(*self.tree.get_children())
-        for p in sorted(peers, key=lambda p: (not p["is_share_host"], not p["online"], p["name"].lower())):
-            tags = [] if p["online"] else ["off"]
-            if p["is_me"]:
-                tags.append("me")
-            self.tree.insert("", "end", iid=str(p["id"]), tags=tags, values=(
-                "🟢 online" if p["online"] else "⚪ offline",
-                p["name"] + ("  (это я)" if p["is_me"] else ""),
-                p["hostname"], p["ip"], "📁 общая папка" if p["is_share_host"] else ""))
+        others = [p for p in peers if not p.get("is_me")]
+        others.sort(key=lambda p: (not p["online"], natural_key(p["name"])))
+        for p in others:
+            online = p["online"] and self.status_now not in (Status.SERVER_DOWN, Status.BLOCKED, Status.OFF)
+            self.tree.insert("", "end", iid=str(p["id"]), text=" " + p["name"],
+                             image=self.img_on if online else self.img_off,
+                             values=(p["ip"],), tags=() if online else ("off",))
+        if sel and self.tree.exists(sel[0]):
+            self.tree.selection_set(sel[0])
+        online = sum(1 for p in others if p["online"])
+        self.count_lbl.config(text=f"{online} / {len(others)}" if others else "")
+
+    # --- окно и трей
+    def show(self):
+        self.deiconify()
+        self.lift()
+        try:
+            self.attributes("-topmost", True)
+            self.after(200, lambda: self.attributes("-topmost", False))
+            self.focus_force()
+        except tk.TclError:
+            pass
+
+    def hide(self):
+        if self.tray.ok:
+            self.withdraw()
+        else:
+            self.iconify()
+
+    def toggle_group(self):
+        self.collapsed = not self.collapsed
+        if self.collapsed:
+            self.list_frame.pack_forget()
+        else:
+            self.list_frame.pack(fill="both", expand=True)
+        txt = self.group_lbl.cget("text")[3:]
+        self.group_lbl.config(text=("▶  " if self.collapsed else "▼  ") + txt)
 
     # --- действия
+    def toggle(self):
+        if self.status_now == Status.NEED_LOGIN:
+            self.show_login()
+            return
+        enabled = self.state_.get("enabled") is not False
+        self._draw_power(not enabled)
+        self.badge.config(text="Отключение…" if enabled else "Подключение…", bg=C["orange"])
+        threading.Thread(target=self.worker.set_enabled, args=(not enabled,), daemon=True, name="toggle").start()
+
     def show_login(self, error: str = ""):
         if self.login_dialog:
             self.login_dialog.lift()
             return
-        self.deiconify()
+        self.show()
         self.login_dialog = LoginDialog(self, error)
 
-    def share_path(self) -> str | None:
-        share = (self.cfg or {}).get("share")
-        if not share:
-            return None
-        host = share["hostname"] if share["hostname"] and HOSTNAME_RE.match(share["hostname"]) else share["ip"]
-        return rf"\\{host}\{share['name']}"
-
-    def open_share(self):
-        path = self.share_path()
-        if not path:
-            messagebox.showinfo(APP_TITLE, "Администратор ещё не отметил компьютер с общей папкой.")
-            return
-        try:
-            os.startfile(path)
-        except OSError as e:
-            messagebox.showerror(APP_TITLE, f"Не удалось открыть {path}\n{e}\n\n"
-                                 "Проверьте, что компьютер с папкой онлайн.")
-
-    def open_peer(self, _event):
+    def selected_peer(self) -> dict | None:
         sel = self.tree.selection()
         if not sel:
+            return None
+        return next((p for p in self.peers if str(p["id"]) == sel[0]), None)
+
+    def peer_menu(self, event):
+        row = self.tree.identify_row(event.y)
+        if not row:
             return
-        ip = self.tree.item(sel[0], "values")[3]
+        self.tree.selection_set(row)
         try:
-            os.startfile(rf"\\{ip}")
-        except OSError:
-            pass
+            self.ctx.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.ctx.grab_release()
+
+    def open_path(self, path):
+        try:
+            os.startfile(str(path))
+        except OSError as e:
+            messagebox.showerror(APP_TITLE, f"Не удалось открыть {path}\n{e}", parent=self)
+
+    def open_log(self):
+        path = log_dir() / "client.log"
+        self.open_path(path if path.exists() else log_dir())
+
+    def open_shares(self):
+        p = self.selected_peer()
+        if not p:
+            return
+        if not p["online"]:
+            messagebox.showinfo(APP_TITLE, f"{p['name']} сейчас не в сети.", parent=self)
+            return
+        path = rf"\\{p['ip']}"
+
+        def work():  # Проводник может думать несколько секунд — не держим окно
+            try:
+                os.startfile(path)
+            except OSError as e:
+                self.ui_q.put(("error", f"Не удалось открыть {path}\n{e}\n\nПроверьте, что на {p['name']} "
+                                        "открыт общий доступ к папке (Справка → Как открыть доступ к папке)."))
+        threading.Thread(target=work, daemon=True, name="open").start()
+
+    def ping(self):
+        p = self.selected_peer()
+        if p and WINDOWS:
+            subprocess.Popen(["cmd", "/k", f"title Ping {p['name']} & ping -t {p['ip']}"],
+                             creationflags=subprocess.CREATE_NEW_CONSOLE)
+
+    def copy_ip(self):
+        p = self.selected_peer()
+        if p:
+            self.clipboard_clear()
+            self.clipboard_append(p["ip"])
 
     def map_drive(self):
-        path = self.share_path()
-        if not path:
-            messagebox.showinfo(APP_TITLE, "Компьютер с общей папкой не назначен.")
+        p = self.selected_peer()
+        if not p:
             return
+        path = simpledialog.askstring(APP_TITLE, f"Общая папка на {p['name']}:\n(например \\\\{p['ip']}\\share)",
+                                      initialvalue=rf"\\{p['ip']}" + "\\", parent=self)
+        if not path or not re.match(r"^\\\\[^\\]+\\[^\\]+", path.strip()):
+            return
+        path = path.strip().rstrip("\\")
         letter = simpledialog.askstring(APP_TITLE, "Буква диска:", initialvalue="Z", parent=self)
-        if not letter:
+        if not letter or not letter.strip()[:1].isalpha():
             return
-        letter = letter.strip().rstrip(":").upper()[:1] + ":"
-        user = simpledialog.askstring(APP_TITLE, f"Логин для {path}\n(например pc1\\share_user, пусто — текущий):",
-                                      parent=self) or ""
+        letter = letter.strip()[:1].upper() + ":"
+        user = simpledialog.askstring(APP_TITLE, f"Логин для {path}\n(например {p['hostname'] or 'pc1'}\\user;"
+                                                 " пусто — без логина):", parent=self) or ""
         pwd = simpledialog.askstring(APP_TITLE, "Пароль:", show="•", parent=self) if user else ""
         host = path.split("\\")[2]
 
         def work():
             if user:
-                # cmdkey хранит пароль в диспетчере учётных данных пользователя — Проводник им тоже пользуется
+                # cmdkey хранит пароль в диспетчере учётных данных — Проводник им тоже пользуется
                 run(["cmdkey", f"/add:{host}", f"/user:{user}", f"/pass:{pwd}"])
             # чтобы диск из программы-админа был виден обычному Проводнику
             run(["reg", "add", r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System",
                  "/v", "EnableLinkedConnections", "/t", "REG_DWORD", "/d", "1", "/f"])
             run(["net", "use", letter, "/delete", "/y"])
             rc, out = run(["net", "use", letter, path, "/persistent:yes"])
-            self.after(0, lambda: messagebox.showinfo(APP_TITLE, f"Диск {letter} подключён к {path}.\n"
-                                                      "Если диск не виден в Проводнике — выйдите из Windows и зайдите снова (один раз).")
-                       if rc == 0 else messagebox.showerror(APP_TITLE, out.strip() or "Ошибка net use"))
-        threading.Thread(target=work, daemon=True).start()
+            if rc == 0:
+                self.ui_q.put(("info", f"Диск {letter} подключён к {path}.\nЕсли диск не виден в Проводнике — "
+                                       "выйдите из Windows и зайдите снова (один раз)."))
+            else:
+                self.ui_q.put(("error", out.strip() or "Ошибка net use"))
+        threading.Thread(target=work, daemon=True, name="net-use").start()
 
     def logout(self):
-        if not messagebox.askyesno(APP_TITLE, "Отключить этот компьютер от сети компании?"):
+        if not messagebox.askyesno(APP_TITLE, "Отключить этот компьютер от сети компании?\n"
+                                              "Для повторного входа понадобится пароль подключения.", parent=self):
             return
-        threading.Thread(target=self.worker.logout, daemon=True).start()
-        self.tree.delete(*self.tree.get_children())
+        threading.Thread(target=self.worker.logout, daemon=True, name="logout").start()
+
+    def help_share(self):
+        messagebox.showinfo(APP_TITLE, (
+            "Компьютеры компании видят общие папки друг друга, как в локальной сети.\n\n"
+            "Чтобы открыть папку другим:\n"
+            "1. Правый щелчок по папке → Свойства → Доступ → Расширенная настройка.\n"
+            "2. «Открыть общий доступ к этой папке» → Разрешения → выбрать, кому и что можно.\n\n"
+            "Открыть папки соседа: двойной щелчок по нему в списке.\n"
+            "Если Windows спрашивает логин — это пользователь и пароль Windows того компьютера."), parent=self)
+
+    def about(self):
+        messagebox.showinfo(APP_TITLE, f"{APP_TITLE} {VERSION}\n\nСервер: {self.state_.get('server_url')}\n"
+                                       f"Журнал: {log_dir() / 'client.log'}", parent=self)
 
     def quit_app(self):
+        log.info("выход из программы (VPN продолжает работать)")
         self.worker.stop_flag = True
+        self.tray.stop()
         self.destroy()
 
 
@@ -857,6 +1187,86 @@ def relaunch_as_admin():
     if not getattr(sys, "frozen", False):
         params = f'"{os.path.abspath(__file__)}" {params}'
     ctypes.windll.shell32.ShellExecuteW(None, "runas", exe, params, None, 1)
+
+
+SHOW_EVENT = "Global\\RetixHubShowWindow"   # второй запуск программы просит первую показать окно
+
+
+def _k32():
+    from ctypes import wintypes as wt
+    k = ctypes.windll.kernel32
+    k.OpenEventW.restype = wt.HANDLE
+    k.OpenEventW.argtypes = (wt.DWORD, wt.BOOL, wt.LPCWSTR)
+    k.CreateEventW.restype = wt.HANDLE
+    k.CreateEventW.argtypes = (ctypes.c_void_p, wt.BOOL, wt.BOOL, wt.LPCWSTR)
+    k.SetEvent.argtypes = (wt.HANDLE,)
+    k.CloseHandle.argtypes = (wt.HANDLE,)
+    k.WaitForSingleObject.argtypes = (wt.HANDLE, wt.DWORD)
+    k.WaitForSingleObject.restype = wt.DWORD
+    return k
+
+
+def signal_running_instance() -> bool:
+    """Программа уже запущена? Тогда показать её окно и выйти (без лишнего окна UAC)."""
+    if not WINDOWS:
+        return False
+    k = _k32()
+    h = k.OpenEventW(0x0002 | 0x00100000, False, SHOW_EVENT)   # EVENT_MODIFY_STATE | SYNCHRONIZE
+    if not h:
+        return False
+    k.SetEvent(h)
+    k.CloseHandle(h)
+    return True
+
+
+def create_show_event():
+    """Событие «показать окно»: открыть его может любой пользователь (программа работает как админ)."""
+    from ctypes import wintypes as wt
+    k = _k32()
+
+    class SA(ctypes.Structure):
+        _fields_ = [("nLength", wt.DWORD), ("lpSecurityDescriptor", ctypes.c_void_p), ("bInheritHandle", wt.BOOL)]
+    sd = ctypes.c_void_p()
+    ok = ctypes.windll.advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW(
+        "D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x00100002;;;AU)", 1, ctypes.byref(sd), None)
+    sa = SA(ctypes.sizeof(SA), sd if ok else None, False)
+    return k.CreateEventW(ctypes.byref(sa), False, False, SHOW_EVENT)
+
+
+def watch_show_event(handle, ui_q: queue.Queue):
+    k = _k32()
+
+    def loop():
+        while True:
+            if k.WaitForSingleObject(handle, 1000) == 0:
+                ui_q.put(("show", None))
+    threading.Thread(target=loop, daemon=True, name="show-event").start()
+
+
+_crash_file = None
+
+
+def setup_logging() -> None:
+    """Журнал в <папка программы>\\logs: client.log (обычный) и crash.log (аварийные падения)."""
+    global _crash_file
+    d = log_dir()
+    handlers: list[logging.Handler] = []
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+        handlers.append(RotatingFileHandler(d / "client.log", maxBytes=1_000_000, backupCount=3, encoding="utf-8"))
+        _crash_file = open(d / "crash.log", "a", encoding="utf-8")  # noqa: SIM115 — открыт всё время работы
+        _crash_file.write(f"--- {time.strftime('%Y-%m-%d %H:%M:%S')} запуск {VERSION}, pid {os.getpid()}\n")
+        _crash_file.flush()
+        faulthandler.enable(_crash_file)   # падение интерпретатора/Tk — трассировка в crash.log
+    except OSError:
+        pass
+    if sys.stderr:
+        handlers.append(logging.StreamHandler())
+    logging.basicConfig(level=logging.INFO, handlers=handlers, format="%(asctime)s %(levelname)s %(threadName)s %(message)s")
+
+    sys.excepthook = lambda t, v, tb: log.critical("необработанная ошибка", exc_info=(t, v, tb))
+    threading.excepthook = lambda a: log.critical(
+        "ошибка в потоке %s", a.thread.name if a.thread else "?", exc_info=(a.exc_type, a.exc_value, a.exc_traceback))
 
 
 def single_instance() -> bool:
@@ -886,7 +1296,8 @@ def selftest() -> int:
     def tk_check():
         root = tk.Tk()
         root.withdraw()
-        ttk.Label(root, text="test")
+        setup_style(root)
+        make_signal_image(True)
         version = root.tk.call("info", "patchlevel")
         root.destroy()
         return f"Tcl/Tk {version}"
@@ -903,8 +1314,12 @@ def selftest() -> int:
         ctx = ssl.create_default_context(cafile=certifi.where())
         return f"{ssl.OPENSSL_VERSION}, CA: {len(ctx.get_ca_certs())}"
 
-    def config_check():
-        return State._default_server()
+    def tray_check():
+        import PIL
+        import pystray
+        from PIL import Image
+        Image.open(resource_dir() / "app_icon.ico").convert("RGBA")
+        return f"pystray ({pystray.Icon.__module__}), Pillow {PIL.__version__}"
 
     def icon_check():
         path = resource_dir() / "app_icon.ico"
@@ -916,7 +1331,8 @@ def selftest() -> int:
     check("cryptography", crypto_check)
     check("SSL", ssl_check)
     check("requests", lambda: requests.__version__)
-    check("server_url", config_check)
+    check("tray", tray_check)
+    check("server_url", lambda: State._default_server())
     check("icon", icon_check)
     lines.append("RESULT: " + ("OK" if ok else "FAIL"))
     try:
@@ -928,10 +1344,10 @@ def selftest() -> int:
 
 
 def uninstall_cleanup() -> int:
-    """retixhub.exe --uninstall: вызывает деинсталлятор. Снимает туннель, блок в hosts, правило firewall
-    и автозапуск. WireGuard и %ProgramData%\\RetixHub (ключ и вход) остаются — при повторной установке
+    """retixhub.exe --uninstall: вызывает деинсталлятор. Снимает туннель, правила firewall и автозапуск.
+    WireGuard и %ProgramData%\\RetixHub (ключ и вход) остаются — при повторной установке
     ПК вернётся в сеть сам."""
-    for step in (Tunnel.uninstall, lambda: update_hosts({}), lambda: ensure_smb_firewall(None), remove_autostart):
+    for step in (Tunnel.uninstall, lambda: ensure_firewall(None), remove_autostart):
         try:
             step()
         except Exception:  # noqa: BLE001
@@ -944,21 +1360,30 @@ def uninstall_cleanup() -> int:
 def main():
     if "--selftest" in sys.argv:
         sys.exit(selftest())
+    uninstall = "--uninstall" in sys.argv
+    # уже запущена — показать окно; до UAC, чтобы не спрашивать права зря
+    if not uninstall and signal_running_instance():
+        return
     if WINDOWS and not is_admin():
         relaunch_as_admin()
         return
     secure_data_dir()
-    handler = RotatingFileHandler(LOG_FILE, maxBytes=1_000_000, backupCount=3, encoding="utf-8")
-    logging.basicConfig(level=logging.INFO, handlers=[handler, logging.StreamHandler()],
-                        format="%(asctime)s %(levelname)s %(message)s")
-    if not single_instance():
-        messagebox.showinfo(APP_TITLE, "Программа уже запущена (посмотрите на панели задач).")
-        return
-    if "--uninstall" in sys.argv:
+    setup_logging()
+    if uninstall:
         log.info("удаление программы: очистка")
         sys.exit(uninstall_cleanup())
-    log.info("старт %s", VERSION)
-    App(State(), minimized="--minimized" in sys.argv).mainloop()
+    if not single_instance():
+        signal_running_instance()
+        return
+    log.info("старт %s (%s)", VERSION, " ".join(sys.argv[1:]) or "без параметров")
+    show_event = create_show_event() if WINDOWS else None
+    app = App(State(), minimized="--minimized" in sys.argv)
+    if show_event:
+        watch_show_event(show_event, app.ui_q)
+    try:
+        app.mainloop()
+    finally:
+        log.info("окно закрыто")
 
 
 if __name__ == "__main__":

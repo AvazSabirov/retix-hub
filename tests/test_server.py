@@ -247,9 +247,10 @@ class TestIsolation:
 
     def test_firewall_rules_per_company(self, ctx, net):
         a1, a2, b1 = self.setup_two(ctx)
-        ctx.cabinet("login1").post(f"/cabinet/devices/{a1['device_id']}/share")
         rules = net["rules"]
-        assert f"-A RETIX_FWD -s 10.66.1.0/24 -d {a1['ip']} -p tcp -m multiport --dports 445 -j ACCEPT" in rules
+        # общие папки (SMB) — между всеми ПК компании, без отметки «ПК с папкой»
+        assert "-A RETIX_FWD -s 10.66.1.0/24 -d 10.66.1.0/24 -p tcp -m multiport --dports 445 -j ACCEPT" in rules
+        assert "-A RETIX_FWD -s 10.66.2.0/24 -d 10.66.2.0/24 -p tcp -m multiport --dports 445 -j ACCEPT" in rules
         assert "-A RETIX_FWD -s 10.66.1.0/24 -d 10.66.1.0/24 -p icmp -j ACCEPT" in rules
         assert "-A RETIX_FWD -s 10.66.2.0/24 -d 10.66.2.0/24 -p icmp -j ACCEPT" in rules
         # ни одного правила, разрешающего трафик между подсетями
