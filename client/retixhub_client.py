@@ -34,7 +34,7 @@ import requests
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
 
-VERSION = "1.0.2"
+VERSION = "1.0.3"
 APP_NAME = "RetixHub"          # служебное имя: папки, задачи, мьютекс
 APP_TITLE = "Retix Hub"        # то, что видит пользователь
 TUNNEL = "retixhub"
@@ -685,6 +685,21 @@ def dark_titlebar(win) -> None:
         log.debug("тёмный заголовок недоступен", exc_info=True)
 
 
+def no_maximize_button(win) -> None:
+    """Убрать кнопку «развернуть на весь экран» из заголовка окна Windows."""
+    if not WINDOWS:
+        return
+    try:
+        win.update_idletasks()
+        u = ctypes.windll.user32
+        hwnd = u.GetParent(win.winfo_id())
+        style = u.GetWindowLongW(hwnd, -16)                       # GWL_STYLE
+        u.SetWindowLongW(hwnd, -16, style & ~0x00010000)          # без WS_MAXIMIZEBOX
+        u.SetWindowPos(hwnd, 0, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0004 | 0x0020)  # NOSIZE|NOMOVE|NOZORDER|FRAMECHANGED
+    except Exception:  # noqa: BLE001
+        log.debug("кнопку «развернуть» не убрать", exc_info=True)
+
+
 def render_power(on: bool, hover: bool = False, size: int = 76):
     """Кнопка ON/OFF со сглаживанием (рисуется через Pillow в 4 раза крупнее и уменьшается)."""
     from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageTk
@@ -930,6 +945,25 @@ class MessageWindow(tk.Toplevel):
         self.destroy()
 
 
+def tray_image(color: str, size: int = 64):
+    """Значок трея целиком в цвете статуса: как значок программы (узлы сети), только фон — цвет статуса."""
+    from PIL import Image, ImageDraw
+    k = 4
+    S = size * k
+    img = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    d.rounded_rectangle((2 * k, 2 * k, S - 2 * k, S - 2 * k), radius=14 * k, fill=color)
+    c = S // 2
+    nodes = [(17 * k, 17 * k), (S - 17 * k, 17 * k), (17 * k, S - 17 * k), (S - 17 * k, S - 17 * k)]
+    for n in nodes:
+        d.line([(c, c), n], fill="white", width=5 * k)
+    for x, y in nodes:
+        d.ellipse((x - 7 * k, y - 7 * k, x + 7 * k, y + 7 * k), fill="white")
+    d.ellipse((c - 10 * k, c - 10 * k, c + 10 * k, c + 10 * k), fill="white")
+    d.ellipse((c - 5 * k, c - 5 * k, c + 5 * k, c + 5 * k), fill=color)
+    return img.resize((size, size), Image.LANCZOS)
+
+
 class Tray:
     """Значок в области уведомлений (pystray, свой поток). Команды — в очередь главного потока."""
 
@@ -943,15 +977,8 @@ class Tray:
         except Exception:  # noqa: BLE001
             log.exception("трей недоступен")
             return
-        try:
-            base = Image.open(resource_dir() / "app_icon.ico").convert("RGBA").resize((64, 64))
-        except Exception:  # noqa: BLE001
-            base = Image.new("RGBA", (64, 64), C["on"])
-        for key, color in (("green", C["green"]), ("orange", C["orange"]), ("red", C["red"]), ("off", C["off"])):
-            img = base.copy()
-            d = ImageDraw.Draw(img)
-            d.ellipse((38, 38, 63, 63), fill=color, outline="white", width=3)
-            self.images[key] = img
+        for key, color in (("green", C["green"]), ("orange", C["orange"]), ("red", C["red"]), ("off", C["red"])):
+            self.images[key] = tray_image(color)
         menu = pystray.Menu(
             pystray.MenuItem("Открыть Retix Hub", lambda: self.ui_q.put(("show", None)), default=True),
             pystray.MenuItem("Подключить / отключить", lambda: self.ui_q.put(("toggle", None))),
@@ -1022,6 +1049,7 @@ class App(tk.Tk):
         setup_style(self)
         self.geometry("360x620")
         self.minsize(320, 380)
+        self.resizable(False, True)   # только по высоте; кнопки «развернуть» нет (см. no_maximize_button)
         self.img_on, self.img_off = make_signal_image(True), make_signal_image(False)
         self._build()
         self.tray = Tray(self.ui_q)
@@ -1031,6 +1059,7 @@ class App(tk.Tk):
         if minimized:
             self.after(100, self.hide)
         dark_titlebar(self)
+        no_maximize_button(self)
         self.worker.start()
         self.after(200, self._poll)
 
