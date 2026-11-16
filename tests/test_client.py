@@ -35,7 +35,7 @@ class Server:
 
     def start(self):
         env = os.environ | {"DATA_DIR": self.data, "WG_DRY_RUN": "1", "COOKIE_SECURE": "0", "API_PORT": str(PORT),
-                            "SUPERADMIN_LOGIN": "avaz", "SUPERADMIN_PASSWORD": "supersecret",
+                            "SUPERADMIN_LOGIN": "admin", "SUPERADMIN_PASSWORD": "supersecret",
                             "WG_ENDPOINT": "vpn.test.uz:51820"}
         self.proc = subprocess.Popen([sys.executable, "-m", "app.main"], cwd=ROOT / "server", env=env,
                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -55,7 +55,7 @@ class Server:
 def server():
     s = Server(); s.start()
     admin = requests.Session()
-    admin.post(BASE + "/admin/login", data={"login": "avaz", "password": "supersecret"})
+    admin.post(BASE + "/admin/login", data={"login": "admin", "password": "supersecret"})
     s.admin = admin
     yield s
     s.stop()

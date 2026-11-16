@@ -8,7 +8,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 os.environ.update(
     DATA_DIR=tempfile.mkdtemp(prefix="retix-test-"), WG_DRY_RUN="1", COOKIE_SECURE="0",
-    SUPERADMIN_LOGIN="avaz", SUPERADMIN_PASSWORD="supersecret", WG_ENDPOINT="vpn.test.uz:51820")
+    SUPERADMIN_LOGIN="admin", SUPERADMIN_PASSWORD="supersecret", WG_ENDPOINT="vpn.test.uz:51820")
 sys.path.insert(0, str(ROOT / "server"))
 sys.path.insert(0, str(ROOT / "client"))
 
@@ -73,7 +73,7 @@ class Ctx:
         self.app = app
         self.api = TestClient(app)
         self.admin = TestClient(app)
-        r = self.admin.post("/admin/login", data={"login": "avaz", "password": "supersecret"}, follow_redirects=False)
+        r = self.admin.post("/admin/login", data={"login": "admin", "password": "supersecret"}, follow_redirects=False)
         assert r.headers["location"] == "/admin"
 
     def company(self, login, join="join123", cab="cab123", max_devices=20, name=""):

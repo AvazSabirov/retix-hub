@@ -127,7 +127,7 @@ class ServerProc:
         if nsx("srv", "ip link show wg0", check=False).returncode != 0 and not KERNEL_WG:
             make_wg_iface("srv", "wg0")  # без модуля ядра интерфейс создаёт wireguard-go
         env = (f"DATA_DIR={self.data} WG_DRY_RUN=0 COOKIE_SECURE=0 API_HOST=0.0.0.0 API_PORT=8100 "
-               f"MONITOR_EVERY=2 SUPERADMIN_LOGIN=avaz SUPERADMIN_PASSWORD=supersecret "
+               f"MONITOR_EVERY=2 SUPERADMIN_LOGIN=admin SUPERADMIN_PASSWORD=supersecret "
                f"WG_ENDPOINT=192.168.77.1:51820")
         self.log = open(Path(self.data) / "server.log", "a")
         self.proc = subprocess.Popen(f"ip netns exec srv env {env} {sys.executable} -m app.main", shell=True,
@@ -272,7 +272,7 @@ def main():
 
 def run_scenarios(srv: ServerProc):
     admin = requests.Session()
-    admin.post(API + "/admin/login", data={"login": "avaz", "password": "supersecret"})
+    admin.post(API + "/admin/login", data={"login": "admin", "password": "supersecret"})
     for login in ("alpha", "beta"):
         admin.post(API + "/admin/companies", data={"login": login, "name": login.title(), "cabinet_password": "cab123",
                                                    "join_password": "join123", "max_devices": 10})
