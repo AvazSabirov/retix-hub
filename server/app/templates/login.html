@@ -1,0 +1,12 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="card login">
+  <h1>{{ title }}</h1>
+  <p class="muted">Вход в панель управления</p>
+  <form method="post" action="{{ action }}">
+    <label><span>{{ login_label }}</span><input type="text" name="login" required autofocus></label>
+    <label><span>Пароль</span><input type="password" name="password" required></label>
+    <button class="primary" style="width:100%">Войти</button>
+  </form>
+</div>
+{% endblock %}
