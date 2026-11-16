@@ -37,7 +37,7 @@ import requests
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
 
-VERSION = "1.0.6"
+VERSION = "1.0.7"
 APP_NAME = "RetixHub"          # служебное имя: папки, задачи, мьютекс
 APP_TITLE = "Retix Hub"        # то, что видит пользователь
 TUNNEL = "retixhub"
@@ -149,12 +149,18 @@ def unprotect(value: str) -> str:
 # ====================================================================== state
 
 class State:
-    """Настройки клиента в %ProgramData%\\RetixHub\\state.json (доступ только админам/SYSTEM)."""
+    """Настройки клиента в %ProgramData%\\RetixHub\\state.json (доступ только админам/SYSTEM).
 
-    FIELDS = {"server_url": "", "company_login": "", "device_name": "", "token": "",
+    Несколько компаний: текущая — в основных полях (server_url, company_login, token, private_key…),
+    остальные — в "profiles" (те же поля, секреты так же зашифрованы DPAPI). У каждой компании свой
+    ключ WireGuard и свой вход: для сервера это разные компьютеры. В сети — одна компания за раз."""
+
+    FIELDS = {"server_url": "", "company_login": "", "company_name": "", "device_name": "", "token": "",
               "private_key": "", "join_password": "", "last_conf_hash": "", "fw_subnet": "",
               "autostart_done": False, "enabled": True, "auto_update": True, "update_attempt": {},
-              "update_state": "none", "update_pubkey": ""}
+              "update_state": "none", "update_pubkey": "", "update_pins": {}, "profiles": {}}
+    PROFILE_FIELDS = ("server_url", "company_login", "company_name", "device_name", "token", "private_key",
+                      "join_password")
 
     def __init__(self, path: Path | None = None):
         self.path = path or STATE_FILE
@@ -187,16 +193,86 @@ class State:
         with self.lock:
             for k, v in kw.items():
                 self.data[k] = protect(v) if k in ("token", "private_key", "join_password") else v
-            tmp = self.path.with_suffix(".tmp")
-            tmp.write_text(json.dumps(self.data, ensure_ascii=False, indent=2), "utf-8")
-            for attempt in range(5):  # антивирус может на миг держать файл
-                try:
-                    tmp.replace(self.path)
-                    break
-                except PermissionError:
-                    if attempt == 4:
-                        raise
-                    time.sleep(0.2)
+            self._write()
+
+    # --- компании (профили)
+    @staticmethod
+    def profile_key(server: str, company: str) -> str:
+        return f"{(server or '').strip().rstrip('/').lower()}|{(company or '').strip().lower()}"
+
+    def current_key(self) -> str:
+        with self.lock:
+            return self.profile_key(self.data.get("server_url"), self.data.get("company_login"))
+
+    def profiles(self) -> list[dict]:
+        """Компании этого ПК: текущая (с входом) первой, затем сохранённые."""
+        with self.lock:
+            cur = self.profile_key(self.data.get("server_url"), self.data.get("company_login"))
+            out = []
+            if self.data.get("company_login") and self.data.get("token"):
+                out.append({"key": cur, "active": True, **{f: self.data.get(f, "") for f in
+                                                          ("server_url", "company_login", "company_name")}})
+            for key, p in sorted((self.data.get("profiles") or {}).items()):
+                if key != cur:
+                    out.append({"key": key, "active": False, **{f: p.get(f, "") for f in
+                                                               ("server_url", "company_login", "company_name")}})
+            return out
+
+    def snapshot(self) -> dict:
+        with self.lock:
+            return json.loads(json.dumps(self.data))
+
+    def restore(self, snap: dict) -> None:
+        with self.lock:
+            self.data = snap
+            self._write()
+
+    def stash_current(self) -> None:
+        """Текущую компанию (если в ней есть вход) — в сохранённые; секреты остаются зашифрованными."""
+        with self.lock:
+            if self.data.get("company_login") and self.data.get("token"):
+                key = self.profile_key(self.data.get("server_url"), self.data.get("company_login"))
+                profiles = dict(self.data.get("profiles") or {})
+                profiles[key] = {f: self.data.get(f, "") for f in self.PROFILE_FIELDS}
+                self.data["profiles"] = profiles
+                self._write()
+
+    def activate(self, key: str) -> bool:
+        """Сохранённую компанию — в текущие (вместо прежней: её сначала stash_current)."""
+        with self.lock:
+            profiles = dict(self.data.get("profiles") or {})
+            p = profiles.pop(key, None)
+            if p is None:
+                return False
+            for f in self.PROFILE_FIELDS:
+                self.data[f] = p.get(f, "")
+            self.data.update(profiles=profiles, last_conf_hash="", fw_subnet="", enabled=True)
+            self._write()
+            return True
+
+    def forget(self, key: str) -> dict | None:
+        """Убрать сохранённую компанию; вернуть её поля (токен — расшифрованным) или None."""
+        with self.lock:
+            profiles = dict(self.data.get("profiles") or {})
+            p = profiles.pop(key, None)
+            if p is None:
+                return None
+            self.data["profiles"] = profiles
+            self._write()
+        return {**p, "token": unprotect(p.get("token", ""))}
+
+    def _write(self) -> None:
+        """Записать на диск (вызывать под self.lock)."""
+        tmp = self.path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(self.data, ensure_ascii=False, indent=2), "utf-8")
+        for attempt in range(5):  # антивирус может на миг держать файл
+            try:
+                tmp.replace(self.path)
+                break
+            except PermissionError:
+                if attempt == 4:
+                    raise
+                time.sleep(0.2)
 
     def keypair(self) -> tuple[str, str]:
         priv_b64 = self.get("private_key")
@@ -694,8 +770,10 @@ class Updater(threading.Thread):
         self.last_check = time.time()
         if self.state.get("auto_update") is False or not self.state.get("token"):
             return None
-        keys = update_public_keys() or [k for k in [self.state.get("update_pubkey") or ""] if KEY_RE.match(k)]
         base = (self.state.get("server_url") or "").rstrip("/")
+        pins = self.state.get("update_pins") or {}
+        pinned = pins.get(base) or ("" if pins else self.state.get("update_pubkey") or "")   # 1.0.6: один ключ
+        keys = update_public_keys() or [k for k in [pinned] if KEY_RE.match(k)]
         u = urlparse(base)
         if u.scheme != "https" and u.hostname not in ("127.0.0.1", "localhost"):
             log.warning("автообновление только по https: %s", base)
@@ -711,7 +789,7 @@ class Updater(threading.Thread):
                     log.warning("автообновление выключено: сервер не прислал ключ подписи")
                     self.warned_no_key = True
                 return None
-            self.state.set(update_pubkey=pk)
+            self.state.set(update_pins={**pins, base: pk})
             keys = [pk]
             log.warning("ключ подписи обновлений запомнен: %s", pk)
         upd = info.get("update") if isinstance(info, dict) else None
@@ -845,6 +923,8 @@ class Worker(threading.Thread):
         self.last_heartbeat = 0.0
         self.cfg: dict | None = None
         self.paused = False  # после «Выйти из сети»
+        # шаг цикла и смена компании (вход, переключение, выход) не идут одновременно
+        self.op_lock = threading.RLock()
 
     # --- связь с GUI
     def emit(self, kind: str, **data):
@@ -855,20 +935,71 @@ class Worker(threading.Thread):
 
     # --- команды из GUI (вызываются в отдельном потоке)
     def login(self, server: str, company: str, password: str, device: str, remember: bool):
-        self.state.set(server_url=server.strip().rstrip("/"), company_login=company.strip(),
-                       device_name=device.strip())
-        try:
-            self._register(password)
-        except ApiError as e:
-            return e.detail
-        except ServerUnreachable:
-            return "Сервер недоступен. Проверьте адрес и интернет."
-        self.state.set(join_password=password if remember else "", enabled=True)
-        self.paused = False
+        """Вход в компанию. Другая компания, чем текущая, — добавляется: текущая уходит в сохранённые
+        (Компания → переключиться), у новой — свой ключ WireGuard (для сервера это другой ПК).
+        Не вышло — всё как было."""
+        server, company = server.strip().rstrip("/"), company.strip()
+        with self.op_lock:
+            snap = self.state.snapshot()
+            target = State.profile_key(server, company)
+            if target != self.state.current_key() and self.state.get("company_login"):
+                self.state.stash_current()
+                if not self.state.activate(target):   # уже в списке — тот же ключ, тот же ПК на сервере
+                    self.state.set(token="", private_key="", join_password="", company_name="", last_conf_hash="")
+            self.state.set(server_url=server, company_login=company, device_name=device.strip())
+            try:
+                self._register(password)
+            except (ApiError, ServerUnreachable) as e:
+                self.state.restore(snap)
+                return e.detail if isinstance(e, ApiError) else "Сервер недоступен. Проверьте адрес и интернет."
+            self.state.set(join_password=password if remember else "", enabled=True, last_conf_hash="")
+            self._reset_connection()
         self.wake.set()
         return None
 
+    def switch_to(self, key: str) -> str | None:
+        """Переключиться на сохранённую компанию: туннель и firewall пересоберутся под неё."""
+        with self.op_lock:
+            if key == self.state.current_key() and self.state.get("token"):
+                return None
+            snap = self.state.snapshot()
+            self.state.stash_current()
+            if not self.state.activate(key):
+                self.state.restore(snap)
+                return "Компания не найдена в списке"
+            log.info("переключение на компанию %s", self.state.get("company_login"))
+            self._reset_connection()
+            self.emit("peers", peers=[])
+            self.status(Status.CONNECTING, "Переключение на другую компанию…")
+        self.wake.set()
+        return None
+
+    def forget_company(self, key: str) -> None:
+        """Убрать сохранённую (не текущую) компанию; её вход отзывается на сервере."""
+        with self.op_lock:
+            if key == self.state.current_key():
+                return
+            p = self.state.forget(key)
+        if p and p.get("token"):
+            try:
+                requests.post(str(p.get("server_url") or "").rstrip("/") + "/api/logout", timeout=8,
+                              headers={"Authorization": f"Bearer {p['token']}", "User-Agent": f"{APP_NAME}/{VERSION}"})
+            except requests.RequestException:
+                pass   # не дошло — администратор компании удалит ПК в кабинете
+
+    def _reset_connection(self):
+        self.cfg = None
+        self.paused = False
+        self.server_was_down = False
+        self.last_install = 0.0
+        self.reinstall_backoff = 60
+        self.last_heartbeat = 0.0
+
     def logout(self):
+        with self.op_lock:
+            self._logout()
+
+    def _logout(self):
         self.paused = True
         if self.state.get("token"):
             try:
@@ -924,7 +1055,8 @@ class Worker(threading.Thread):
         while not self.stop_flag:
             try:
                 if not self.paused:
-                    self.step()
+                    with self.op_lock:
+                        self.step()
             except Exception as e:  # noqa: BLE001
                 log.exception("ошибка цикла")
                 self.status(Status.ERROR, str(e))
@@ -991,6 +1123,8 @@ class Worker(threading.Thread):
             self.cfg = None
             self.status(Status.ERROR, "Сервер прислал неверную конфигурацию — туннель не изменён")
             return
+        if self.cfg.get("company") and self.cfg["company"] != self.state.get("company_name"):
+            self.state.set(company_name=str(self.cfg["company"])[:100])
 
         if self.cfg["status"] == "blocked":
             if self.tunnel.service_state() != "missing":
@@ -1242,10 +1376,10 @@ def setup_style(root: tk.Tk) -> None:
 
 
 class LoginDialog(tk.Toplevel):
-    def __init__(self, app: "App", error: str = ""):
+    def __init__(self, app: "App", error: str = "", add: bool = False):
         super().__init__(app)
         self.app = app
-        self.title("Подключение к сети компании")
+        self.title("Добавить компанию" if add else "Подключение к сети компании")
         self.configure(bg=C["bg"])
         self.resizable(False, False)
         self.transient(app)
@@ -1258,7 +1392,7 @@ class LoginDialog(tk.Toplevel):
         frm.pack(fill="both")
         self.vars = {
             "server": tk.StringVar(value=st.get("server_url")),
-            "company": tk.StringVar(value=st.get("company_login")),
+            "company": tk.StringVar(value="" if add else st.get("company_login")),
             "password": tk.StringVar(),
             "device": tk.StringVar(value=st.get("device_name") or socket.gethostname()),
             "remember": tk.BooleanVar(value=True),
@@ -1461,7 +1595,7 @@ class Tray:
 
 
 class App(tk.Tk):
-    def __init__(self, state: State, minimized: bool):
+    def __init__(self, state: State, minimized: bool = True, announce: bool = False):
         super().__init__()
         self.report_callback_exception = self._tk_error   # ошибки в обработчиках окна — в журнал
         self.state_ = state
@@ -1491,8 +1625,11 @@ class App(tk.Tk):
         # крестик — спрятать в трей (VPN работает дальше); без трея — свернуть
         self.protocol("WM_DELETE_WINDOW", self.hide)
         self.bind("<Unmap>", self._on_unmap)   # кнопка «свернуть» — тоже в трей, а не на панель задач
-        if minimized:
+        if minimized:   # программа запускается в трей; окно — двойным щелчком по значку у часов
             self.after(100, self.hide)
+        if announce:    # запустили ярлыком — подсказать, где программа (при автозапуске — молча)
+            self.after(1500, lambda: self.tray.notify(
+                APP_TITLE, "Retix Hub работает в трее (значок у часов). Двойной щелчок — открыть окно."))
         dark_titlebar(self)
         no_maximize_button(self)
         self.worker.start()
@@ -1514,7 +1651,7 @@ class App(tk.Tk):
         m.add_command(label="Подключить / отключить", command=self.toggle)
         m.add_command(label="Переподключить", command=self.worker.force_reconnect)
         m.add_separator()
-        m.add_command(label="Войти в другую компанию…", command=self.show_login)
+        m.add_command(label="Добавить компанию…", command=lambda: self.show_login(add=True))
         m.add_command(label="Выйти из сети компании", command=self.logout)
         m.add_separator()
         m.add_command(label="Открыть журнал", command=self.open_log)
@@ -1524,7 +1661,10 @@ class App(tk.Tk):
         h = dark_menu(self)
         h.add_command(label="Как открыть доступ к папке…", command=self.help_share)
         h.add_command(label="О программе", command=self.about)
-        for title, menu in (("Система", m), ("Справка", h)):
+        self.company_menu = dark_menu(self)
+        self.company_menu.configure(postcommand=self._fill_company_menu)   # список — при каждом открытии
+        self._forget_menu = None
+        for title, menu in (("Система", m), ("Компания", self.company_menu), ("Справка", h)):
             b = tk.Label(bar, text=title, bg=C["bg"], fg=C["text"], padx=8, pady=3, font=("Segoe UI", 9),
                          cursor="hand2")
             b.pack(side="left")
@@ -1692,7 +1832,9 @@ class App(tk.Tk):
         if c and status != Status.NEED_LOGIN:
             self.name_lbl.config(text=c.get("device_name") or socket.gethostname())
             self.ip_lbl.config(text=c.get("ip") or "—")
-            self.group_lbl.config(text=("▶  " if self.collapsed else "▼  ") + (c.get("company") or "—"))
+            hidden = c.get("show_peers") is False   # администратор скрыл список (сеть при этом та же)
+            self.group_lbl.config(text=("▶  " if self.collapsed else "▼  ") + (c.get("company") or "—")
+                                  + ("  · список скрыт администратором" if hidden else ""))
         elif status == Status.NEED_LOGIN:
             self.ip_lbl.config(text="—")
             self.group_lbl.config(text="▼  —")
@@ -1765,12 +1907,62 @@ class App(tk.Tk):
         self.badge.config(text="Отключение…" if enabled else "Подключение…", bg=C["orange"])
         threading.Thread(target=self.worker.set_enabled, args=(not enabled,), daemon=True, name="toggle").start()
 
-    def show_login(self, error: str = ""):
+    def show_login(self, error: str = "", add: bool = False):
         if self.login_dialog:
             self.login_dialog.lift()
             return
         self.show()
-        self.login_dialog = LoginDialog(self, error)
+        self.login_dialog = LoginDialog(self, error, add=add)
+
+    # --- несколько компаний: в сети — одна, остальные сохранены (вход и ключ)
+    @staticmethod
+    def _company_title(p: dict) -> str:
+        return p.get("company_name") or p.get("company_login") or "—"
+
+    def _fill_company_menu(self):
+        m = self.company_menu
+        m.delete(0, "end")
+        if self._forget_menu is not None:
+            self._forget_menu.destroy()
+            self._forget_menu = None
+        profiles = self.state_.profiles()
+        for p in profiles:
+            title = self._company_title(p)
+            if p["active"]:
+                m.add_command(label=f"●  {title}  (сейчас)", state="disabled")
+            else:
+                m.add_command(label=f"     {title}", command=lambda k=p["key"], t=title: self.switch_company(k, t))
+        if profiles:
+            m.add_separator()
+        m.add_command(label="Добавить компанию…", command=lambda: self.show_login(add=True))
+        others = [p for p in profiles if not p["active"]]
+        if others:
+            self._forget_menu = dark_menu(m)
+            for p in others:
+                title = self._company_title(p)
+                self._forget_menu.add_command(label=title, command=lambda k=p["key"], t=title: self.forget_company(k, t))
+            m.add_cascade(label="Убрать из списка", menu=self._forget_menu)
+
+    def switch_company(self, key: str, title: str):
+        if not messagebox.askyesno(APP_TITLE, f"Переключиться на «{title}»?\n\n"
+                                              "Сеть текущей компании отключится — компьютер будет в сети выбранной. "
+                                              "Вернуться можно так же, через меню «Компания».", parent=self):
+            return
+        for win in list(self.chats.values()):   # переписка — с ПК прежней компании
+            win.close()
+
+        def work():
+            err = self.worker.switch_to(key)
+            if err:
+                self.ui_q.put(("error", err))
+        threading.Thread(target=work, daemon=True, name="switch").start()
+
+    def forget_company(self, key: str, title: str):
+        if not messagebox.askyesno(APP_TITLE, f"Убрать «{title}» из списка?\n\n"
+                                              "Вход этого ПК в эту компанию будет отозван. Чтобы вернуться, "
+                                              "понадобится пароль подключения компании.", parent=self):
+            return
+        threading.Thread(target=lambda: self.worker.forget_company(key), daemon=True, name="forget").start()
 
     def selected_peer(self) -> dict | None:
         sel = self.tree.selection()
@@ -2188,7 +2380,8 @@ def main():
         return
     log.info("старт %s (%s)", VERSION, " ".join(sys.argv[1:]) or "без параметров")
     show_event = create_show_event() if WINDOWS else None
-    app = App(State(), minimized="--minimized" in sys.argv)
+    # всегда в трей (окно — из трея); --show — открыть окно сразу. Нужен вход — окно входа покажется само.
+    app = App(State(), minimized="--show" not in sys.argv, announce="--minimized" not in sys.argv)
     if show_event:
         watch_show_event(show_event, app.ui_q)
     try:
