@@ -42,6 +42,18 @@ CREATE TABLE IF NOT EXISTS devices (
 );
 CREATE INDEX IF NOT EXISTS ix_devices_company ON devices(company_id);
 
+-- сообщения между ПК одной компании (меню «Сообщение» в клиенте)
+CREATE TABLE IF NOT EXISTS messages (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    company_id      INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+    from_device_id  INTEGER REFERENCES devices(id) ON DELETE SET NULL,
+    to_device_id    INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+    text            TEXT NOT NULL,
+    created_at      INTEGER NOT NULL,
+    delivered       INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS ix_messages_to ON messages(to_device_id, delivered);
+
 CREATE TABLE IF NOT EXISTS audit_log (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     company_id  INTEGER,

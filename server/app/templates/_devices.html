@@ -7,7 +7,6 @@
       <span class="dot {{ 'on' if d.online }}"></span>{{ 'online' if d.online else 'offline' }}
       {% if d.status == 'pending' %}<span class="tag warn">ждёт одобрения</span>{% endif %}
       {% if d.status == 'blocked' %}<span class="tag bad">заблокирован</span>{% endif %}
-      {% if d.is_share_host %}<span class="tag share">📁 общая папка</span>{% endif %}
     </td>
     <td>
       <form class="rename" method="post" action="{{ prefix }}{{ d.id }}/rename">
@@ -21,11 +20,6 @@
     <td class="actions">
       {% if d.status == 'pending' %}
         <form method="post" action="{{ prefix }}{{ d.id }}/approve"><button class="small primary">Одобрить</button></form>
-      {% endif %}
-      {% if d.is_share_host %}
-        <form method="post" action="{{ prefix }}{{ d.id }}/unshare"><button class="small">Снять 📁</button></form>
-      {% else %}
-        <form method="post" action="{{ prefix }}{{ d.id }}/share"><button class="small" title="Этот ПК хранит общую папку">Сделать 📁</button></form>
       {% endif %}
       {% if d.is_blocked %}
         <form method="post" action="{{ prefix }}{{ d.id }}/unblock"><button class="small">Разблокировать</button></form>

@@ -8,7 +8,7 @@
   <div class="stats">
     <div><span class="muted">Онлайн</span><b>{{ online }} / {{ devices|length }}</b></div>
     <div><span class="muted">Одобрение</span><b>{{ 'да' if company.require_approval else 'нет' }}</b></div>
-    <div><span class="muted">Весь трафик внутри</span><b>{{ 'да' if company.full_lan else 'только папка' }}</b></div>
+    <div><span class="muted">Весь трафик внутри</span><b>{{ 'да' if company.full_lan else 'ping и общие папки' }}</b></div>
   </div>
 </div>
 <div class="card">

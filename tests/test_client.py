@@ -98,16 +98,16 @@ class FakeTunnel:
 
 
 class Client:
-    """Один «компьютер»: своё состояние, свой hosts, свой туннель."""
+    """Один «компьютер»: своё состояние и свой туннель."""
 
     def __init__(self, tmp: Path, hostname="BUH-01"):
         tmp.mkdir(parents=True, exist_ok=True)
-        self.hosts = tmp / "hosts"; self.hosts.write_text("127.0.0.1 localhost\n# своя строка\n10.0.0.5 nas\n")
         self.state = rc.State(tmp / "state.json"); self.state.set(server_url=BASE)
         self.tunnel = FakeTunnel()
         self.fw = []
         self.hostname = hostname
-        self.w = rc.Worker(self.state, queue.Queue(), tunnel=self.tunnel, hosts_file=self.hosts)
+        self.events_seen = []
+        self.w = rc.Worker(self.state, queue.Queue(), tunnel=self.tunnel)
 
     def step(self, n=1):
         for _ in range(n):
@@ -118,6 +118,7 @@ class Client:
         st = None
         while not self.w.events.empty():
             kind, data = self.w.events.get()
+            self.events_seen.append((kind, data))
             if kind == "status":
                 st = data
             elif kind == "peers":
@@ -136,7 +137,7 @@ def patch_windows(monkeypatch):
 @pytest.fixture()
 def make_client(tmp_path, monkeypatch):
     fw = []
-    monkeypatch.setattr(rc, "ensure_smb_firewall", lambda subnet, ports="445": fw.append((subnet, ports)))
+    monkeypatch.setattr(rc, "ensure_firewall", lambda subnet, ports="445": fw.append((subnet, ports)))
     clients = []
 
     def make(hostname="BUH-01"):
@@ -206,7 +207,7 @@ def test_secrets_not_plain_in_state(make_client, company):
 def test_restart_keeps_session(make_client, company, tmp_path):
     c = make_client(); login(c, company); c.step(2)
     # «перезагрузка ПК»: новый процесс клиента с тем же state.json и туннелем
-    w2 = rc.Worker(rc.State(c.state.path), queue.Queue(), tunnel=c.tunnel, hosts_file=c.hosts)
+    w2 = rc.Worker(rc.State(c.state.path), queue.Queue(), tunnel=c.tunnel)
     w2.step()
     assert c.tunnel.installs == 1                         # конфиг тот же — не переставляем
     kinds = [w2.events.get()[1].get("status") for _ in range(w2.events.qsize())]
@@ -348,49 +349,69 @@ def test_company_disabled(make_client, company, server):
     assert c.step()["status"] == rc.Status.BLOCKED and c.tunnel.state == "missing"
 
 
-def test_peers_hosts_and_share(make_client, company):
+def test_peers_list(make_client, company):
     a = make_client("PC1"); login(a, company, name="Склад"); a.step(2)
     b = make_client("BUH-01"); login(b, company, name="Бухгалтерия"); b.step(2)
-    company.cab.post(BASE + f"/cabinet/devices/{a.w.cfg['device_id']}/share")
     b.step()
     names = {p["name"]: p for p in b.peers}
-    assert set(names) == {"Склад", "Бухгалтерия"} and names["Склад"]["is_share_host"] and names["Бухгалтерия"]["is_me"]
-    hosts = b.hosts.read_text()
-    assert f"{a.w.cfg['ip']}\tpc1" in hosts
-    assert "buh-01" not in hosts                          # себя в hosts не пишем
-    assert "10.0.0.5 nas" in hosts and "# своя строка" in hosts   # чужие строки целы
-    assert b.w.cfg["share"]["hostname"] == "PC1"
+    assert set(names) == {"Склад", "Бухгалтерия"} and names["Бухгалтерия"]["is_me"]
+    assert names["Склад"]["ip"] == a.w.cfg["ip"]
 
 
-def test_hosts_idempotent_and_cleaned_on_logout(make_client, company):
+def test_hosts_never_touched(make_client, company, patch_windows):
+    """1.0.1: файл hosts не трогаем совсем (антивирусы, например Dr.Web, блокируют запись)."""
+    assert not hasattr(rc, "update_hosts") and not hasattr(rc, "HOSTS_FILE")
     a = make_client("PC1"); login(a, company, name="A"); a.step(2)
-    b = make_client("PC2"); login(b, company, name="B"); b.step(2)
-    b.step()
-    m1 = b.hosts.stat().st_mtime_ns
-    time.sleep(0.02); b.step()
-    assert b.hosts.stat().st_mtime_ns == m1              # не переписываем без изменений
-    assert b.hosts.read_text().count("RetixHub BEGIN") == 1
+    b = make_client("PC2"); login(b, company, name="B"); b.step(3)
     b.w.logout()
-    assert "RetixHub" not in b.hosts.read_text() and "10.0.0.5 nas" in b.hosts.read_text()
-    assert b.tunnel.state == "missing" and b.state.get("token") == ""
+    assert not any("hosts" in " ".join(map(str, c)).lower() for c in patch_windows)
 
 
-def test_hosts_skips_bad_hostnames(tmp_path):
-    h = tmp_path / "hosts"; h.write_text("127.0.0.1 localhost\n")
-    rc.update_hosts({"good-pc": "10.66.1.2"}, h)
-    assert "10.66.1.2\tgood-pc" in h.read_text()
-    rc.update_hosts({}, h)
-    assert h.read_text() == "127.0.0.1 localhost\n"
-
-
-def test_share_host_firewall(make_client, company):
+def test_firewall_on_every_pc(make_client, company):
+    """Общие папки и ping открыты из подсети компании на каждом ПК, без отметки «ПК с папкой»."""
     a = make_client("PC1"); login(a, company, name="Склад"); a.step(2)
-    company.cab.post(BASE + f"/cabinet/devices/{a.w.cfg['device_id']}/share")
-    a.step()
     assert a.fw[-1] == (a.w.cfg["subnet"], "445")
-    company.cab.post(BASE + f"/cabinet/devices/{a.w.cfg['device_id']}/unshare")
+    n = len(a.fw)
+    a.step(2)
+    assert len(a.fw) == n                                 # без изменений — не трогаем
+    company.cab.post(BASE + "/cabinet/settings", data={"share_name": "share", "share_ports": "445,139"})
     a.step()
+    assert a.fw[-1] == (a.w.cfg["subnet"], "445,139")
+    a.w.logout()
     assert a.fw[-1][0] is None
+
+
+def test_power_off_and_on(make_client, company):
+    c = make_client(); login(c, company); c.step(2)
+    c.w.set_enabled(False)
+    st = c.step()
+    assert st["status"] == rc.Status.OFF and c.tunnel.state == "missing"
+    assert c.step()["status"] == rc.Status.OFF and c.tunnel.installs == 1    # выключено — не ставим
+    # «перезагрузка»: остаётся выключенным
+    w2 = rc.Worker(rc.State(c.state.path), queue.Queue(), tunnel=c.tunnel); w2.step()
+    assert c.tunnel.state == "missing"
+    c.w.set_enabled(True)
+    c.step()
+    assert c.step()["status"] == rc.Status.ONLINE and c.tunnel.installs == 2
+    assert c.state.get("token")                          # вход сохранён — пароль не нужен
+
+
+def test_messages_between_pcs(make_client, company):
+    a = make_client("PC1"); login(a, company, name="Склад"); a.step(2)
+    b = make_client("PC2"); login(b, company, name="Бухгалтерия"); b.step(2)
+    assert a.w.send_message(b.w.cfg["device_id"], "Отчёт готов") is None
+    b.step()
+    msgs = [d for k, d in b.events_seen if k == "messages"]
+    assert msgs and msgs[-1]["messages"][0]["text"] == "Отчёт готов"
+    assert msgs[-1]["messages"][0]["from_name"] == "Склад"
+    b.step()
+    assert len([1 for k, _ in b.events_seen if k == "messages"]) == 1      # повторно не приходит
+    assert "не найден" in a.w.send_message(999999, "x")
+
+
+def test_natural_sort():
+    names = ["10 zoo kassa", "2 zoo kassa", "01 zoo kassa", "ALPHA"]
+    assert sorted(names, key=rc.natural_key) == ["01 zoo kassa", "2 zoo kassa", "10 zoo kassa", "ALPHA"]
 
 
 def test_wireguard_missing(make_client, company, monkeypatch):
@@ -409,7 +430,6 @@ def test_isolation_from_client_side(make_client, server, company):
     a.step(); b.step()
     assert {p["name"] for p in a.peers} == {"A"} and {p["name"] for p in b.peers} == {"B"}
     assert a.w.cfg["subnet"] != b.w.cfg["subnet"]
-    assert "b1" not in a.hosts.read_text().lower()
 
 
 def test_build_conf_format():
@@ -418,3 +438,9 @@ def test_build_conf_format():
     conf = rc.Tunnel.build_conf(cfg, "P" * 43 + "=")
     assert conf.splitlines()[:3] == ["[Interface]", "PrivateKey = " + "P" * 43 + "=", "Address = 10.66.1.2/32"]
     assert "PersistentKeepalive = 25" in conf
+
+
+def test_smb_check_closed_port():
+    # на 127.0.0.1 порт 445 закрыт -> понятная причина, а не пустой ответ
+    msg = rc.smb_check("127.0.0.1", timeout=0.5)
+    assert msg.startswith("Компьютер не отвечает") and "\\\\" not in msg
