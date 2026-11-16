@@ -635,11 +635,81 @@ class Worker(threading.Thread):
 # (в т.ч. after()) может «уронить» программу без следа в журнале.
 
 C = {
-    "bg": "#1b2431", "panel": "#232f3f", "head": "#2c3a4e", "line": "#334257", "sel": "#2f5d8a",
-    "text": "#e6ebf2", "muted": "#8fa0b5", "name": "#5cc8f5",
-    "on": "#2b9bd8", "off": "#5b6778", "green": "#22c55e", "orange": "#f59e0b", "red": "#ef4444",
-    "entry": "#141b26",
+    "bg": "#0d1117", "panel": "#131a23", "head": "#1a2330", "line": "#232e3d", "sel": "#1d4a74",
+    "hover": "#1f2a38", "text": "#e3e9f1", "muted": "#7b889b", "name": "#4fc3f7",
+    "on": "#1e8fe0", "off": "#3a4555", "green": "#22c55e", "orange": "#f59e0b", "red": "#ef4444",
+    "entry": "#0a0e13",
 }
+
+
+def dark_menu(parent) -> "tk.Menu":
+    """Выпадающее меню в цветах приложения."""
+    return tk.Menu(parent, tearoff=0, bg=C["head"], fg=C["text"], activebackground=C["sel"],
+                   activeforeground="white", disabledforeground=C["muted"], bd=0, relief="flat",
+                   font=("Segoe UI", 9))
+
+
+def dark_titlebar(win) -> None:
+    """Тёмный заголовок окна Windows 10/11 (DWM). На других системах ничего не делает."""
+    if not WINDOWS:
+        return
+    try:
+        win.update_idletasks()
+        hwnd = ctypes.windll.user32.GetParent(win.winfo_id())
+        on = ctypes.c_int(1)
+        for attr in (20, 19):  # DWMWA_USE_IMMERSIVE_DARK_MODE (новые и старые сборки Windows 10)
+            if ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, attr, ctypes.byref(on), ctypes.sizeof(on)) == 0:
+                break
+        r, g, b = (int(C["bg"][i:i + 2], 16) for i in (1, 3, 5))
+        color = ctypes.c_int(r | (g << 8) | (b << 16))   # Windows 11: цвет заголовка = цвет окна
+        ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 35, ctypes.byref(color), ctypes.sizeof(color))
+    except Exception:  # noqa: BLE001
+        log.debug("тёмный заголовок недоступен", exc_info=True)
+
+
+def render_power(on: bool, hover: bool = False, size: int = 76):
+    """Кнопка ON/OFF со сглаживанием (рисуется через Pillow в 4 раза крупнее и уменьшается)."""
+    from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageTk
+    k = 4
+    S = size * k
+    img = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+    accent = (30, 143, 224) if on else (58, 69, 85)
+    if hover:
+        accent = tuple(min(255, c + 22) for c in accent)
+    if on:  # мягкое свечение вокруг
+        glow = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+        ImageDraw.Draw(glow).ellipse((6 * k, 6 * k, S - 6 * k, S - 6 * k), fill=accent + (150,))
+        img = Image.alpha_composite(img, glow.filter(ImageFilter.GaussianBlur(5 * k)))
+    d = ImageDraw.Draw(img)
+    pad = 7 * k
+    d.ellipse((pad, pad, S - pad, S - pad), fill=(10, 14, 19, 255), outline=accent + (255,), width=3 * k)
+    inner = pad + 6 * k
+    top, bottom = tuple(min(255, c + 30) for c in accent), tuple(max(0, c - 25) for c in accent)
+    grad = Image.new("RGBA", (S, S), (0, 0, 0, 0))                                        # градиент сверху вниз
+    gd = ImageDraw.Draw(grad)
+    for i in range(inner, S - inner):
+        t = (i - inner) / max(1, S - 2 * inner)
+        gd.line((inner, i, S - inner, i), fill=tuple(int(top[j] * (1 - t) + bottom[j] * t) for j in range(3)) + (255,))
+    mask = Image.new("L", (S, S), 0)
+    ImageDraw.Draw(mask).ellipse((inner, inner, S - inner, S - inner), fill=255)
+    img.paste(grad, (0, 0), mask)
+    d = ImageDraw.Draw(img)
+    white = (255, 255, 255, 255) if on else (170, 182, 198, 255)
+    c, r = S // 2, 13 * k
+    cy = c - 5 * k
+    d.arc((c - r, cy - r, c + r, cy + r), start=300, end=600, fill=white, width=3 * k)    # значок питания
+    d.line((c, cy - r - 3 * k, c, cy + 1 * k), fill=white, width=3 * k)
+    d.ellipse((c - 1.5 * k, cy - r - 4.5 * k, c + 1.5 * k, cy - r - 1.5 * k), fill=white)
+    d.ellipse((c - 1.5 * k, cy - 0.5 * k, c + 1.5 * k, cy + 2.5 * k), fill=white)
+    try:
+        font = ImageFont.truetype("segoeuib.ttf", 10 * k)
+    except OSError:
+        try:
+            font = ImageFont.truetype("DejaVuSans-Bold.ttf", 10 * k)
+        except OSError:
+            font = ImageFont.load_default()
+    d.text((c, cy + r + 9 * k), "ON" if on else "OFF", fill=white, font=font, anchor="mm")
+    return ImageTk.PhotoImage(img.resize((size, size), Image.LANCZOS))
 
 # статус -> (текст плашки, цвет)
 STATUS_VIEW = {
@@ -745,6 +815,7 @@ class LoginDialog(tk.Toplevel):
         x = app.winfo_rootx() + (app.winfo_width() - self.winfo_reqwidth()) // 2
         y = app.winfo_rooty() + 60
         self.geometry(f"+{max(0, x)}+{max(0, y)}")
+        dark_titlebar(self)
         self.grab_set()
 
     def close(self):
@@ -806,6 +877,7 @@ class MessageWindow(tk.Toplevel):
         self.entry.bind("<Return>", self._enter)
         self.entry.focus_set()
         self.protocol("WM_DELETE_WINDOW", self.close)
+        dark_titlebar(self)
 
     def _enter(self, event):
         if event.state & 0x1:  # Shift+Enter — новая строка
@@ -937,8 +1009,10 @@ class App(tk.Tk):
         self.tray = Tray(self.ui_q)
         # крестик — спрятать в трей (VPN работает дальше); без трея — свернуть
         self.protocol("WM_DELETE_WINDOW", self.hide)
+        self.bind("<Unmap>", self._on_unmap)   # кнопка «свернуть» — тоже в трей, а не на панель задач
         if minimized:
             self.after(100, self.hide)
+        dark_titlebar(self)
         self.worker.start()
         self.after(200, self._poll)
 
@@ -948,8 +1022,10 @@ class App(tk.Tk):
 
     # --- построение окна
     def _build(self):
-        menu = tk.Menu(self)
-        m = tk.Menu(menu, tearoff=0)
+        # своё меню (системное меню Windows нельзя перекрасить)
+        bar = tk.Frame(self, bg=C["bg"])
+        bar.pack(fill="x", padx=4, pady=(2, 0))
+        m = dark_menu(self)
         m.add_command(label="Подключить / отключить", command=self.toggle)
         m.add_command(label="Переподключить", command=self.worker.force_reconnect)
         m.add_separator()
@@ -960,19 +1036,26 @@ class App(tk.Tk):
         m.add_command(label="Папка журнала", command=lambda: self.open_path(log_dir()))
         m.add_separator()
         m.add_command(label="Выход (VPN продолжит работать)", command=self.quit_app)
-        menu.add_cascade(label="Система", menu=m)
-        h = tk.Menu(menu, tearoff=0)
+        h = dark_menu(self)
         h.add_command(label="Как открыть доступ к папке…", command=self.help_share)
         h.add_command(label="О программе", command=self.about)
-        menu.add_cascade(label="Справка", menu=h)
-        self.config(menu=menu)
+        for title, menu in (("Система", m), ("Справка", h)):
+            b = tk.Label(bar, text=title, bg=C["bg"], fg=C["text"], padx=8, pady=3, font=("Segoe UI", 9),
+                         cursor="hand2")
+            b.pack(side="left")
+            b.bind("<Enter>", lambda _e, w=b: w.config(bg=C["hover"]))
+            b.bind("<Leave>", lambda _e, w=b: w.config(bg=C["bg"]))
+            b.bind("<Button-1>", lambda _e, w=b, mm=menu: mm.tk_popup(w.winfo_rootx(), w.winfo_rooty() + w.winfo_height()))
 
         # шапка: кнопка ON/OFF, имя ПК, IP, статус
         top = tk.Frame(self, bg=C["panel"], highlightthickness=1, highlightbackground=C["line"])
         top.pack(fill="x", padx=8, pady=(8, 6))
-        self.power = tk.Canvas(top, width=72, height=72, bg=C["panel"], highlightthickness=0, cursor="hand2")
-        self.power.pack(side="left", padx=10, pady=10)
+        self.power = tk.Canvas(top, width=76, height=76, bg=C["panel"], highlightthickness=0, cursor="hand2")
+        self.power.pack(side="left", padx=8, pady=8)
         self.power.bind("<Button-1>", lambda _e: self.toggle())
+        self.power_on, self.power_hover = False, False
+        self.power.bind("<Enter>", lambda _e: self._hover_power(True))
+        self.power.bind("<Leave>", lambda _e: self._hover_power(False))
         info = tk.Frame(top, bg=C["panel"])
         info.pack(side="left", fill="x", expand=True, pady=10)
         self.name_lbl = tk.Label(info, text=self.state_.get("device_name") or socket.gethostname(), bg=C["panel"],
@@ -1021,7 +1104,7 @@ class App(tk.Tk):
         self.tree.bind("<Return>", lambda _e: self.open_shares())
         self.tree.bind("<Button-3>", self.peer_menu)
 
-        self.ctx = tk.Menu(self, tearoff=0)
+        self.ctx = dark_menu(self)
         self.ctx.add_command(label="Сообщение", command=self.message)
         self.ctx.add_separator()
         self.ctx.add_command(label="Копировать IP-адрес", command=self.copy_ip)
@@ -1039,9 +1122,20 @@ class App(tk.Tk):
         self.bind("<Configure>", lambda e: self.msg_lbl.config(wraplength=max(200, e.width - 20))
                   if e.widget is self else None)
 
+    def _hover_power(self, hover: bool):
+        self.power_hover = hover
+        self._draw_power(self.power_on)
+
     def _draw_power(self, on: bool):
+        self.power_on = on
         cv = self.power
         cv.delete("all")
+        try:
+            self._power_img = render_power(on, self.power_hover)   # ссылку держим, иначе картинку удалит сборщик
+            cv.create_image(38, 38, image=self._power_img)
+            return
+        except Exception:  # noqa: BLE001 — без Pillow рисуем попроще
+            log.debug("кнопка через Pillow не нарисована", exc_info=True)
         color = C["on"] if on else C["off"]
         cv.create_oval(3, 3, 69, 69, fill="#dfe7f0", outline="")
         cv.create_oval(9, 9, 63, 63, fill=color, outline="")
@@ -1145,6 +1239,10 @@ class App(tk.Tk):
             self.focus_force()
         except tk.TclError:
             pass
+
+    def _on_unmap(self, event):
+        if event.widget is self and self.tray.ok:
+            self.after(10, lambda: self.state() == "iconic" and self.withdraw())
 
     def hide(self):
         if self.tray.ok:
