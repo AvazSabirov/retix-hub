@@ -27,7 +27,20 @@ def device_update(request: Request, ctx=Depends(current_device)):
         raise HTTPException(403, "Устройство не активно")
     version = request.headers.get("x-retix-version", "").strip() or dev["client_version"]
     rel = updates.pick(conn, dev["company_id"], version)
-    return {"current": version, "update": updates.payload(rel, dev["id"]) if rel is not None else None}
+    return {"current": version, "public_key": updates.public_key_b64(),
+            "update": updates.payload(rel, dev["id"]) if rel is not None else None}
+
+
+@router.get("/api/client/version")
+def client_version_legacy(conn=Depends(db.get_db)):
+    """Для клиента 1.0.5 (первый вариант автообновления: без подписи, по SHA-256 с этого же сервера):
+    версия, опубликованная в «Обновлениях» для всех компаний, — та же, что отдаёт /download/client.
+    Так ПК на 1.0.5 сами переходят на новую версию, а дальше обновляются уже по подписи."""
+    rel = updates.site_release(conn)
+    if rel is None:
+        return {"version": None}
+    return {"version": rel["version"], "file": rel["file_name"], "size": rel["size"], "sha256": rel["sha256"],
+            "url": "/download/client"}
 
 
 @router.get("/api/update/file/{rid}")

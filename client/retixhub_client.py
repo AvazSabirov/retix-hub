@@ -37,7 +37,7 @@ import requests
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
 
-VERSION = "1.0.5"
+VERSION = "1.0.6"
 APP_NAME = "RetixHub"          # служебное имя: папки, задачи, мьютекс
 APP_TITLE = "Retix Hub"        # то, что видит пользователь
 TUNNEL = "retixhub"
@@ -154,7 +154,7 @@ class State:
     FIELDS = {"server_url": "", "company_login": "", "device_name": "", "token": "",
               "private_key": "", "join_password": "", "last_conf_hash": "", "fw_subnet": "",
               "autostart_done": False, "enabled": True, "auto_update": True, "update_attempt": {},
-              "update_state": "none"}
+              "update_state": "none", "update_pubkey": ""}
 
     def __init__(self, path: Path | None = None):
         self.path = path or STATE_FILE
@@ -535,8 +535,10 @@ def remove_autostart() -> None:
 # ПК в каждом запросе шлёт свою версию и состояние обновления (X-Retix-Version, X-Retix-Update-State),
 # сервер в каждом ответе — до какой версии обновиться (X-Retix-Update). Изменилось — сразу
 # GET /api/update; кроме того — раз в 10 минут. Версию, размер и SHA-256 клиент берёт ТОЛЬКО из
-# манифеста, подписанного закрытым ключом сервера (Ed25519); открытый ключ зашит в клиент
-# (UPDATE_PUBLIC_KEYS или client_config.json → update_public_keys). Нет ключа — сам не обновляется.
+# манифеста, подписанного закрытым ключом сервера (Ed25519). Открытый ключ: зашитый в клиент
+# (UPDATE_PUBLIC_KEYS или client_config.json → update_public_keys), а если его нет — ключ сервера,
+# запомненный при первой связи по https (state.json → update_pubkey, доступ только администраторам).
+# Дальше ключ не меняется: подписанное другим ключом клиент не ставит.
 
 UPDATE_PUBLIC_KEYS: list[str] = []      # base64 открытых ключей подписи; обычно — в client_config.json
 MANIFEST_APP = "Retix Hub"
@@ -692,12 +694,7 @@ class Updater(threading.Thread):
         self.last_check = time.time()
         if self.state.get("auto_update") is False or not self.state.get("token"):
             return None
-        keys = update_public_keys()
-        if not keys:
-            if not self.warned_no_key:
-                log.warning("автообновление выключено: в client_config.json нет update_public_keys")
-                self.warned_no_key = True
-            return None
+        keys = update_public_keys() or [k for k in [self.state.get("update_pubkey") or ""] if KEY_RE.match(k)]
         base = (self.state.get("server_url") or "").rstrip("/")
         u = urlparse(base)
         if u.scheme != "https" and u.hostname not in ("127.0.0.1", "localhost"):
@@ -707,6 +704,16 @@ class Updater(threading.Thread):
             info = self.api.update_info()
         except (ApiError, ServerUnreachable):
             return None
+        if not keys:   # первая связь: запомнить ключ сервера (по https, сертификат проверен)
+            pk = str((info or {}).get("public_key") or "") if isinstance(info, dict) else ""
+            if not KEY_RE.match(pk):
+                if not self.warned_no_key:
+                    log.warning("автообновление выключено: сервер не прислал ключ подписи")
+                    self.warned_no_key = True
+                return None
+            self.state.set(update_pubkey=pk)
+            keys = [pk]
+            log.warning("ключ подписи обновлений запомнен: %s", pk)
         upd = info.get("update") if isinstance(info, dict) else None
         if not upd:
             self._set_state("none")
