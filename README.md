@@ -48,6 +48,10 @@ nginx -t && systemctl reload nginx
 certbot --nginx -d hub.retix.uz --redirect
 ```
 
+Журнал сервера минимальный: только ошибки, предупреждения и строка о запуске (`docker logs retixhub`).
+Запросы касс не пишутся. Docker хранит не больше 2 файлов по 5 МБ. Для разбора проблемы — `LOG_LEVEL=INFO`
+(или `DEBUG` — с каждым запросом) в `.env` и `./run.sh`; потом верните `WARNING`.
+
 Проверка на сервере:
 ```bash
 wg show                                # интерфейс wg0 и пиры

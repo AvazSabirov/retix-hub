@@ -17,11 +17,13 @@ mkdir -p "$HUB_DATA"
 docker build -t retixhub .
 docker rm -f retixhub >/dev/null 2>&1 || true
 # --network host: wg0 и правила iptables создаются на хосте
+# журнал контейнера: не больше 2 файлов по 5 МБ (docker logs retixhub)
 docker run -d --name retixhub --restart unless-stopped \
     --network host \
     --cap-add NET_ADMIN --cap-add SYS_MODULE \
     --device /dev/net/tun \
     --env-file .env \
+    --log-opt max-size=5m --log-opt max-file=2 \
     -v "$HUB_DATA":/data \
     -v /lib/modules:/lib/modules:ro \
     retixhub
