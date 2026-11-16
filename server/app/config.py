@@ -25,6 +25,10 @@ SERVER_CIDR = f"{SERVER_IP}/16"
 
 # Через сколько секунд без handshake устройство считается offline
 ONLINE_SECONDS = int(os.getenv("ONLINE_SECONDS", "180"))
+# Через сколько секунд без входящего трафика устройство считается offline. Handshake WireGuard
+# обновляется лишь раз в ~2 минуты, а keepalive (WG_KEEPALIVE) и ping клиента идут каждые 8–25 с —
+# поэтому выключенный ПК виден по тому, что от него перестали приходить байты.
+OFFLINE_AFTER_SECONDS = int(os.getenv("OFFLINE_AFTER_SECONDS", "45"))
 # Radmin Server: Radmin Viewer подключается к нему по TCP 4899 — открыт между ПК компании всегда
 RADMIN_PORT = int(os.getenv("RADMIN_PORT", "4899"))
 

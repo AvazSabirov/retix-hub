@@ -508,10 +508,31 @@ class TestWg:
         a = ctx.register("firma1", "A"); b = ctx.register("firma1", "B")
         conn = db.connect()
         monitor.update_handshakes(conn, [
-            {"public_key": a["_key"], "endpoint": "1.1.1.1:1", "latest_handshake": int(time.time()) - 5},
-            {"public_key": b["_key"], "endpoint": "", "latest_handshake": int(time.time()) - 600}])
+            {"public_key": a["_key"], "endpoint": "1.1.1.1:1", "latest_handshake": int(time.time()) - 5, "rx": 100},
+            {"public_key": b["_key"], "endpoint": "", "latest_handshake": int(time.time()) - 600, "rx": 100}])
         peers = {p["name"]: p["online"] for p in ctx.api.get("/api/peers", headers=ctx.h(a["token"])).json()["peers"]}
         assert peers == {"A": True, "B": False}
+
+    def test_offline_when_traffic_stops(self, ctx):
+        """ПК выключили: handshake ещё «свежий» (до 3 минут), но keepalive больше не приходят —
+        через OFFLINE_AFTER_SECONDS он уже offline, не дожидаясь устаревания handshake."""
+        import time
+        from app import db, monitor, services
+        from app.config import OFFLINE_AFTER_SECONDS
+        ctx.company("firma1")
+        a = ctx.register("firma1", "A"); b = ctx.register("firma1", "B")
+        conn = db.connect()
+        t0 = int(time.time()) - OFFLINE_AFTER_SECONDS - 30
+        hs = int(time.time()) - 60   # handshake минуту назад — по нему ПК ещё был бы «в сети»
+        peer = lambda d, rx: {"public_key": d["_key"], "endpoint": "1.1.1.1:1", "latest_handshake": hs, "rx": rx}
+        monitor.update_handshakes(conn, [peer(a, 1000), peer(b, 1000)], now=t0)
+        # дальше A шлёт keepalive (rx растёт), B выключен (rx не меняется)
+        monitor.update_handshakes(conn, [peer(a, 1148), peer(b, 1000)])
+        peers = {p["name"]: p["online"] for p in ctx.api.get("/api/peers", headers=ctx.h(a["token"])).json()["peers"]}
+        assert peers == {"A": True, "B": False}
+        # без трафика вообще (rx=0) — тоже не в сети
+        monitor.update_handshakes(conn, [peer(b, 0)])
+        assert not services.is_online(conn.execute("SELECT * FROM devices WHERE public_key=?", (b["_key"],)).fetchone())
 
     def test_server_key_stable(self):
         from app import wg

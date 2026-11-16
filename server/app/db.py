@@ -40,6 +40,8 @@ CREATE TABLE IF NOT EXISTS devices (
     show_peers      INTEGER NOT NULL DEFAULT 1,  -- видит в программе другие ПК компании и может им писать
     client_version  TEXT NOT NULL DEFAULT '',
     last_handshake  INTEGER NOT NULL DEFAULT 0,
+    rx_bytes        INTEGER NOT NULL DEFAULT 0,  -- принято от ПК по WireGuard (из wg show dump)
+    last_rx_at      INTEGER NOT NULL DEFAULT 0,  -- когда rx_bytes последний раз вырос: ПК реально на связи
     endpoint        TEXT NOT NULL DEFAULT '',
     last_seen       TEXT,
     update_state    TEXT NOT NULL DEFAULT '',   -- что ПК сообщает об обновлении: downloading:1.0.6 …
@@ -114,6 +116,8 @@ MIGRATIONS = [
     ("devices", "update_state", "TEXT NOT NULL DEFAULT ''"),
     ("devices", "update_state_at", "TEXT"),
     ("devices", "show_peers", "INTEGER NOT NULL DEFAULT 1"),
+    ("devices", "rx_bytes", "INTEGER NOT NULL DEFAULT 0"),
+    ("devices", "last_rx_at", "INTEGER NOT NULL DEFAULT 0"),
 ]
 
 

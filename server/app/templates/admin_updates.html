@@ -115,7 +115,7 @@
       <td><code>{{ d.ip }}</code></td>
       <td class="nowrap">{{ d.client_version or '?' }}</td>
       <td>{% if d.target %}→ {{ d.target }}{% if d.state_text %}<div class="muted small">{{ d.state_text }} · {{ d.update_state_at|dt }}</div>{% endif %}{% elif d.state_text %}<span class="muted small">{{ d.state_text }}</span>{% else %}<span class="muted">последняя</span>{% endif %}</td>
-      <td class="nowrap muted">{{ d.last_handshake | ago }}</td>
+      <td class="nowrap muted">{{ (d.last_rx_at or d.last_handshake) | ago }}</td>
     </tr>
     {% else %}<tr><td colspan="6" class="muted">ПК нет</td></tr>{% endfor %}
   </table></div>
