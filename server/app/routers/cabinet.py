@@ -93,12 +93,15 @@ def join_password(new_password: str = Form(...), kick_all: str = Form(""), ctx=D
     conn, company = ctx
     if len(new_password) < 6:
         return redirect("/cabinet", "Пароль минимум 6 символов", err=True)
-    conn.execute("UPDATE companies SET join_pass_hash=? WHERE id=?", (hash_pw(new_password), company["id"]))
-    if kick_all:
-        # токены сброшены — клиенты обязаны войти заново с новым паролем
-        conn.execute("UPDATE devices SET token_hash=NULL WHERE company_id=?", (company["id"],))
-    services.audit(conn, company["id"], "join_password", "kick_all" if kick_all else "")
-    conn.commit()
+    with db.write_lock:
+        conn.execute("UPDATE companies SET join_pass_hash=? WHERE id=?", (hash_pw(new_password), company["id"]))
+        if kick_all:
+            # токены сброшены и пиры сняты с wg0 — ПК отключены от сети, пока не войдут с новым паролем
+            services.revoke_tokens(conn, "company_id=?", (company["id"],))
+        services.audit(conn, company["id"], "join_password", "kick_all" if kick_all else "")
+        conn.commit()
+        if kick_all:
+            services.reconcile(conn)
     return redirect("/cabinet", "Пароль подключения изменён" + (", все устройства должны войти заново" if kick_all else ""))
 
 

@@ -26,7 +26,7 @@
       {% else %}
         <form method="post" action="{{ prefix }}{{ d.id }}/block"><button class="small danger" title="Устройство не сможет подключиться, даже зная пароль">Блок</button></form>
       {% endif %}
-      <form method="post" action="{{ prefix }}{{ d.id }}/delete" onsubmit="return confirm('Удалить {{ d.name }}? Если на ПК сохранён пароль компании, он зарегистрируется снова. Чтобы запретить навсегда — используйте «Блок».')"><button class="small danger">Удалить</button></form>
+      <form method="post" action="{{ prefix }}{{ d.id }}/delete" data-confirm="Удалить {{ d.name }}? Если на ПК сохранён пароль компании, он зарегистрируется снова. Чтобы запретить навсегда — используйте «Блок»."><button class="small danger">Удалить</button></form>
     </td>
   </tr>
   {% else %}
