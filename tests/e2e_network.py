@@ -198,10 +198,9 @@ class Pc:
     def __init__(self, ns, hostname, company, name):
         self.ns, self.hostname, self.company, self.name = ns, hostname, company, name
         d = Path(tempfile.mkdtemp(prefix=f"retix-{ns}-"))
-        self.hosts = d / "hosts"; self.hosts.write_text("127.0.0.1 localhost\n")
         self.state = rc.State(d / "state.json"); self.state.set(server_url=API)
         self.tunnel = LinuxTunnel(ns, f"wg-{ns}")
-        self.w = rc.Worker(self.state, queue.Queue(), tunnel=self.tunnel, hosts_file=self.hosts)
+        self.w = rc.Worker(self.state, queue.Queue(), tunnel=self.tunnel)
         self.peers = []
 
     def _host(self):
@@ -254,7 +253,7 @@ def main():
             sys.exit(f"нет {tool}")
     print(f"WireGuard: {'модуль ядра' if KERNEL_WG else 'wireguard-go (userspace)'}")
     rc.run = lambda args, timeout=60: (0, "")
-    rc.ensure_smb_firewall = lambda subnet, ports="445": None
+    rc.ensure_firewall = lambda subnet, ports="445": None
     rc.ensure_autostart = lambda: None
 
     setup()
@@ -303,14 +302,11 @@ def run_scenarios(srv: ServerProc):
     check("PC1 ↔ Бухгалтерия: ping", ping_retry("a1", a2.ip) and ping_retry("a2", a1.ip))
     check("ПК → сервер 10.66.0.1: ping", ping_retry("a1", "10.66.0.1"))
 
-    print("\n3. Общая папка (\\\\PC1\\share)")
-    cab_a.post(API + f"/cabinet/devices/{a1.dev_id}/share")
+    print("\n3. Общие папки (SMB) между всеми ПК компании")
     a2.step()
-    check("клиент видит, где общая папка", a2.w.cfg["share"] and a2.w.cfg["share"]["ip"] == a1.ip)
-    check("hosts: PC1 → его VPN-адрес", f"{a1.ip}\tpc1" in a2.hosts.read_text())
     check("Бухгалтерия → PC1:445 (SMB) открыт", tcp("a2", a1.ip, 445))
-    check("Бухгалтерия → PC1:22 закрыт (только папка)", not tcp("a2", a1.ip, 22))
-    check("PC1 → Бухгалтерия:445 закрыт (она не хранит папку)", not tcp("a1", a2.ip, 445))
+    check("PC1 → Бухгалтерия:445 (SMB) открыт", tcp("a1", a2.ip, 445))
+    check("Бухгалтерия → PC1:22 закрыт (только ping и папки)", not tcp("a2", a1.ip, 22))
 
     print("\n4. Изоляция компаний")
     check("Beta → PC1 alpha: ping не проходит", not ping("b1", a1.ip))
@@ -406,7 +402,7 @@ def run_scenarios(srv: ServerProc):
 
     print("\n15. Выход из сети")
     a3.w.logout()
-    check("туннель удалён, hosts очищен", a3.tunnel.service_state() == "missing" and "RetixHub" not in a3.hosts.read_text())
+    check("туннель удалён", a3.tunnel.service_state() == "missing")
 
 
 if __name__ == "__main__":

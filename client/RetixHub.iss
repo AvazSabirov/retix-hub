@@ -16,9 +16,9 @@
 ;     (задача Планировщика «RetixHub» с правами администратора — без UAC
 ;     при каждом входе в Windows);
 ;   - после установки клиент запускается (кроме /SILENT и /VERYSILENT);
-;   - данные в %ProgramData%\RetixHub (ключ, вход, журнал) установщик
-;     не трогает ни при установке, ни при удалении;
-;   - при удалении: туннель, блок в hosts, правило firewall и автозапуск
+;   - данные в %ProgramData%\RetixHub (ключ, вход) и журнал {app}\logs установщик
+;     при обновлении не трогает (журнал удаляется вместе с программой);
+;   - при удалении: туннель, правила firewall и автозапуск
 ;     снимаются (RetixHub.exe --uninstall). WireGuard остаётся;
 ;   - установка более старой версии поверх новой запрещена.
 ;
@@ -103,6 +103,7 @@ Filename: "{app}\{#AppExe}"; Parameters: "--uninstall"; WorkingDir: "{app}"; Fla
 
 [UninstallDelete]
 Type: files; Name: "{app}\retixhub_selftest.txt"
+Type: filesandordirs; Name: "{app}\logs"
 
 [Code]
 const
