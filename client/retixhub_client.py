@@ -7,7 +7,7 @@ Retix Hub — клиент для Windows (окно, значок в трее).
 * показывает компьютеры компании (online/offline), открывает их общие папки (\\\\10.66.x.y),
   подключает сетевой диск; файл hosts не трогает;
 * открывает в firewall Windows общие папки (SMB) и ping из подсети компании;
-* раз в 10 минут проверяет новую версию на сервере и обновляется сам (тихая установка).
+* обновляется сам: версию публикует суперадмин, клиент проверяет подпись и ставит её тихо.
 
 Работает с правами администратора (перезапускает себя через UAC).
 Журнал: <папка программы>\\logs\\client.log, аварийные падения — logs\\crash.log.
@@ -37,7 +37,7 @@ import requests
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
 
-VERSION = "1.0.5"
+VERSION = "1.0.6"
 APP_NAME = "RetixHub"          # служебное имя: папки, задачи, мьютекс
 APP_TITLE = "Retix Hub"        # то, что видит пользователь
 TUNNEL = "retixhub"
@@ -153,7 +153,8 @@ class State:
 
     FIELDS = {"server_url": "", "company_login": "", "device_name": "", "token": "",
               "private_key": "", "join_password": "", "last_conf_hash": "", "fw_subnet": "",
-              "autostart_done": False, "enabled": True, "auto_update": True, "update_attempt": {}}
+              "autostart_done": False, "enabled": True, "auto_update": True, "update_attempt": {},
+              "update_state": "none", "update_pubkey": ""}
 
     def __init__(self, path: Path | None = None):
         self.path = path or STATE_FILE
@@ -239,6 +240,7 @@ class Api:
         # запросы по одному: иначе окно сообщений могло бы отправить уже заменённый токен,
         # а старый токен сервер считает признаком копии входа на другом ПК
         self.lock = threading.Lock()
+        self.on_hint = None   # Updater.note_hint: подсказка сервера X-Retix-Update
 
     def _req(self, method: str, path: str, auth: bool = True, **kw):
         with self.lock:
@@ -246,7 +248,8 @@ class Api:
 
     def _req_locked(self, method: str, path: str, auth: bool, **kw):
         url = self.state.get("server_url").rstrip("/") + path
-        headers = {"Authorization": f"Bearer {self.state.get('token')}"} if auth else {}
+        headers = {"Authorization": f"Bearer {self.state.get('token')}", "X-Retix-Version": VERSION,
+                   "X-Retix-Update-State": self.state.get("update_state") or "none"} if auth else {}
         try:
             r = self.http.request(method, url, headers=headers, timeout=8, **kw)
         except requests.RequestException as e:
@@ -254,6 +257,9 @@ class Api:
         new_token = r.headers.get(TOKEN_HEADER)
         if auth and new_token and r.status_code < 400:
             self.state.set(token=new_token)   # сразу на диск: после перезапуска — уже новый
+        hint = r.headers.get("X-Retix-Update")
+        if hint and self.on_hint:
+            self.on_hint(hint)
         if r.status_code >= 500:
             raise ServerUnreachable(f"HTTP {r.status_code}")
         if r.status_code >= 400:
@@ -286,6 +292,9 @@ class Api:
 
     def logout(self):
         return self._req("POST", "/api/logout")
+
+    def update_info(self):
+        return self._req("GET", "/api/update")
 
 
 # ====================================================================== проверка ответа сервера
@@ -522,44 +531,139 @@ def remove_autostart() -> None:
 
 
 # ====================================================================== автообновление
+# Как у касс Retix: суперадмин загружает установщик на сервер (/admin/updates) и публикует его.
+# ПК в каждом запросе шлёт свою версию и состояние обновления (X-Retix-Version, X-Retix-Update-State),
+# сервер в каждом ответе — до какой версии обновиться (X-Retix-Update). Изменилось — сразу
+# GET /api/update; кроме того — раз в 10 минут. Версию, размер и SHA-256 клиент берёт ТОЛЬКО из
+# манифеста, подписанного закрытым ключом сервера (Ed25519). Открытый ключ: зашитый в клиент
+# (UPDATE_PUBLIC_KEYS или client_config.json → update_public_keys), а если его нет — ключ сервера,
+# запомненный при первой связи по https (state.json → update_pubkey, доступ только администраторам).
+# Дальше ключ не меняется: подписанное другим ключом клиент не ставит.
 
-VERSION_RE = re.compile(r"^\d+(\.\d+){1,3}$")
+UPDATE_PUBLIC_KEYS: list[str] = []      # base64 открытых ключей подписи; обычно — в client_config.json
+MANIFEST_APP = "Retix Hub"
+MANIFEST_KIND = "retixhub-update"
+MIN_CHECK_GAP = 10                      # сек — не чаще, даже если подсказка «мигает»
+INSTALL_GRACE = 300                     # сек — столько установщику на работу, потом «не установилась»
+VERSION_RE = re.compile(r"^\d{1,5}(\.\d{1,5}){1,3}$")
+SHA_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
-def version_tuple(v: str) -> tuple:
-    if not VERSION_RE.match(v or ""):
-        raise ValueError(f"версия {v!r}")
-    return tuple((list(map(int, v.split("."))) + [0, 0, 0])[:4])
+class UpdateError(Exception):
+    """Понятный текст: что не так с обновлением."""
+
+
+def vkey(version):
+    """«1.0.6» -> (1, 0, 6, 0); не версия -> None."""
+    v = str(version or "").strip()
+    if not VERSION_RE.match(v):
+        return None
+    return tuple(([int(p) for p in v.split(".")] + [0, 0, 0])[:4])
+
+
+def newer(a, b) -> bool:
+    """Версия a новее b."""
+    ka, kb = vkey(a), vkey(b)
+    return ka is not None and (kb is None or ka > kb)
+
+
+def update_public_keys() -> list[str]:
+    keys = list(UPDATE_PUBLIC_KEYS)
+    cfg = app_dir() / "client_config.json"
+    try:
+        extra = json.loads(cfg.read_text("utf-8")).get("update_public_keys") or []
+        keys += [k for k in extra if isinstance(k, str)]
+    except (OSError, ValueError, AttributeError):
+        pass
+    return [k.strip() for k in keys if KEY_RE.match(k.strip())]
+
+
+def verify_manifest(info: dict, keys: list[str]) -> dict:
+    """Ответ сервера (update) -> проверенный манифест {version, size, sha256, file}.
+    UpdateError — подпись не сошлась или манифест чужой."""
+    from cryptography.exceptions import InvalidSignature
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+    try:
+        body = base64.b64decode(str(info.get("manifest") or ""), validate=True)
+        sig = base64.b64decode(str(info.get("signature") or ""), validate=True)
+    except (ValueError, TypeError):
+        raise UpdateError("манифест обновления повреждён")
+    ok = False
+    for key in keys:
+        try:
+            Ed25519PublicKey.from_public_bytes(base64.b64decode(key)).verify(sig, body)
+            ok = True
+            break
+        except (InvalidSignature, ValueError):
+            pass
+    if not body or not ok:
+        raise UpdateError("подпись обновления не сходится — установщик не от сервера Retix Hub")
+    try:
+        m = json.loads(body.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        raise UpdateError("манифест обновления повреждён")
+    if not isinstance(m, dict) or m.get("app") != MANIFEST_APP or m.get("kind") != MANIFEST_KIND:
+        raise UpdateError("манифест не от обновления Retix Hub")
+    size, sha, version = m.get("size"), str(m.get("sha256") or "").lower(), str(m.get("version") or "")
+    if vkey(version) is None or not isinstance(size, int) or not 0 < size <= UPDATE_MAX_SIZE or not SHA_RE.match(sha):
+        raise UpdateError("манифест обновления неполный")
+    if info.get("version") and str(info["version"]) != version:
+        raise UpdateError("версия в ответе сервера не совпадает с подписанной")
+    return {"version": version, "size": size, "sha256": sha, "file": str(m.get("file") or "")}
 
 
 def launch_installer(path: Path) -> None:
-    """Тихая установка новой версии. Через «start», а не дочерним процессом: установщик закрывает
-    RetixHub.exe вместе с его дочерними процессами (taskkill /T) — себя он бы тоже убил.
+    """Тихая установка новой версии. Через «start», а не дочерним процессом: если установщику
+    придётся закрыть RetixHub.exe силой, он не погибнет вместе с ним.
     /AUTOUPDATE=1 — после установки установщик сам запустит новый клиент (в трее)."""
     subprocess.Popen(["cmd", "/c", "start", "", str(path), "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART",
                       "/AUTOUPDATE=1"], creationflags=CREATE_NO_WINDOW)
 
 
 class Updater(threading.Thread):
-    """Раз в 10 минут: есть ли на сервере версия новее (GET /api/client/version). Если есть —
-    скачивает установщик в %ProgramData%\\RetixHub\\update, сверяет размер и sha256 и ставит его.
-    VPN при обновлении не рвётся: туннель держит служба WireGuard."""
+    """Фоновое обновление: сверка (подсказка сервера или раз в 10 минут), скачивание с докачкой в
+    %ProgramData%\\RetixHub\\update, проверка подписи и SHA-256, тихая установка. VPN не рвётся:
+    туннель держит служба WireGuard."""
 
-    def __init__(self, state: State, on_update=None, launcher=None):
+    def __init__(self, state: State, api: "Api", on_update=None, launcher=None):
         super().__init__(daemon=True, name="updater")
-        self.state = state
+        self.state, self.api = state, api
         self.on_update = on_update or (lambda ver: None)
         self.launcher = launcher or launch_installer
+        self.wake = threading.Event()
         self.stop_event = threading.Event()
+        self.last_hint: str | None = None
+        self.last_check = 0.0
+        self.warned_no_key = False
         self.http = requests.Session()
         self.http.headers["User-Agent"] = f"{APP_NAME}/{VERSION}"
+        self.finish_pending()
 
+    # --- из других потоков
+    def note_hint(self, value: str):
+        """X-Retix-Update из ответа на любой запрос. Изменился и есть что ставить — сверка сразу."""
+        value = str(value or "").strip()[:32]
+        if value == self.last_hint:
+            return
+        self.last_hint = value
+        if value and value != "none":
+            self.wake.set()
+
+    # --- поток
     def run(self):
         if not getattr(sys, "frozen", False):
             log.info("автообновление выключено: запуск из исходников")
             return
         delay = UPDATE_FIRST
-        while not self.stop_event.wait(delay):
+        while not self.stop_event.is_set():
+            self.wake.wait(delay)
+            self.wake.clear()
+            if self.stop_event.is_set():
+                return
+            gap = time.time() - self.last_check
+            if gap < MIN_CHECK_GAP:
+                delay = MIN_CHECK_GAP - gap
+                continue
             delay = UPDATE_EVERY
             try:
                 if self.check():
@@ -567,75 +671,136 @@ class Updater(threading.Thread):
             except Exception:  # noqa: BLE001
                 log.exception("автообновление")
 
+    def _set_state(self, value: str):
+        if self.state.get("update_state") != value:
+            self.state.set(update_state=value)   # уйдёт на сервер со следующим запросом
+
+    def finish_pending(self):
+        """После запуска: прошлое обновление встало или нет (видно суперадмину)."""
+        attempt = self.state.get("update_attempt") or {}
+        ver = attempt.get("version")
+        if not ver:
+            return
+        if not newer(ver, VERSION):
+            log.warning("Retix Hub обновлён до %s", VERSION)
+            self.state.set(update_attempt={}, update_state="none")
+            self._cleanup()
+        elif time.time() - attempt.get("at", 0) > INSTALL_GRACE:
+            log.warning("обновление до %s не установилось (работает %s)", ver, VERSION)
+            self._set_state(f"failed:{ver}")
+
     def check(self) -> str | None:
         """Версия, которая начала устанавливаться, или None."""
-        if self.state.get("auto_update") is False:
+        self.last_check = time.time()
+        if self.state.get("auto_update") is False or not self.state.get("token"):
             return None
+        keys = update_public_keys() or [k for k in [self.state.get("update_pubkey") or ""] if KEY_RE.match(k)]
         base = (self.state.get("server_url") or "").rstrip("/")
         u = urlparse(base)
         if u.scheme != "https" and u.hostname not in ("127.0.0.1", "localhost"):
             log.warning("автообновление только по https: %s", base)
             return None
         try:
-            r = self.http.get(base + "/api/client/version", timeout=15)
-            r.raise_for_status()
-            info = r.json()
-        except (requests.RequestException, ValueError):
+            info = self.api.update_info()
+        except (ApiError, ServerUnreachable):
             return None
-        ver = str(info.get("version") or "")
-        try:
-            if version_tuple(ver) <= version_tuple(VERSION):
-                self._cleanup()
+        if not keys:   # первая связь: запомнить ключ сервера (по https, сертификат проверен)
+            pk = str((info or {}).get("public_key") or "") if isinstance(info, dict) else ""
+            if not KEY_RE.match(pk):
+                if not self.warned_no_key:
+                    log.warning("автообновление выключено: сервер не прислал ключ подписи")
+                    self.warned_no_key = True
                 return None
-        except ValueError:
+            self.state.set(update_pubkey=pk)
+            keys = [pk]
+            log.warning("ключ подписи обновлений запомнен: %s", pk)
+        upd = info.get("update") if isinstance(info, dict) else None
+        if not upd:
+            self._set_state("none")
+            self._cleanup()
             return None
-        last = self.state.get("update_attempt") or {}
-        if last.get("version") == ver and time.time() - last.get("at", 0) < UPDATE_RETRY:
-            return None   # эта версия уже ставилась и не встала — не долбим каждые 10 минут
-        sha = str(info.get("sha256") or "").lower()
-        size = info.get("size")
-        if not re.fullmatch(r"[0-9a-f]{64}", sha) or not isinstance(size, int) or not 0 < size <= UPDATE_MAX_SIZE:
-            log.warning("обновление %s: сервер не прислал sha256/размер", ver)
+        try:
+            m = verify_manifest(upd, keys)
+        except UpdateError as e:
+            log.error("обновление отклонено: %s", e)
+            self._set_state(f"error:{upd.get('version')}" if vkey(upd.get("version")) else "none")
             return None
-        path = self._download(base + "/download/client", ver, sha, size)
+        ver = m["version"]
+        if not newer(ver, VERSION):
+            self._set_state("none")
+            return None
+        attempt = self.state.get("update_attempt") or {}
+        if attempt.get("version") == ver and time.time() - attempt.get("at", 0) < UPDATE_RETRY:
+            return None   # эта версия уже ставилась и не встала — снова не раньше чем через час
+        url = str(upd.get("url") or "")
+        if not url.startswith("/api/update/file/"):
+            log.error("обновление %s: неверная ссылка на файл", ver)
+            return None
+        self._set_state(f"downloading:{ver}")
+        path = self._download(base + url, ver, m["sha256"], m["size"])
         if not path:
+            self._set_state(f"error:{ver}")
             return None
-        log.warning("обновление %s -> %s: запускаю установщик", VERSION, ver)
+        self._set_state(f"installing:{ver}")
         self.state.set(update_attempt={"version": ver, "at": int(time.time())})
+        log.warning("обновление %s -> %s: запускаю установщик", VERSION, ver)
         self.launcher(path)
         self.on_update(ver)
         return ver
 
     def _download(self, url: str, ver: str, sha: str, size: int) -> Path | None:
+        """Скачать (докачать после обрыва) и проверить. None — не вышло, файла нет."""
         UPDATE_DIR.mkdir(parents=True, exist_ok=True)
         final = UPDATE_DIR / f"RetixHub_Setup_{ver}.exe"
         part = UPDATE_DIR / f"RetixHub_Setup_{ver}.part"
-        h, got = hashlib.sha256(), 0
+        for f in UPDATE_DIR.iterdir():            # другие версии — уже не нужны
+            if f not in (final, part):
+                try:
+                    f.unlink()
+                except OSError:
+                    pass
+        if final.exists() and final.stat().st_size == size and self._sha(final) == sha:
+            return final
+        have = part.stat().st_size if part.exists() else 0
+        if have > size:
+            part.unlink()
+            have = 0
         try:
-            with self.http.get(url, stream=True, timeout=30) as r:
-                r.raise_for_status()
-                with open(part, "wb") as f:
-                    for chunk in r.iter_content(1 << 16):
-                        got += len(chunk)
-                        if got > size:
-                            raise ValueError("файл больше заявленного")
-                        h.update(chunk)
-                        f.write(chunk)
-            if got != size or h.hexdigest() != sha:
-                raise ValueError("размер или sha256 не совпали")
+            headers = {"Range": f"bytes={have}-"} if 0 < have < size else {}
+            with self.http.get(url, stream=True, timeout=(10, 60), headers=headers) as r:
+                if r.status_code == 416:
+                    pass                                  # уже всё скачано
+                else:
+                    r.raise_for_status()
+                    if r.status_code != 206:              # сервер начал сначала
+                        have = 0
+                    with open(part, "ab" if have else "wb") as f:
+                        got = have
+                        for chunk in r.iter_content(256 * 1024):
+                            got += len(chunk)
+                            if got > size:
+                                raise UpdateError("файл больше заявленного")
+                            f.write(chunk)
+            if part.stat().st_size != size or self._sha(part) != sha:
+                part.unlink()
+                raise UpdateError("размер или SHA-256 не совпали с подписанными")
             part.replace(final)
             return final
-        except (requests.RequestException, OSError, ValueError) as e:
-            log.warning("обновление %s не скачано: %s", ver, e)
-            try:
-                part.unlink()
-            except OSError:
-                pass
+        except (requests.RequestException, OSError, UpdateError) as e:
+            log.warning("обновление %s не скачано: %s", ver, e)   # .part остаётся — докачаем
             return None
 
     @staticmethod
+    def _sha(path: Path) -> str:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+        return h.hexdigest()
+
+    @staticmethod
     def _cleanup():
-        """Установщик прошлого обновления больше не нужен."""
+        """Установщики прошлых обновлений больше не нужны."""
         if UPDATE_DIR.exists():
             for f in UPDATE_DIR.iterdir():
                 try:
@@ -1331,7 +1496,8 @@ class App(tk.Tk):
         dark_titlebar(self)
         no_maximize_button(self)
         self.worker.start()
-        self.updater = Updater(state, on_update=lambda ver: self.ui_q.put(("update", ver)))
+        self.updater = Updater(state, self.worker.api, on_update=lambda ver: self.ui_q.put(("update", ver)))
+        self.worker.api.on_hint = self.updater.note_hint
         self.updater.start()
         self.after(200, self._poll)
 

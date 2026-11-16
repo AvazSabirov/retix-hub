@@ -41,9 +41,32 @@ CREATE TABLE IF NOT EXISTS devices (
     last_handshake  INTEGER NOT NULL DEFAULT 0,
     endpoint        TEXT NOT NULL DEFAULT '',
     last_seen       TEXT,
+    update_state    TEXT NOT NULL DEFAULT '',   -- что ПК сообщает об обновлении: downloading:1.0.6 …
+    update_state_at TEXT,
     created_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS ix_devices_company ON devices(company_id);
+
+-- версии клиента, загруженные суперадмином (/admin/updates)
+CREATE TABLE IF NOT EXISTS app_releases (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    version       TEXT NOT NULL UNIQUE,           -- из свойств exe: 1.0.6
+    file_name     TEXT NOT NULL,                  -- RetixHub_Setup_1.0.6.exe (для ПК и сайта)
+    stored_name   TEXT NOT NULL,                  -- файл в DATA_DIR/updates
+    size          INTEGER NOT NULL,
+    sha256        TEXT NOT NULL,
+    manifest      TEXT NOT NULL,                  -- base64 JSON {app, kind, version, file, size, sha256}
+    signature     TEXT NOT NULL,                  -- base64 Ed25519 манифеста
+    notes         TEXT NOT NULL DEFAULT '',       -- что нового
+    companies     TEXT NOT NULL DEFAULT '',       -- '' — всем, иначе JSON [id компаний]
+    published     INTEGER NOT NULL DEFAULT 0,
+    published_at  TEXT,
+    publish_at    TEXT,                           -- опубликовать в это время (TZ), иначе NULL
+    downloads     INTEGER NOT NULL DEFAULT 0,
+    site_downloads INTEGER NOT NULL DEFAULT 0,
+    created_at    TEXT NOT NULL,
+    created_by    TEXT NOT NULL DEFAULT ''
+);
 
 -- сообщения между ПК одной компании (меню «Сообщение» в клиенте)
 CREATE TABLE IF NOT EXISTS messages (
@@ -87,6 +110,8 @@ MIGRATIONS = [
     ("devices", "token_next_hash", "TEXT"),
     ("devices", "token_next_at", "INTEGER NOT NULL DEFAULT 0"),
     ("devices", "token_set_at", "INTEGER NOT NULL DEFAULT 0"),
+    ("devices", "update_state", "TEXT NOT NULL DEFAULT ''"),
+    ("devices", "update_state_at", "TEXT"),
 ]
 
 

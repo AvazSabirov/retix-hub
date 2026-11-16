@@ -12,6 +12,12 @@
   header { display:flex; align-items:center; gap:12px; padding:12px 24px; background:#111827; color:#fff; }
   header .sub { color:#9ca3af; } header form { margin-left:auto; }
   header a { color:#fff; text-decoration:none; }
+  .adminnav { display:flex; gap:14px; margin-left:18px; } .adminnav a { color:#9ca3af; } .adminnav a.on { color:#fff; font-weight:600; }
+  .small { font-size:12px; } .nowrap { white-space:nowrap; } textarea { font:inherit; padding:7px 9px; border:1px solid var(--line); border-radius:7px; width:100%; }
+  .inline { display:inline; margin:0; } .opt { display:flex; gap:8px; align-items:flex-start; margin:4px 0; } .opt input { margin-top:3px; }
+  .scope-box { max-height:150px; overflow:auto; border:1px solid var(--line); border-radius:7px; padding:6px 10px; margin-top:4px; }
+  .tbl-wrap { overflow-x:auto; } input[type=file], input[type=datetime-local] { font:inherit; }
+  .key { word-break:break-all; user-select:all; }
   main { max-width:1150px; margin:24px auto; padding:0 16px; }
   .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:18px 20px; margin-bottom:18px; }
   h1 { font-size:20px; margin:0 0 4px; } h2 { font-size:16px; margin:0 0 12px; }
@@ -45,6 +51,7 @@
 <body>
 <header>
   <a href="/"><b>Retix Hub</b></a><span class="sub">{{ title }}</span>
+  {% if admin_nav %}<nav class="adminnav"><a href="/admin" class="{{ 'on' if admin_nav == 'companies' }}">Компании</a><a href="/admin/updates" class="{{ 'on' if admin_nav == 'updates' }}">Обновления</a></nav>{% endif %}
   {% if logout_url %}<form method="post" action="{{ logout_url }}"><button class="link">Выйти</button></form>{% endif %}
 </header>
 <main>

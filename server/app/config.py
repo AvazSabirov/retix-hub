@@ -32,6 +32,9 @@ RADMIN_PORT = int(os.getenv("RADMIN_PORT", "4899"))
 # (его скопировали на другой ПК), отключает устройство до одобрения администратором.
 TOKEN_ROTATE_SECONDS = int(os.getenv("TOKEN_ROTATE_SECONDS", "120"))
 
+# Часы для публикации обновлений по расписанию (суперадмин → «Обновления»)
+TZ = os.getenv("TZ_NAME", "Asia/Tashkent")
+
 # Журнал: по умолчанию только ошибки и предупреждения (+ одна строка о запуске). INFO — для разбора проблем.
 LOG_LEVEL = os.getenv("LOG_LEVEL", "WARNING").upper()
 

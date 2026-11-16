@@ -17,6 +17,16 @@ from cryptography.hazmat.primitives import serialization  # noqa: E402
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey  # noqa: E402
 
 
+def fake_setup(version="1.0.6", product="Retix Hub", pad=300_000) -> bytes:
+    """Похожий на установщик Inno Setup exe: MZ, VS_FIXEDFILEINFO с версией, ProductName."""
+    a, b, c, d = (list(map(int, version.split("."))) + [0, 0, 0, 0])[:4]
+    ms, ls = (a << 16) | b, (c << 16) | d
+    fixed = (b"\xbd\x04\xef\xfe" + (0x00010000).to_bytes(4, "little")
+             + ms.to_bytes(4, "little") + ls.to_bytes(4, "little"))
+    strings = ("ProductName\0".encode("utf-16-le") + b"\0\0" + (product + "\0").encode("utf-16-le")) if product else b""
+    return b"MZ" + b"\0" * 126 + b"PE\0\0" + fixed + b"\0" * 20 + strings + os.urandom(pad)
+
+
 def new_pubkey() -> str:
     raw = X25519PrivateKey.generate().public_key().public_bytes(
         serialization.Encoding.Raw, serialization.PublicFormat.Raw)
@@ -57,7 +67,10 @@ def clean(app, net):
         pass
     conn = db.connect()
     conn.executescript("DELETE FROM token_history; DELETE FROM messages; DELETE FROM devices; DELETE FROM companies;"
-                       "DELETE FROM audit_log; DELETE FROM sqlite_sequence;")
+                       "DELETE FROM audit_log; DELETE FROM app_releases; DELETE FROM sqlite_sequence;")
+    import shutil
+    from app.config import DATA_DIR
+    shutil.rmtree(os.path.join(DATA_DIR, "updates"), ignore_errors=True)
     conn.commit()
     conn.close()
     limiter._fails.clear()
