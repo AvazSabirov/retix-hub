@@ -34,7 +34,7 @@ import requests
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
 
-VERSION = "1.0.3"
+VERSION = "1.0.4"
 APP_NAME = "RetixHub"          # служебное имя: папки, задачи, мьютекс
 APP_TITLE = "Retix Hub"        # то, что видит пользователь
 TUNNEL = "retixhub"
@@ -51,7 +51,7 @@ WG_DIR = Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "WireGuard"
 WIREGUARD_EXE = WG_DIR / "wireguard.exe"
 WG_EXE = WG_DIR / "wg.exe"
 SERVICE = f"WireGuardTunnel${TUNNEL}"
-FW_RULE = "RetixHub SMB"          # входящие общие папки (SMB) из подсети компании
+FW_RULE = "RetixHub SMB"          # входящие общие папки (SMB) и Radmin Server (4899) из подсети компании
 FW_RULE_PING = "RetixHub Ping"    # входящий ping из подсети компании
 
 CHECK_EVERY = 8          # сек — основной цикл
@@ -362,6 +362,58 @@ def ensure_firewall(subnet: str | None, ports: str = "445") -> None:
         log.info("firewall: общие папки (%s) и ping разрешены из %s", ports, subnet)
 
 
+RADMIN_PORT = 4899
+
+
+def lan_ports(cfg: dict) -> str:
+    """Входящие TCP-порты из подсети компании: общие папки (из кабинета, обычно 445) + Radmin Server."""
+    ports = [p for p in (cfg.get("share_ports") or "445").replace(" ", "").split(",") if p]
+    radmin = str(cfg.get("radmin_port") or RADMIN_PORT)
+    if radmin not in ports:
+        ports.append(radmin)
+    return ",".join(ports)
+
+
+def find_radmin_viewer(saved: str = "") -> Path | None:
+    """Radmin Viewer (Radmin.exe): сохранённый путь, стандартные папки, реестр App Paths."""
+    candidates = [Path(saved)] if saved else []
+    for env in ("ProgramFiles(x86)", "ProgramFiles", "ProgramW6432"):
+        base = os.environ.get(env)
+        if base:
+            candidates += [Path(base) / "Radmin Viewer 3" / "Radmin.exe", Path(base) / "Radmin Viewer" / "Radmin.exe"]
+    for c in candidates:
+        if c.is_file():
+            return c
+    if WINDOWS:
+        try:
+            import winreg
+            for root in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+                try:
+                    with winreg.OpenKey(root, r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\Radmin.exe") as k:
+                        p = Path(winreg.QueryValue(k, None).strip('"'))
+                        if p.is_file():
+                            return p
+                except OSError:
+                    pass
+        except ImportError:
+            pass
+    return None
+
+
+def radmin_args(exe: Path, ip: str, mode: str, port: int = RADMIN_PORT) -> list[str]:
+    """Командная строка Radmin Viewer: full — полное управление, view — только просмотр, files — передача файлов."""
+    flags = {"full": [], "view": ["/noinput"], "files": ["/file"]}[mode]
+    return [str(exe), f"/connect:{ip}:{port}", *flags]
+
+
+def port_open(ip: str, port: int, timeout: float = 3.0) -> bool:
+    try:
+        with socket.create_connection((ip, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
 def smb_check(ip: str, timeout: float = 3.0) -> str | None:
     """Доступны ли общие папки (SMB, порт 445) на ПК. None — да, иначе понятная причина."""
     try:
@@ -608,7 +660,7 @@ class Worker(threading.Thread):
             self.reinstall_backoff = 60
 
         # 4. firewall: общие папки и ping из подсети компании — на каждом ПК
-        ports = self.cfg.get("share_ports") or "445"
+        ports = lan_ports(self.cfg)
         want_fw = f"{self.cfg['subnet']}|{ports}"
         if want_fw != self.state.get("fw_subnet"):
             ensure_firewall(self.cfg["subnet"], ports)
@@ -1157,9 +1209,14 @@ class App(tk.Tk):
         self.ctx.add_command(label="Копировать IP-адрес", command=self.copy_ip)
         self.ctx.add_separator()
         self.ctx.add_command(label="Пинг", command=self.ping)
-        self.ctx.add_command(label="Общие папки", command=self.open_shares, font=("Segoe UI", 9, "bold"))
+        self.ctx.add_command(label="Общие папки", command=self.open_shares)
         self.ctx.add_command(label="Подключить сетевой диск…", command=self.map_drive)
-        self.ctx.add_command(label="Удалённый рабочий стол", command=self.remote_desktop)
+        self.ctx.add_separator()
+        self.ctx.add_command(label="Полное управление", command=lambda: self.radmin("full"),
+                             font=("Segoe UI", 9, "bold"))
+        self.ctx.add_command(label="Только просмотр", command=lambda: self.radmin("view"))
+        self.ctx.add_command(label="Передача файлов", command=lambda: self.radmin("files"))
+        self.ctx.add_command(label="Удалённый рабочий стол (RDP)", command=self.remote_desktop)
         self.ctx.add_separator()
         self.ctx.add_command(label="Свойства", command=self.properties)
 
@@ -1414,6 +1471,41 @@ class App(tk.Tk):
             win.lift()
             win.entry.focus_set()
 
+    def radmin(self, mode: str):
+        """Radmin Viewer -> Radmin Server на выбранном ПК (порт 4899) через сеть Retix Hub."""
+        p = self.selected_peer()
+        if not p:
+            return
+        exe = find_radmin_viewer(self.state_.get("radmin_path") or "")
+        if not exe:
+            if not messagebox.askyesno(APP_TITLE, "Radmin Viewer не найден.\n\nУкажите файл Radmin.exe вручную?\n"
+                                                  "(Скачать Radmin Viewer: https://www.radmin.ru/download/)",
+                                       parent=self):
+                return
+            from tkinter import filedialog
+            path = filedialog.askopenfilename(parent=self, title="Где Radmin.exe (Radmin Viewer)?",
+                                              filetypes=[("Radmin Viewer", "Radmin.exe"), ("Программы", "*.exe")])
+            if not path:
+                return
+            exe = Path(path)
+            self.state_.set(radmin_path=str(exe))
+        port = int((self.cfg or {}).get("radmin_port") or RADMIN_PORT)
+        args = radmin_args(exe, p["ip"], mode, port)
+
+        def work():  # проверка порта до 3 с — не держим окно
+            if not port_open(p["ip"], port):
+                self.ui_q.put(("error", f"Radmin Server на {p['name']} ({p['ip']}:{port}) не отвечает.\n\n"
+                                        "• на том ПК не установлен или не запущен Radmin Server;\n"
+                                        "• на том ПК старая версия Retix Hub (обновите — она открывает порт 4899);\n"
+                                        "• сервер Retix Hub не обновлён (git pull && ./run.sh)."))
+                return
+            log.info("Radmin Viewer: %s", " ".join(args))
+            try:
+                subprocess.Popen(args, cwd=str(exe.parent))
+            except OSError as e:
+                self.ui_q.put(("error", f"Не удалось запустить Radmin Viewer\n{e.strerror or e}"))
+        threading.Thread(target=work, daemon=True, name="radmin").start()
+
     def remote_desktop(self):
         """Удалённый рабочий стол Windows (RDP). На том ПК он должен быть включён (Windows Pro),
         а в кабинете компании открыт порт 3389 (или «любой трафик между ПК»)."""
@@ -1438,6 +1530,7 @@ class App(tk.Tk):
             f"Версия Retix Hub:  {p.get('client_version') or '—'}",
             "",
             f"Общие папки:  \\\\{p['ip']}",
+            f"Radmin:  {p['ip']}:{(self.cfg or {}).get('radmin_port') or RADMIN_PORT}",
         ]), parent=self)
 
     def copy_ip(self):

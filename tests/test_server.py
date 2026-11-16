@@ -281,6 +281,8 @@ class TestIsolation:
         # общие папки (SMB) — между всеми ПК компании, без отметки «ПК с папкой»
         assert "-A RETIX_FWD -s 10.66.1.0/24 -d 10.66.1.0/24 -p tcp -m multiport --dports 445 -j ACCEPT" in rules
         assert "-A RETIX_FWD -s 10.66.2.0/24 -d 10.66.2.0/24 -p tcp -m multiport --dports 445 -j ACCEPT" in rules
+        # Radmin Viewer -> Radmin Server (4899) — внутри компании
+        assert "-A RETIX_FWD -s 10.66.1.0/24 -d 10.66.1.0/24 -p tcp --dport 4899 -j ACCEPT" in rules
         assert "-A RETIX_FWD -s 10.66.1.0/24 -d 10.66.1.0/24 -p icmp -j ACCEPT" in rules
         assert "-A RETIX_FWD -s 10.66.2.0/24 -d 10.66.2.0/24 -p icmp -j ACCEPT" in rules
         # ни одного правила, разрешающего трафик между подсетями
