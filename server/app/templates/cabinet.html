@@ -1,0 +1,49 @@
+{% extends "base.html" %}
+{% from "_devices.html" import devices_table %}
+{% block content %}
+<div class="card">
+  <h1>{{ company.name or company.login }}</h1>
+  <div class="muted">Логин компании для подключения: <code>{{ company.login }}</code></div>
+  <div class="stats">
+    <div><span class="muted">Онлайн</span><b>{{ online }} / {{ devices|length }}</b></div>
+    <div><span class="muted">Лимит устройств</span><b>{{ company.max_devices }}</b></div>
+    <div><span class="muted">Подсеть</span><b>{{ subnet }}</b></div>
+    <div><span class="muted">Общая папка</span><b>{{ company.share_name }}</b></div>
+  </div>
+</div>
+
+<div class="card">
+  <h2>Компьютеры</h2>
+  {{ devices_table(devices, action_prefix) }}
+</div>
+
+<div class="grid">
+  <div class="card">
+    <h2>Настройки сети</h2>
+    <form method="post" action="/cabinet/settings">
+      <label class="check"><input type="checkbox" name="require_approval" value="1" {{ 'checked' if company.require_approval }}> Новые ПК ждут одобрения</label>
+      <label class="check"><input type="checkbox" name="full_lan" value="1" {{ 'checked' if company.full_lan }}> Разрешить любой трафик между ПК компании</label>
+      <label><span>Имя общей папки (\\ПК\<b>имя</b>)</span><input type="text" name="share_name" value="{{ company.share_name }}"></label>
+      <label><span>Порты к ПК с папкой (если выключено «любой трафик»)</span><input type="text" name="share_ports" value="{{ company.share_ports }}"></label>
+      <button class="primary">Сохранить</button>
+    </form>
+  </div>
+  <div class="card">
+    <h2>Пароль подключения ПК</h2>
+    <p class="muted">Его вводят в программе-клиенте на компьютере.</p>
+    <form method="post" action="/cabinet/join-password">
+      <label><span>Новый пароль</span><input type="password" name="new_password" minlength="6" required></label>
+      <label class="check"><input type="checkbox" name="kick_all" value="1"> Отключить все ПК (войдут заново с новым паролем)</label>
+      <button>Сменить</button>
+    </form>
+  </div>
+  <div class="card">
+    <h2>Пароль кабинета</h2>
+    <form method="post" action="/cabinet/cabinet-password">
+      <label><span>Текущий пароль</span><input type="password" name="old_password" required></label>
+      <label><span>Новый пароль</span><input type="password" name="new_password" minlength="6" required></label>
+      <button>Сменить</button>
+    </form>
+  </div>
+</div>
+{% endblock %}

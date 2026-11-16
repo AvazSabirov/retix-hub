@@ -1,0 +1,42 @@
+{% macro devices_table(devices, prefix) %}
+<table>
+  <tr><th>Статус</th><th>Имя</th><th>Компьютер</th><th>IP</th><th>Последняя связь</th><th>Клиент</th><th>Действия</th></tr>
+  {% for d in devices %}
+  <tr>
+    <td>
+      <span class="dot {{ 'on' if d.online }}"></span>{{ 'online' if d.online else 'offline' }}
+      {% if d.status == 'pending' %}<span class="tag warn">ждёт одобрения</span>{% endif %}
+      {% if d.status == 'blocked' %}<span class="tag bad">заблокирован</span>{% endif %}
+      {% if d.is_share_host %}<span class="tag share">📁 общая папка</span>{% endif %}
+    </td>
+    <td>
+      <form class="rename" method="post" action="{{ prefix }}{{ d.id }}/rename">
+        <input type="text" name="value" value="{{ d.name }}" maxlength="64"><button class="small" title="Переименовать">✓</button>
+      </form>
+    </td>
+    <td>{{ d.hostname or '—' }}</td>
+    <td><code>{{ d.ip }}</code></td>
+    <td class="muted">{{ d.last_handshake | ago }}{% if d.endpoint %}<br><small>{{ d.endpoint }}</small>{% endif %}</td>
+    <td class="muted">{{ d.client_version or '—' }}</td>
+    <td class="actions">
+      {% if d.status == 'pending' %}
+        <form method="post" action="{{ prefix }}{{ d.id }}/approve"><button class="small primary">Одобрить</button></form>
+      {% endif %}
+      {% if d.is_share_host %}
+        <form method="post" action="{{ prefix }}{{ d.id }}/unshare"><button class="small">Снять 📁</button></form>
+      {% else %}
+        <form method="post" action="{{ prefix }}{{ d.id }}/share"><button class="small" title="Этот ПК хранит общую папку">Сделать 📁</button></form>
+      {% endif %}
+      {% if d.is_blocked %}
+        <form method="post" action="{{ prefix }}{{ d.id }}/unblock"><button class="small">Разблокировать</button></form>
+      {% else %}
+        <form method="post" action="{{ prefix }}{{ d.id }}/block"><button class="small danger" title="Устройство не сможет подключиться, даже зная пароль">Блок</button></form>
+      {% endif %}
+      <form method="post" action="{{ prefix }}{{ d.id }}/delete" onsubmit="return confirm('Удалить {{ d.name }}? Если на ПК сохранён пароль компании, он зарегистрируется снова. Чтобы запретить навсегда — используйте «Блок».')"><button class="small danger">Удалить</button></form>
+    </td>
+  </tr>
+  {% else %}
+  <tr><td colspan="7" class="muted">Устройств пока нет. Установите клиент на компьютер и войдите логином компании.</td></tr>
+  {% endfor %}
+</table>
+{% endmacro %}

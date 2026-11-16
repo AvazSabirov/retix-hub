@@ -1,0 +1,233 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Retix Hub — защищённая сеть для компьютеров компании</title>
+<meta name="description" content="Retix Hub объединяет компьютеры компании в закрытую сеть: общая папка \\PC1\share из любого места, интернет идёт напрямую, компании изолированы друг от друга.">
+<style>
+  :root { --bg:#f4f6f9; --card:#fff; --text:#1d2430; --muted:#6b7685; --line:#e3e7ee;
+          --accent:#2563eb; --accent-soft:#e8efff; --ink:#111827; --ok:#16a34a; }
+  * { box-sizing:border-box; }
+  body { margin:0; font:16px/1.6 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; color:var(--text); background:var(--bg); }
+  a { color:var(--accent); text-decoration:none; }
+  .wrap { max-width:1120px; margin:0 auto; padding:0 20px; }
+  header { background:var(--ink); color:#fff; }
+  header .wrap { display:flex; align-items:center; gap:28px; height:64px; }
+  .logo { font-weight:700; font-size:19px; color:#fff; letter-spacing:.2px; }
+  .logo span { color:#7aa2ff; }
+  nav { display:flex; gap:22px; margin-left:auto; align-items:center; }
+  nav a { color:#cbd5e1; font-size:15px; } nav a:hover { color:#fff; }
+  .btn { display:inline-block; padding:11px 20px; border-radius:9px; font-weight:600; font-size:15px; border:1px solid transparent; }
+  .btn.primary { background:var(--accent); color:#fff; } .btn.primary:hover { background:#1d4fd8; }
+  .btn.ghost { border-color:#cfd6e2; color:var(--text); background:#fff; }
+  .btn.small { padding:7px 14px; font-size:14px; }
+  nav .btn.small { background:#fff; color:var(--ink); }
+
+  .hero { background:var(--ink); color:#fff; padding:64px 0 80px; }
+  .hero .wrap { display:grid; grid-template-columns:1.1fr .9fr; gap:48px; align-items:center; }
+  .hero h1 { font-size:44px; line-height:1.15; margin:0 0 18px; letter-spacing:-.5px; }
+  .hero p.lead { font-size:19px; color:#cbd5e1; margin:0 0 30px; max-width:560px; }
+  .hero .ctas { display:flex; gap:12px; flex-wrap:wrap; }
+  .hero .btn.ghost { background:transparent; color:#fff; border-color:#475569; }
+  .status { margin-top:28px; font-size:14px; color:#94a3b8; display:flex; gap:8px; align-items:center; }
+  .status i { width:9px; height:9px; border-radius:50%; background:#22c55e; display:inline-block; box-shadow:0 0 0 4px rgba(34,197,94,.18); }
+
+  .map { background:#0b1220; border:1px solid #243049; border-radius:16px; padding:26px; font-size:14px; }
+  .map .srv { margin:0 auto 22px; width:220px; text-align:center; background:#1e3a8a; border:1px solid #3b5bdb; border-radius:12px; padding:12px; }
+  .map .srv b { display:block; font-size:15px; } .map .srv small { color:#a5b4fc; }
+  .map .cos { display:grid; grid-template-columns:1fr 1fr; gap:14px; }
+  .map .co { border:1px dashed #334155; border-radius:12px; padding:12px; }
+  .map .co h4 { margin:0 0 8px; font-size:13px; color:#94a3b8; font-weight:600; }
+  .map .pc { background:#111a2e; border:1px solid #243049; border-radius:8px; padding:7px 10px; margin-bottom:6px; display:flex; justify-content:space-between; }
+  .map .pc code { color:#93c5fd; font-size:12px; }
+  .map .pc.share { border-color:#16a34a; } .map .pc.share code { color:#86efac; }
+  .map .note { margin-top:14px; color:#94a3b8; font-size:12.5px; text-align:center; }
+
+  section { padding:72px 0; }
+  section h2 { font-size:30px; margin:0 0 10px; letter-spacing:-.3px; }
+  section .sub { color:var(--muted); margin:0 0 36px; max-width:680px; }
+  .steps { display:grid; grid-template-columns:repeat(3,1fr); gap:20px; }
+  .step, .feat, .dl { background:var(--card); border:1px solid var(--line); border-radius:14px; padding:24px; }
+  .step .n { width:34px; height:34px; border-radius:50%; background:var(--accent-soft); color:var(--accent); font-weight:700; display:flex; align-items:center; justify-content:center; margin-bottom:14px; }
+  .step h3, .feat h3, .dl h3 { margin:0 0 8px; font-size:18px; }
+  .step p, .feat p, .dl p { margin:0; color:var(--muted); font-size:15px; }
+  code.path { background:#eef2ff; color:#3730a3; padding:1px 6px; border-radius:5px; font-size:14px; }
+  .feats { display:grid; grid-template-columns:repeat(3,1fr); gap:20px; }
+  .feat .ico { font-size:24px; margin-bottom:10px; }
+  .alt { background:#fff; border-top:1px solid var(--line); border-bottom:1px solid var(--line); }
+  .dls { display:grid; grid-template-columns:1.3fr 1fr; gap:20px; }
+  .dl ul { margin:12px 0 18px; padding-left:20px; color:var(--muted); font-size:15px; }
+  .dl .btn { margin-top:4px; }
+  .muted { color:var(--muted); }
+  .api { background:var(--ink); color:#e2e8f0; border-radius:14px; padding:22px 24px; font:14px/1.7 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; overflow-x:auto; white-space:pre; }
+  .api .m { color:#7aa2ff; } .api .c { color:#94a3b8; }
+  .msg { padding:12px 16px; border-radius:10px; margin:0 0 20px; background:#dcfce7; color:#166534; }
+  .msg.err { background:#fee2e2; color:#991b1b; }
+  footer { padding:34px 0; color:var(--muted); font-size:14px; border-top:1px solid var(--line); }
+  footer .wrap { display:flex; gap:20px; flex-wrap:wrap; }
+  footer .right { margin-left:auto; display:flex; gap:18px; }
+  .hero .wrap > *, .dls > *, .steps > *, .feats > * { min-width:0; }
+  @media (max-width: 900px) {
+    .hero .wrap, .dls, .steps, .feats { grid-template-columns:minmax(0,1fr); }
+    .hero { padding:40px 0 56px; }
+    .hero h1 { font-size:30px; }
+    .hero p.lead { font-size:17px; }
+    nav a:not(.btn) { display:none; }
+    section { padding:48px 0; }
+    section h2 { font-size:25px; }
+  }
+  @media (max-width: 520px) {
+    .map { padding:16px; }
+    .map .cos { grid-template-columns:minmax(0,1fr); }
+    .api { font-size:12.5px; padding:16px; }
+    .hero h1 { font-size:27px; }
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="wrap">
+    <a class="logo" href="/">Retix <span>Hub</span></a>
+    <nav>
+      <a href="#how">Как работает</a>
+      <a href="#features">Возможности</a>
+      <a href="#download">Скачать</a>
+      <a class="btn small" href="/cabinet">Кабинет компании</a>
+    </nav>
+  </div>
+</header>
+
+<div class="hero">
+  <div class="wrap">
+    <div>
+      <h1>Компьютеры компании — в одной закрытой сети, где бы они ни были</h1>
+      <p class="lead">Retix Hub соединяет офис, склад, кассы и ноутбуки сотрудников в защищённую сеть.
+        Общая папка <code class="path" style="background:#1e293b;color:#c7d2fe">\\PC1\share</code> открывается так же,
+        как в локальной сети, а интернет у каждого компьютера продолжает работать напрямую.</p>
+      <div class="ctas">
+        <a class="btn primary" href="#download">Скачать клиент</a>
+        <a class="btn ghost" href="/cabinet">Войти в кабинет</a>
+      </div>
+      <div class="status"><i></i> Сервер работает · {{ public_url | replace("https://", "") }} · версия {{ version }}</div>
+    </div>
+
+    <div class="map" aria-label="Схема сети Retix Hub">
+      <div class="srv"><b>Retix Hub</b><small>hub.retix.uz · 10.66.0.1</small></div>
+      <div class="cos">
+        <div class="co">
+          <h4>Компания «Склад»</h4>
+          <div class="pc share">PC1 📁 <code>10.66.1.2</code></div>
+          <div class="pc">Бухгалтерия <code>10.66.1.3</code></div>
+          <div class="pc">Касса 1 <code>10.66.1.4</code></div>
+        </div>
+        <div class="co">
+          <h4>Компания «Ресторан»</h4>
+          <div class="pc share">Офис 📁 <code>10.66.2.2</code></div>
+          <div class="pc">Кухня <code>10.66.2.3</code></div>
+          <div class="pc">Бар <code>10.66.2.4</code></div>
+        </div>
+      </div>
+      <div class="note">Каждая компания в своей подсети и не видит другие</div>
+    </div>
+  </div>
+</div>
+
+<section id="how">
+  <div class="wrap">
+    {% if msg %}<div class="msg {{ 'err' if err }}">{{ msg }}</div>{% endif %}
+    <h2>Как это работает</h2>
+    <p class="sub">Подключение занимает пару минут. Не нужно пробрасывать порты, настраивать роутер или держать белый IP в офисе.</p>
+    <div class="steps">
+      <div class="step"><div class="n">1</div><h3>Компания получает доступ</h3>
+        <p>Администратор Retix создаёт компанию и выдаёт логин и пароль подключения. У компании появляется свой кабинет.</p></div>
+      <div class="step"><div class="n">2</div><h3>Установите клиент</h3>
+        <p>На каждом компьютере запустите Retix Hub и введите логин и пароль компании. Компьютер сам появится в сети.</p></div>
+      <div class="step"><div class="n">3</div><h3>Работайте с общей папкой</h3>
+        <p>Откройте <code class="path">\\PC1\share</code> или нажмите «Открыть общую папку». Получайте и загружайте файлы как в офисе.</p></div>
+    </div>
+  </div>
+</section>
+
+<section id="features" class="alt">
+  <div class="wrap">
+    <h2>Возможности</h2>
+    <p class="sub">Retix Hub построен на WireGuard — современном и быстром протоколе шифрования. Управление — через веб-кабинет.</p>
+    <div class="feats">
+      <div class="feat"><div class="ico">🌐</div><h3>Только сеть компании</h3>
+        <p>Через Retix Hub идёт только трафик между компьютерами компании. Интернет, мессенджеры и сайты работают напрямую и не тормозят.</p></div>
+      <div class="feat"><div class="ico">🔒</div><h3>Компании изолированы</h3>
+        <p>У каждой компании своя подсеть и свой кабинет. Компьютеры одной компании не видят и не могут достучаться до другой.</p></div>
+      <div class="feat"><div class="ico">🔄</div><h3>Сам переподключается</h3>
+        <p>Пропал интернет или сервер перезагрузился — клиент дождётся и восстановит связь без участия пользователя.</p></div>
+      <div class="feat"><div class="ico">📁</div><h3>Общая папка по имени</h3>
+        <p>Клиент знает имена всех компьютеров компании, поэтому <code class="path">\\PC1\share</code> открывается по имени, как раньше.</p></div>
+      <div class="feat"><div class="ico">👥</div><h3>Видно, кто в сети</h3>
+        <p>В клиенте и в кабинете видно, какие компьютеры сейчас онлайн и когда каждый был на связи последний раз.</p></div>
+      <div class="feat"><div class="ico">🛡️</div><h3>Контроль доступа</h3>
+        <p>Одобрение новых компьютеров, блокировка, лимит устройств, смена пароля с отключением всех — в один клик.</p></div>
+    </div>
+  </div>
+</section>
+
+<section id="download">
+  <div class="wrap">
+    <h2>Скачать</h2>
+    <p class="sub">Клиент для Windows 10 и 11. Для установки нужны права администратора.</p>
+    <div class="dls">
+      <div class="dl">
+        <h3>Retix Hub для Windows</h3>
+        <p>Подключает компьютер к сети компании, показывает пользователей и открывает общую папку.</p>
+        <ul>
+          <li>Логин и пароль подключения выдаёт администратор компании</li>
+          <li>Сервер уже указан: <b>{{ public_url | replace("https://", "") }}</b></li>
+          <li>Запускается вместе с Windows, работает в фоне</li>
+        </ul>
+        {% if client_available %}
+          <a class="btn primary" href="/download/client">Скачать RetixHub.exe</a>
+        {% else %}
+          <span class="btn ghost" style="cursor:default">Скоро здесь появится</span>
+          <p class="muted" style="margin-top:10px;font-size:14px">Пока клиент выдаёт администратор компании.</p>
+        {% endif %}
+      </div>
+      <div class="dl">
+        <h3>WireGuard</h3>
+        <p>Retix Hub использует официальный WireGuard для Windows. Если он не установлен, клиент поставит его сам — или скачайте вручную.</p>
+        <ul><li>Бесплатный, открытый исходный код</li><li>Ставится один раз</li></ul>
+        <a class="btn ghost" href="/download/wireguard">Скачать WireGuard</a>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="alt" id="api">
+  <div class="wrap">
+    <h2>Для разработчиков</h2>
+    <p class="sub">Все запросы клиентов принимает этот же адрес. Справка в JSON — <a href="/api">{{ public_url }}/api</a>.</p>
+<div class="api"><span class="c"># базовый адрес</span>
+{{ public_url }}/api
+
+<span class="m">GET </span> /api/ping        <span class="c"># сервер доступен</span>
+<span class="m">POST</span> /api/register    <span class="c"># регистрация ПК по логину и паролю компании</span>
+<span class="m">GET </span> /api/me          <span class="c"># конфигурация WireGuard этого ПК</span>
+<span class="m">GET </span> /api/peers       <span class="c"># компьютеры своей компании</span>
+<span class="m">POST</span> /api/heartbeat   <span class="c"># отметка клиента</span>
+
+<span class="c"># /me, /peers, /heartbeat — с заголовком Authorization: Bearer &lt;токен из /register&gt;</span></div>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <span>© Retix · Retix Hub {{ version }}</span>
+    <div class="right">
+      <a href="/cabinet">Кабинет компании</a>
+      <a href="#download">Скачать клиент</a>
+      <a href="/api">API</a>
+    </div>
+  </div>
+</footer>
+
+</body>
+</html>
