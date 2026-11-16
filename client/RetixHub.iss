@@ -16,6 +16,8 @@
 ;   - автозапуск сразу при установке: задача Планировщика «RetixHub» с правами
 ;     администратора (без UAC при каждом входе в Windows), окно — в трее;
 ;   - после установки клиент запускается (кроме /SILENT и /VERYSILENT);
+;   - автообновление: клиент сам запускает новый установщик с /VERYSILENT /AUTOUPDATE=1,
+;     после установки клиент запускается снова (в трее);
 ;   - данные в %ProgramData%\RetixHub (ключ, вход) и журнал {app}\logs установщик
 ;     при обновлении не трогает (журнал удаляется вместе с программой);
 ;   - при удалении: туннель, правила firewall и автозапуск
@@ -100,6 +102,8 @@ Name: "{autoprograms}\{#AppName}"; Filename: "{app}\{#AppExe}"; WorkingDir: "{ap
 Filename: "{sys}\schtasks.exe"; Parameters: "/Create /F /TN ""RetixHub"" /SC ONLOGON /RL HIGHEST /TR ""\""{app}\{#AppExe}\"" --minimized"""; Flags: runhidden waituntilterminated; StatusMsg: "Автозапуск при входе в Windows…"
 ; установщик уже с правами администратора — клиент стартует без второго окна UAC
 Filename: "{app}\{#AppExe}"; WorkingDir: "{app}"; Flags: nowait skipifsilent
+; автообновление (тихая установка из клиента): запустить новую версию, окно — в трее
+Filename: "{app}\{#AppExe}"; Parameters: "--minimized"; WorkingDir: "{app}"; Flags: nowait; Check: IsAutoUpdate
 
 [UninstallRun]
 Filename: "{app}\{#AppExe}"; Parameters: "--uninstall"; WorkingDir: "{app}"; Flags: waituntilterminated runhidden; RunOnceId: "RetixHubCleanup"
@@ -154,6 +158,12 @@ begin
     Sleep(1000);
   end;
   Log('ОШИБКА: RetixHub.exe не завершился');
+end;
+
+{ Установщик запущен автообновлением клиента: /AUTOUPDATE=1 }
+function IsAutoUpdate: Boolean;
+begin
+  Result := ExpandConstant('{param:AUTOUPDATE|0}') = '1';
 end;
 
 function IsDowngrade(var OldVer: String): Boolean;

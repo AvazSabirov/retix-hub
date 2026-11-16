@@ -82,8 +82,8 @@ def create_company(login: str = Form(...), name: str = Form(""), cabinet_passwor
         if idx is None:
             return redirect("/admin", "Свободных подсетей нет", err=True)
         cur = conn.execute(
-            "INSERT INTO companies(login, name, cabinet_pass_hash, join_pass_hash, subnet_index, max_devices) "
-            "VALUES (?,?,?,?,?,?)",
+            "INSERT INTO companies(login, name, cabinet_pass_hash, join_pass_hash, subnet_index, max_devices, "
+            "require_approval) VALUES (?,?,?,?,?,?,1)",  # новые ПК подключаются после одобрения в кабинете
             (login, name.strip()[:100], hash_pw(cabinet_password), hash_pw(join_password), idx,
              max(1, min(max_devices, 253))))
         services.audit(conn, cur.lastrowid, "company_create", login)
