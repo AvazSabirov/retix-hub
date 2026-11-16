@@ -1,0 +1,123 @@
+{% extends "base.html" %}
+{% macro scope_fields(ids) %}
+  <div>
+    <span class="muted small">Кому</span>
+    <label class="opt"><input type="radio" name="scope" value="all" {{ 'checked' if not ids }}> Всем компаниям</label>
+    <label class="opt"><input type="radio" name="scope" value="some" {{ 'checked' if ids }}> Только выбранным:</label>
+    <div class="scope-box">
+      {% for c in companies %}<label class="opt"><input type="checkbox" name="companies" value="{{ c.id }}" {{ 'checked' if c.id in ids }}> {{ c.name or c.login }} <span class="muted">({{ c.login }})</span></label>{% else %}<span class="muted small">компаний нет</span>{% endfor %}
+    </div>
+  </div>
+{% endmacro %}
+{% block content %}
+<div class="card">
+  <h1>Обновления клиента</h1>
+  <p class="muted">Кнопка «Скачать» на <a href="/" target="_blank" rel="noopener">главной странице</a> отдаёт
+    {% if site_version %}версию <b>{{ site_version }}</b> — самую новую опубликованную для всех компаний{% else %}<b>файл из downloads/</b>: опубликованной версии «Всем компаниям» пока нет{% endif %}.
+    Черновики и версии для выбранных компаний на сайте не показываются.</p>
+  <details>
+    <summary class="small">Открытый ключ подписи — один раз вписать в клиент</summary>
+    <p class="small">ПК ставит только установщик, подписанный этим сервером. Ключ вписывается в
+      <code>client/client_config.json</code> → <code>"update_public_keys": ["…"]</code> до сборки клиента
+      (клиент без ключа сам не обновляется). Закрытый ключ — <code>update_sign.key</code> в папке данных сервера:
+      храните его в бэкапе, без него ПК не примут новые версии.</p>
+    <p><code class="key" id="pubkey">{{ public_key }}</code></p>
+  </details>
+</div>
+
+<div class="card">
+  <h2>Загрузить установщик</h2>
+  <form method="post" action="/admin/updates" enctype="multipart/form-data">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <div class="grid">
+      <label><span>Файл RetixHub_Setup_&lt;версия&gt;.exe (до {{ max_mb }} МБ)</span><input type="file" name="file" accept=".exe" required></label>
+      <label><span>Версия (пусто — из свойств exe)</span><input type="text" name="version" placeholder="1.0.6"></label>
+    </div>
+    <label><span>Что нового (видно здесь и в журнале клиента)</span><textarea name="notes" rows="3" placeholder="Коротко, 2–4 строки"></textarea></label>
+    <div class="grid">
+      {{ scope_fields([]) }}
+      <div>
+        <span class="muted small">Когда</span>
+        <label class="opt"><input type="checkbox" name="publish" value="1"> <span>Опубликовать сразу (иначе — черновик: ПК его не видят)</span></label>
+        <label><span>или опубликовать в — дата и время ({{ tz_name }}, сейчас {{ now }})</span><input type="datetime-local" name="publish_at"></label>
+        <span class="muted small">До этого времени версия — черновик; наступит — опубликуется сама.</span>
+      </div>
+    </div>
+    <p><button class="primary">Загрузить</button></p>
+  </form>
+  <p class="muted small">ПК при каждом запросе к серверу сверяет свою версию с опубликованной (и раз в 10 минут), скачивает
+    установщик в фоне (с докачкой), проверяет подпись и SHA-256, ставит его тихо и запускается снова — VPN не рвётся.
+    Версия читается из свойств exe: загрузить файл с другой версией, чем в поле, нельзя. Одну версию дважды загрузить
+    нельзя — чтобы заменить файл, удалите версию и загрузите заново.</p>
+</div>
+
+<div class="card">
+  <h2>Версии</h2>
+  <div class="tbl-wrap"><table>
+    <tr><th>Версия</th><th>Статус</th><th>Кому</th><th>Файл</th><th>ПК</th><th></th></tr>
+    {% for r in releases %}
+    <tr>
+      <td><b>{{ r.version }}</b>{% if r.version == site_version %} <span class="tag share">на сайте</span>{% endif %}
+        <div class="muted small nowrap">загружена {{ r.created_at|dt }}</div></td>
+      <td class="nowrap">{% if r.published %}<span class="tag share">опубликована</span><div class="muted small">{{ r.published_at|dt }}</div>{% elif r.publish_at %}<span class="tag warn">по расписанию</span><div class="muted small">опубликуется {{ r.publish_at|dt }}</div>{% else %}<span class="tag">черновик</span>{% endif %}</td>
+      <td>{{ r.scope_text }}</td>
+      <td><a href="/admin/updates/{{ r.id }}/file">{{ r.file_name }}</a>
+        <div class="muted small nowrap">{{ (r.size / 1048576)|round(1) }} МБ · SHA-256 <code title="{{ r.sha256 }}">{{ r.sha256[:12] }}…</code></div></td>
+      <td class="nowrap small">на версии: <b>{{ r.on_version }}</b><br>ждут её: <b>{{ r.waiting }}</b><br>скачиваний: {{ r.downloads }}{% if r.site_downloads %}<br>с сайта: {{ r.site_downloads }}{% endif %}</td>
+      <td><div class="actions">
+        <form class="inline" method="post" action="/admin/updates/{{ r.id }}"
+              {% if not r.published %}data-confirm="Опубликовать {{ r.version }}? ПК ({{ r.scope_text }}) обновятся сами в течение 10 минут."{% endif %}>
+          <input type="hidden" name="csrf" value="{{ csrf }}">
+          <input type="hidden" name="action" value="{{ 'unpublish' if r.published else 'publish' }}">
+          <button class="small {{ '' if r.published else 'primary' }}">{{ 'Снять' if r.published else 'Опубликовать' }}</button></form>
+        <form class="inline" method="post" action="/admin/updates/{{ r.id }}/delete"
+              data-confirm="Удалить версию {{ r.version }} и её файл?">
+          <input type="hidden" name="csrf" value="{{ csrf }}">
+          <button class="small danger">Удалить</button></form>
+      </div>
+      {% if not r.published %}<div class="actions" style="margin-top:6px">
+        <form class="inline" method="post" action="/admin/updates/{{ r.id }}"
+              data-confirm="Опубликовать {{ r.version }} в указанное время? Тогда ПК ({{ r.scope_text }}) обновятся сами.">
+          <input type="hidden" name="csrf" value="{{ csrf }}">
+          <input type="hidden" name="action" value="schedule">
+          <input type="datetime-local" name="publish_at" value="{{ r.publish_at_input }}" required aria-label="Дата и время публикации">
+          <button class="small">{{ 'Изменить время' if r.publish_at else 'Опубликовать в…' }}</button></form>
+        {% if r.publish_at %}<form class="inline" method="post" action="/admin/updates/{{ r.id }}">
+          <input type="hidden" name="csrf" value="{{ csrf }}">
+          <input type="hidden" name="action" value="unschedule">
+          <button class="small">Отменить расписание</button></form>{% endif %}
+      </div>{% endif %}</td>
+    </tr>
+    <tr><td colspan="6">
+      <details><summary class="small">Что нового и кому{% if r.notes %}: <span class="muted">{{ r.notes|truncate(90) }}</span>{% endif %}</summary>
+        <form method="post" action="/admin/updates/{{ r.id }}" style="margin-top:8px">
+          <input type="hidden" name="csrf" value="{{ csrf }}">
+          <input type="hidden" name="action" value="save">
+          <label><span>Что нового</span><textarea name="notes" rows="3">{{ r.notes }}</textarea></label>
+          {{ scope_fields(r.scope_ids) }}
+          <p><button class="small">Сохранить</button></p>
+        </form>
+      </details>
+    </td></tr>
+    {% else %}<tr><td colspan="6" class="muted">Обновлений ещё не загружали</td></tr>{% endfor %}
+  </table></div>
+</div>
+
+<div class="card">
+  <h2>Компьютеры</h2>
+  <p class="small">{% for v, n in versions %}<span class="tag">{{ v }} — {{ n }}</span> {% else %}<span class="muted">ПК нет</span>{% endfor %}</p>
+  <div class="tbl-wrap"><table>
+    <tr><th>Компания</th><th>ПК</th><th>IP</th><th>Версия</th><th>Обновление</th><th>Последняя связь</th></tr>
+    {% for d in devices %}
+    <tr>
+      <td>{{ d.company_name or d.company_login }}</td>
+      <td>{{ d.name }}</td>
+      <td><code>{{ d.ip }}</code></td>
+      <td class="nowrap">{{ d.client_version or '?' }}</td>
+      <td>{% if d.target %}→ {{ d.target }}{% if d.state_text %}<div class="muted small">{{ d.state_text }} · {{ d.update_state_at|dt }}</div>{% endif %}{% elif d.state_text %}<span class="muted small">{{ d.state_text }}</span>{% else %}<span class="muted">последняя</span>{% endif %}</td>
+      <td class="nowrap muted">{{ d.last_handshake | ago }}</td>
+    </tr>
+    {% else %}<tr><td colspan="6" class="muted">ПК нет</td></tr>{% endfor %}
+  </table></div>
+</div>
+{% endblock %}

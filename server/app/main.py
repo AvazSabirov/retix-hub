@@ -8,7 +8,7 @@ from starlette.middleware.sessions import SessionMiddleware
 from . import db, monitor, services, wg
 from .config import (APP_NAME, APP_VERSION, API_HOST, API_PORT, COOKIE_SECURE, DRY_RUN, LOG_LEVEL, SECRET_KEY,
                      SUPERADMIN_PASSWORD)
-from .routers import admin, api_client, cabinet, public
+from .routers import admin, api_client, cabinet, public, updates
 
 # минимальный журнал: ошибки и предупреждения; строка о запуске — всегда (логгер retixhub на INFO)
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -37,6 +37,7 @@ app.add_middleware(SessionMiddleware, secret_key=SECRET_KEY, session_cookie="ret
 app.include_router(api_client.router)
 app.include_router(cabinet.router)
 app.include_router(admin.router)
+app.include_router(updates.router)
 app.include_router(public.router)
 
 

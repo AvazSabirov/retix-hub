@@ -4,7 +4,7 @@ import re
 
 import pytest
 
-from conftest import new_pubkey
+from conftest import fake_setup, new_pubkey
 
 
 # ---------------------------------------------------------------- суперадмин
@@ -691,26 +691,6 @@ class TestHardening:
         assert d["_key"] not in net["peers"]
         assert ctx.register("firma1", key=d["_key"])["status"] == "active"   # вход заново — без одобрения
 
-    def test_client_version_for_autoupdate(self, ctx):
-        import hashlib
-        import os
-        from app.config import DOWNLOADS_DIR
-        c = ctx.TestClient(ctx.app)
-        os.makedirs(DOWNLOADS_DIR, exist_ok=True)
-        assert c.get("/api/client/version").json() == {"version": None}
-        files = {"RetixHub_Setup_1.0.9.exe": b"MZ-109", "RetixHub_Setup_1.0.10.exe": b"MZ-1010" * 100}
-        for name, data in files.items():
-            with open(os.path.join(DOWNLOADS_DIR, name), "wb") as f:
-                f.write(data)
-        try:
-            info = c.get("/api/client/version").json()
-            assert info["version"] == "1.0.10" and info["size"] == 700
-            assert info["sha256"] == hashlib.sha256(b"MZ-1010" * 100).hexdigest()
-            assert c.get(info["url"]).content == b"MZ-1010" * 100
-        finally:
-            for name in files:
-                os.remove(os.path.join(DOWNLOADS_DIR, name))
-
     def test_old_database_is_migrated(self, monkeypatch, tmp_path):
         import sqlite3
         from app import db
@@ -732,3 +712,250 @@ class TestHardening:
         row = conn.execute("SELECT token_hash, token_next_hash, token_set_at FROM devices").fetchone()
         assert tuple(row) == ("h", None, 0)
         conn.execute("SELECT COUNT(*) FROM token_history").fetchone()
+
+
+class TestAdminApprovalToggle:
+    def _approval(self, cid):
+        from app import db
+        return db.connect().execute("SELECT require_approval FROM companies WHERE id=?", (cid,)).fetchone()[0]
+
+    def test_create_form_has_checkbox_on_by_default(self, ctx):
+        page = ctx.admin.get("/admin").text
+        assert 'name="require_approval" value="1" checked' in page and 'name="approval_form"' in page
+
+    def test_create_with_and_without_approval(self, ctx):
+        base = {"cabinet_password": "cab123", "join_password": "join123", "approval_form": "1"}
+        ctx.admin.post("/admin/companies", data=base | {"login": "withap", "require_approval": "1"})
+        ctx.admin.post("/admin/companies", data=base | {"login": "noap"})          # галочка снята
+        ctx.admin.post("/admin/companies", data={"login": "plain", "cabinet_password": "cab123",
+                                                  "join_password": "join123"})  # без формы — включено
+        from app import db
+        rows = dict(db.connect().execute("SELECT login, require_approval FROM companies").fetchall())
+        assert rows == {"withap": 1, "noap": 0, "plain": 1}
+        assert ctx.register("noap")["status"] == "active"
+        assert ctx.register("withap")["status"] == "pending"
+
+    def test_toggle_on_company_page(self, ctx, net):
+        cid = ctx.company("firma1")                       # одобрение выключено
+        old = ctx.register("firma1", "OLD")
+        page = ctx.admin.get(f"/admin/companies/{cid}").text
+        assert "> Новые ПК ждут одобрения" in page and 'value="1" checked> Новые ПК ждут одобрения' not in page
+        ctx.admin.post(f"/admin/companies/{cid}/update",
+                       data={"name": "firma1", "max_devices": 20, "is_active": "1", "require_approval": "1"})
+        assert self._approval(cid) == 1
+        assert 'value="1" checked> Новые ПК ждут одобрения' in ctx.admin.get(f"/admin/companies/{cid}").text
+        new = ctx.register("firma1", "NEW")
+        assert new["status"] == "pending" and new["_key"] not in net["peers"]
+        assert old["_key"] in net["peers"]                # уже подключённые остаются в сети
+        ctx.admin.post(f"/admin/companies/{cid}/devices/{new['device_id']}/approve")
+        assert new["_key"] in net["peers"]
+        ctx.admin.post(f"/admin/companies/{cid}/update", data={"name": "firma1", "max_devices": 20, "is_active": "1"})
+        assert self._approval(cid) == 0
+        assert "approval=True" in ctx.admin.get(f"/admin/companies/{cid}").text   # в журнале
+
+
+# ---------------------------------------------------------------- обновления через суперадмина
+
+class TestUpdates:
+    @staticmethod
+    def csrf(client):
+        return re.search(r'name="csrf" value="([^"]+)"', client.get("/admin/updates").text).group(1)
+
+    def upload(self, ctx, data, publish=True, client=None, **form):
+        c = client or ctx.admin
+        fields = {"csrf": self.csrf(c), **form} | ({"publish": "1"} if publish else {})
+        r = c.post("/admin/updates", data=fields, files={"file": ("setup.exe", data, "application/octet-stream")},
+                   follow_redirects=False)
+        assert r.status_code == 303, r.text
+        from urllib.parse import parse_qs, urlparse
+        return parse_qs(urlparse(r.headers["location"]).query).get("msg", [""])[0]
+
+    @staticmethod
+    def rel(version):
+        from app import db
+        return db.connect().execute("SELECT * FROM app_releases WHERE version=?", (version,)).fetchone()
+
+    def device(self, ctx, company, version="1.0.5"):
+        d = ctx.register(company)
+        d["h"] = ctx.h(d["token"]) | {"X-Retix-Version": version}
+        return d
+
+    def test_upload_reads_version_signs_and_publishes(self, ctx):
+        import base64
+        import json
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+        data = fake_setup("1.0.6")
+        assert "1.0.6 загружена и опубликована" in self.upload(ctx, data, notes="Новое меню")
+        rel = self.rel("1.0.6")
+        assert rel["published"] == 1 and rel["size"] == len(data) and rel["file_name"] == "RetixHub_Setup_1.0.6.exe"
+        page = ctx.admin.get("/admin/updates").text
+        pub = re.search(r'<code class="key" id="pubkey">([^<]+)</code>', page).group(1)
+        body = base64.b64decode(rel["manifest"])
+        Ed25519PublicKey.from_public_bytes(base64.b64decode(pub)).verify(base64.b64decode(rel["signature"]), body)
+        m = json.loads(body)
+        assert m == {"app": "Retix Hub", "kind": "retixhub-update", "version": "1.0.6",
+                     "file": "RetixHub_Setup_1.0.6.exe", "size": len(data), "sha256": rel["sha256"]}
+        assert "Новое меню" in page and "опубликована" in page
+
+    @pytest.mark.parametrize("data,form,err", [
+        (b"not an exe", {}, "не программа Windows"),
+        (fake_setup("1.0.6", product="Retix"), {}, "не установщик Retix Hub"),
+        (fake_setup("1.0.6"), {"version": "1.0.7"}, "версия 1.0.6, а указано 1.0.7"),
+        (fake_setup("1.0.6"), {"version": "abc"}, "не версия"),
+        (fake_setup("1.0.6"), {"scope": "some"}, "хотя бы одну компанию"),
+        (fake_setup("1.0.6"), {"publish_at": "2020-01-01T10:00"}, "уже прошло"),
+    ])
+    def test_upload_rejected(self, ctx, data, form, err):
+        assert err in self.upload(ctx, data, **form)
+        from app import db
+        assert db.connect().execute("SELECT COUNT(*) FROM app_releases").fetchone()[0] == 0
+
+    def test_upload_duplicate_and_csrf_and_login(self, ctx):
+        self.upload(ctx, fake_setup("1.0.6"))
+        assert "уже загружена" in self.upload(ctx, fake_setup("1.0.6"))
+        r = ctx.admin.post("/admin/updates", data={"csrf": "wrong"}, files={"file": ("s.exe", fake_setup("1.0.7"), "x/y")})
+        assert "устарела" in r.text and self.rel("1.0.7") is None
+        anon = ctx.TestClient(ctx.app)
+        r = anon.post("/admin/updates", files={"file": ("s.exe", fake_setup("1.0.8"), "x/y")}, follow_redirects=False)
+        assert r.headers["location"] == "/admin/login" and self.rel("1.0.8") is None
+        assert anon.get("/admin/updates", follow_redirects=False).headers["location"] == "/admin/login"
+
+    def test_device_gets_newest_published_in_scope(self, ctx):
+        a_id, b_id = ctx.company("firma1"), ctx.company("firma2")
+        a, b = self.device(ctx, "firma1"), self.device(ctx, "firma2")
+        self.upload(ctx, fake_setup("1.0.6"))                                    # всем
+        self.upload(ctx, fake_setup("1.0.7"), scope="some", companies=[str(a_id)])   # пилот на firma1
+        self.upload(ctx, fake_setup("1.0.9"), publish=False)                     # черновик
+        assert ctx.api.get("/api/update", headers=a["h"]).json()["update"]["version"] == "1.0.7"
+        assert ctx.api.get("/api/update", headers=b["h"]).json()["update"]["version"] == "1.0.6"
+        r = ctx.api.get("/api/me", headers=a["h"])
+        assert r.headers["x-retix-update"] == "1.0.7" and len(r.headers["x-retix-update-sha"]) == 16
+        assert ctx.api.get("/api/update", headers=a["h"] | {"X-Retix-Version": "1.0.7"}).json()["update"] is None
+        assert ctx.api.get("/api/me", headers=a["h"] | {"X-Retix-Version": "1.0.7"}).headers["x-retix-update"] == "none"
+        assert b_id
+
+    def test_unpublish_schedule_and_due(self, ctx):
+        from app import db
+        ctx.company("firma1")
+        d = self.device(ctx, "firma1")
+        self.upload(ctx, fake_setup("1.0.6"), publish=False)
+        rid = self.rel("1.0.6")["id"]
+        assert ctx.api.get("/api/update", headers=d["h"]).json()["update"] is None      # черновик
+        csrf = self.csrf(ctx.admin)
+        assert "уже прошло" in ctx.admin.post(f"/admin/updates/{rid}", data={
+            "csrf": csrf, "action": "schedule", "publish_at": "2020-01-01T10:00"}).text
+        ctx.admin.post(f"/admin/updates/{rid}", data={"csrf": csrf, "action": "schedule", "publish_at": "2099-01-01T10:00"})
+        assert self.rel("1.0.6")["publish_at"] == "2099-01-01 10:00:00"
+        assert ctx.api.get("/api/update", headers=d["h"]).json()["update"] is None
+        conn = db.connect()
+        conn.execute("UPDATE app_releases SET publish_at='2020-01-01 10:00:00' WHERE id=?", (rid,))   # время пришло
+        conn.commit()
+        assert ctx.api.get("/api/update", headers=d["h"]).json()["update"]["version"] == "1.0.6"
+        assert self.rel("1.0.6")["published"] == 1
+        assert conn.execute("SELECT COUNT(*) FROM audit_log WHERE action='update_publish' "
+                            "AND details LIKE '%по расписанию%'").fetchone()[0] == 1
+        ctx.admin.post(f"/admin/updates/{rid}", data={"csrf": csrf, "action": "unpublish"})
+        assert ctx.api.get("/api/update", headers=d["h"]).json()["update"] is None
+        assert ctx.admin.post(f"/admin/updates/{rid}", data={"csrf": "bad", "action": "publish"}).text.count("устарела")
+        assert self.rel("1.0.6")["published"] == 0
+
+    def test_file_by_ticket_with_resume(self, ctx, monkeypatch):
+        import hashlib
+        import time as _time
+        from app import updates
+        ctx.company("firma1")
+        d = self.device(ctx, "firma1")
+        data = fake_setup("1.0.6")
+        self.upload(ctx, data)
+        u = ctx.api.get("/api/update", headers=d["h"]).json()["update"]
+        c = ctx.TestClient(ctx.app)                       # без токена: билет в ссылке
+        r = c.get(u["url"])
+        assert r.status_code == 200 and hashlib.sha256(r.content).hexdigest() == u["sha256"]
+        r = c.get(u["url"], headers={"Range": "bytes=1000-"})
+        assert r.status_code == 206 and r.content == data[1000:]
+        assert c.get(u["url"], headers={"Range": f"bytes={len(data)}-"}).status_code == 416
+        assert c.get(u["url"].replace("&s=", "&s=0")).status_code == 403          # подделан
+        rid = u["id"]
+        exp = int(_time.time()) - 1
+        assert c.get(f"/api/update/file/{rid}?d={d['device_id']}&e={exp}&s={updates._ticket_sig(rid, d['device_id'], exp)}").status_code == 403
+        ctx.cabinet("firma1").post(f"/cabinet/devices/{d['device_id']}/block")
+        assert c.get(u["url"]).status_code == 403                                   # ПК заблокирован
+        assert self.rel("1.0.6")["downloads"] == 1
+
+    def test_other_company_cannot_download_pilot(self, ctx):
+        a_id = ctx.company("firma1"); ctx.company("firma2")
+        a, b = self.device(ctx, "firma1"), self.device(ctx, "firma2")
+        self.upload(ctx, fake_setup("1.0.7"), scope="some", companies=[str(a_id)])
+        url = ctx.api.get("/api/update", headers=a["h"]).json()["update"]["url"]
+        from app import updates
+        rid = int(re.search(r"/file/(\d+)", url).group(1))
+        forged = updates.ticket_url(rid, b["device_id"])          # даже с честным билетом другой компании
+        assert ctx.TestClient(ctx.app).get(forged).status_code == 404
+
+    def test_state_reported_and_shown(self, ctx):
+        from app import db
+        ctx.company("firma1")
+        d = self.device(ctx, "firma1")
+        self.upload(ctx, fake_setup("1.0.6"))
+        ctx.api.get("/api/me", headers=d["h"] | {"X-Retix-Update-State": "downloading:1.0.6"})
+        page = ctx.admin.get("/admin/updates").text
+        assert "скачивает 1.0.6" in page and "ждут её: <b>1</b>" in page
+        ctx.api.get("/api/me", headers=d["h"] | {"X-Retix-Update-State": "<script>"})   # мусор не пишется
+        assert db.connect().execute("SELECT update_state FROM devices").fetchone()[0] == "downloading:1.0.6"
+        ctx.api.get("/api/me", headers=d["h"] | {"X-Retix-Version": "1.0.6", "X-Retix-Update-State": "none"})
+        row = db.connect().execute("SELECT client_version, update_state FROM devices").fetchone()
+        assert tuple(row) == ("1.0.6", "none")
+        assert "на версии: <b>1</b>" in ctx.admin.get("/admin/updates").text
+
+    def test_site_download_uses_release_for_all(self, ctx):
+        a_id = ctx.company("firma1")
+        c = ctx.TestClient(ctx.app)
+        pilot, release = fake_setup("1.0.7"), fake_setup("1.0.6")
+        self.upload(ctx, pilot, scope="some", companies=[str(a_id)])
+        assert c.get("/download/client", follow_redirects=False).status_code == 303   # пилот на сайте не виден
+        self.upload(ctx, release)
+        r = c.get("/download/client")
+        assert r.content == release and "RetixHub_Setup_1.0.6.exe" in r.headers["content-disposition"]
+        assert "RetixHub_Setup_1.0.6.exe" in c.get("/").text
+        assert "на сайте" in ctx.admin.get("/admin/updates").text
+
+    def test_legacy_version_for_clients_1_0_5(self, ctx):
+        import hashlib
+        a_id = ctx.company("firma1")
+        c = ctx.TestClient(ctx.app)
+        assert c.get("/api/client/version").json() == {"version": None}
+        self.upload(ctx, fake_setup("1.0.7"), scope="some", companies=[str(a_id)])   # пилот 1.0.5 не видит
+        assert c.get("/api/client/version").json() == {"version": None}
+        data = fake_setup("1.0.6")
+        self.upload(ctx, data)
+        info = c.get("/api/client/version").json()
+        assert info["version"] == "1.0.6" and info["size"] == len(data)
+        assert info["sha256"] == hashlib.sha256(data).hexdigest() == hashlib.sha256(c.get(info["url"]).content).hexdigest()
+
+    def test_update_answer_has_public_key(self, ctx):
+        ctx.company("firma1")
+        d = self.device(ctx, "firma1")
+        pub = re.search(r'id="pubkey">([^<]+)<', ctx.admin.get("/admin/updates").text).group(1)
+        assert ctx.api.get("/api/update", headers=d["h"]).json()["public_key"] == pub
+
+    def test_save_notes_scope_and_delete(self, ctx):
+        import os
+        from app import updates
+        a_id = ctx.company("firma1")
+        self.upload(ctx, fake_setup("1.0.6"))
+        rel = self.rel("1.0.6")
+        csrf = self.csrf(ctx.admin)
+        ctx.admin.post(f"/admin/updates/{rel['id']}", data={"csrf": csrf, "action": "save", "notes": "Исправления",
+                                                           "scope": "some", "companies": [str(a_id)]})
+        rel = self.rel("1.0.6")
+        assert rel["notes"] == "Исправления" and rel["companies"] == f"[{a_id}]"
+        path = os.path.join(updates.updates_dir(), rel["stored_name"])
+        assert os.path.exists(path)
+        assert ctx.admin.get(f"/admin/updates/{rel['id']}/file").content[:2] == b"MZ"
+        ctx.admin.post(f"/admin/updates/{rel['id']}/delete", data={"csrf": csrf})
+        assert self.rel("1.0.6") is None and not os.path.exists(path)
+
+    def test_admin_nav_links(self, ctx):
+        page = ctx.admin.get("/admin").text
+        assert 'href="/admin/updates"' in page
+        assert "Обновления клиента" in ctx.admin.get("/admin/updates").text
