@@ -130,7 +130,8 @@ def reconcile(conn=None) -> bool:
         with db.write_lock:
             rows = conn.execute(
                 "SELECT d.public_key, d.ip FROM devices d JOIN companies c ON c.id=d.company_id "
-                "WHERE c.is_active=1 AND d.is_blocked=0 AND d.is_approved=1").fetchall()
+                "WHERE c.is_active=1 AND d.is_blocked=0 AND d.is_approved=1 "
+                "AND d.token_hash IS NOT NULL").fetchall()  # токен отозван (выход, «отключить все») — вне сети
             wg.sync_peers({r["public_key"]: r["ip"] for r in rows})
             wg.apply_firewall(build_forward_rules(conn))
         return True
@@ -140,6 +141,21 @@ def reconcile(conn=None) -> bool:
     finally:
         if own:
             conn.close()
+
+
+# ---------- токены устройств ----------
+
+def retire_token(conn, device_id: int, token_hash: str | None, now: int) -> None:
+    """Токен больше не действует; если он придёт снова — это копия с другого ПК."""
+    if token_hash:
+        conn.execute("INSERT OR REPLACE INTO token_history(token_hash, device_id, revoked_at) VALUES (?,?,?)",
+                     (token_hash, device_id, now))
+    conn.execute("DELETE FROM token_history WHERE revoked_at<?", (now - 30 * 86400,))
+
+
+def revoke_tokens(conn, where: str, args: tuple) -> None:
+    """Сбросить токены устройств (без commit): клиенты должны войти заново, из WireGuard они уходят."""
+    conn.execute(f"UPDATE devices SET token_hash=NULL, token_next_hash=NULL, token_next_at=0 WHERE {where}", args)
 
 
 # ---------- действия над устройствами (кабинет и админка) ----------

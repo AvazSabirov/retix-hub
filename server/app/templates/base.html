@@ -51,5 +51,13 @@
   {% if msg %}<div class="msg {{ 'err' if err else '' }}">{{ msg }}</div>{% endif %}
   {% block content %}{% endblock %}
 </main>
+<script>
+  // подтверждение для форм с data-confirm. Текст берётся из атрибута, а не вставляется в JS:
+  // имя ПК задаёт клиент: вставленное в обработчик формы, оно исполнялось бы как код (XSS)
+  document.addEventListener('submit', function (e) {
+    var text = e.target.getAttribute('data-confirm');
+    if (text && !window.confirm(text)) e.preventDefault();
+  });
+</script>
 </body>
 </html>

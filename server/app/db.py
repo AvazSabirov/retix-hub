@@ -15,7 +15,7 @@ CREATE TABLE IF NOT EXISTS companies (
     join_pass_hash    TEXT NOT NULL,
     subnet_index      INTEGER NOT NULL UNIQUE,
     max_devices       INTEGER NOT NULL DEFAULT 20,
-    require_approval  INTEGER NOT NULL DEFAULT 0,
+    require_approval  INTEGER NOT NULL DEFAULT 1,
     full_lan          INTEGER NOT NULL DEFAULT 0,
     share_name        TEXT NOT NULL DEFAULT 'share',
     share_ports       TEXT NOT NULL DEFAULT '445',
@@ -31,6 +31,9 @@ CREATE TABLE IF NOT EXISTS devices (
     public_key      TEXT NOT NULL UNIQUE,
     ip              TEXT NOT NULL UNIQUE,
     token_hash      TEXT UNIQUE,
+    token_next_hash TEXT,                       -- выдан клиенту, станет token_hash, когда клиент им воспользуется
+    token_next_at   INTEGER NOT NULL DEFAULT 0,
+    token_set_at    INTEGER NOT NULL DEFAULT 0,
     is_share_host   INTEGER NOT NULL DEFAULT 0,
     is_blocked      INTEGER NOT NULL DEFAULT 0,
     is_approved     INTEGER NOT NULL DEFAULT 1,
@@ -54,6 +57,13 @@ CREATE TABLE IF NOT EXISTS messages (
 );
 CREATE INDEX IF NOT EXISTS ix_messages_to ON messages(to_device_id, delivered);
 
+-- прежние токены устройств: если такой токен пришёл снова — его скопировали на другой ПК
+CREATE TABLE IF NOT EXISTS token_history (
+    token_hash  TEXT PRIMARY KEY,
+    device_id   INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+    revoked_at  INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS audit_log (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     company_id  INTEGER,
@@ -72,11 +82,24 @@ def connect() -> sqlite3.Connection:
     return conn
 
 
+# столбцы, добавленные после первых установок: (таблица, столбец, определение)
+MIGRATIONS = [
+    ("devices", "token_next_hash", "TEXT"),
+    ("devices", "token_next_at", "INTEGER NOT NULL DEFAULT 0"),
+    ("devices", "token_set_at", "INTEGER NOT NULL DEFAULT 0"),
+]
+
+
 def init() -> None:
     conn = connect()
     try:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.executescript(SCHEMA)
+        for table, column, definition in MIGRATIONS:
+            have = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+            if column not in have:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS ix_devices_token_next ON devices(token_next_hash)")
         conn.commit()
     finally:
         conn.close()

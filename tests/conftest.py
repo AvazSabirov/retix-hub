@@ -56,8 +56,8 @@ def clean(app, net):
     with TestClient(app):  # lifespan: db.init()
         pass
     conn = db.connect()
-    conn.executescript("DELETE FROM devices; DELETE FROM companies; DELETE FROM audit_log;"
-                       "DELETE FROM sqlite_sequence;")
+    conn.executescript("DELETE FROM token_history; DELETE FROM messages; DELETE FROM devices; DELETE FROM companies;"
+                       "DELETE FROM audit_log; DELETE FROM sqlite_sequence;")
     conn.commit()
     conn.close()
     limiter._fails.clear()
@@ -76,13 +76,18 @@ class Ctx:
         r = self.admin.post("/admin/login", data={"login": "admin", "password": "supersecret"}, follow_redirects=False)
         assert r.headers["location"] == "/admin"
 
-    def company(self, login, join="join123", cab="cab123", max_devices=20, name=""):
+    def company(self, login, join="join123", cab="cab123", max_devices=20, name="", approval=False):
+        """Компания. Новые компании по умолчанию ждут одобрения ПК; большинству сценариев оно
+        не нужно — approval=False выключает его, как галочка в кабинете."""
         r = self.admin.post("/admin/companies", data={"login": login, "name": name or login, "cabinet_password": cab,
                                                       "join_password": join, "max_devices": max_devices})
         assert "создана" in r.text, r.text[:400]
         from app import db
         conn = db.connect()
         cid = conn.execute("SELECT id FROM companies WHERE login=?", (login,)).fetchone()[0]
+        if not approval:
+            conn.execute("UPDATE companies SET require_approval=0 WHERE id=?", (cid,))
+            conn.commit()
         conn.close()
         return cid
 

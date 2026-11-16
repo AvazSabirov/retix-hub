@@ -1,11 +1,17 @@
 """API для Windows-клиента."""
 import time
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel, Field
 
 from .. import db, services, wg
 from ..auth import check_pw, client_ip, limiter, new_token, sha256
+from ..config import TOKEN_ROTATE_SECONDS
+
+# Новый токен сервер отдаёт в этом заголовке. Клиент переходит на него сразу; старый действует,
+# пока клиент не пришёл с новым. После этого старый токен — только у копии: она отключает ПК.
+TOKEN_HEADER = "X-Retix-Token"
+NEXT_TOKEN_RETRY = 30  # сек: клиент не забрал выданный токен (ответ потерялся) — выдать заново
 
 router = APIRouter(prefix="/api", tags=["client"])
 
@@ -32,16 +38,54 @@ class HeartbeatIn(BaseModel):
     client_version: str = Field(default="", max_length=32)
 
 
-def current_device(request: Request, conn=Depends(db.get_db)):
+def _token_reused(conn, device_id: int, now: int) -> None:
+    """Пришёл старый токен: им пользуются два компьютера. Отключаем ПК до одобрения администратором."""
+    with db.write_lock:
+        dev = conn.execute("SELECT * FROM devices WHERE id=?", (device_id,)).fetchone()
+        if not dev:
+            return
+        services.revoke_tokens(conn, "id=?", (device_id,))
+        conn.execute("UPDATE devices SET is_approved=0 WHERE id=?", (device_id,))
+        services.audit(conn, dev["company_id"], "token_reuse",
+                       f"{dev['name']} {dev['ip']}: токен использован на двух ПК, ждёт одобрения")
+        conn.commit()
+        services.reconcile(conn)
+
+
+def current_device(request: Request, response: Response, conn=Depends(db.get_db)):
+    """Устройство по Bearer-токену. Один токен — один компьютер: токен регулярно меняется,
+    а старый, пришедший снова, отключает устройство (см. TOKEN_HEADER)."""
     auth = request.headers.get("authorization", "")
-    if not auth.lower().startswith("bearer "):
+    if not auth.lower().startswith("bearer ") or not auth[7:].strip():
         raise HTTPException(401, "Нет токена")
-    dev = conn.execute("SELECT * FROM devices WHERE token_hash=?", (sha256(auth[7:].strip()),)).fetchone()
+    token_hash = sha256(auth[7:].strip())
+    now = int(time.time())
+    dev = conn.execute("SELECT * FROM devices WHERE token_hash=?", (token_hash,)).fetchone()
     if not dev:
+        dev = conn.execute("SELECT * FROM devices WHERE token_next_hash=?", (token_hash,)).fetchone()
+        if dev:  # клиент перешёл на новый токен — прежний больше не действует
+            with db.write_lock:
+                services.retire_token(conn, dev["id"], dev["token_hash"], now)
+                conn.execute("UPDATE devices SET token_hash=?, token_next_hash=NULL, token_next_at=0, "
+                             "token_set_at=? WHERE id=?", (token_hash, now, dev["id"]))
+                conn.commit()
+            dev = conn.execute("SELECT * FROM devices WHERE id=?", (dev["id"],)).fetchone()
+    if not dev:
+        old = conn.execute("SELECT device_id FROM token_history WHERE token_hash=?", (token_hash,)).fetchone()
+        if old:
+            _token_reused(conn, old["device_id"], now)
+            raise HTTPException(401, "Этот вход уже используется на другом компьютере. "
+                                     "ПК отключён и ждёт одобрения администратора компании")
         raise HTTPException(401, "Устройство не найдено, нужна повторная регистрация")
     company = conn.execute("SELECT * FROM companies WHERE id=?", (dev["company_id"],)).fetchone()
     if not company["is_active"]:
         raise HTTPException(403, "Компания отключена")
+    if dev["token_hash"] == token_hash and now - dev["token_set_at"] >= TOKEN_ROTATE_SECONDS \
+            and (not dev["token_next_hash"] or now - dev["token_next_at"] >= NEXT_TOKEN_RETRY):
+        token, next_hash = new_token()
+        conn.execute("UPDATE devices SET token_next_hash=?, token_next_at=? WHERE id=?", (next_hash, now, dev["id"]))
+        conn.commit()
+        response.headers[TOKEN_HEADER] = token
     return conn, dev, company
 
 
@@ -75,9 +119,13 @@ def register(data: RegisterIn, request: Request, conn=Depends(db.get_db)):
         if existing and existing["company_id"] != company["id"]:
             raise HTTPException(409, "Этот ключ уже зарегистрирован в другой компании")
 
+        now = int(time.time())
         if existing:  # повторная регистрация того же ПК — новый токен, тот же IP
-            conn.execute("UPDATE devices SET token_hash=?, name=?, hostname=?, client_version=? WHERE id=?",
-                         (token_hash, name, hostname, data.client_version, existing["id"]))
+            # прежний токен перестаёт действовать; если он придёт снова — вход скопирован на другой ПК
+            services.retire_token(conn, existing["id"], existing["token_hash"], now)
+            conn.execute("UPDATE devices SET token_hash=?, token_next_hash=NULL, token_next_at=0, token_set_at=?, "
+                         "name=?, hostname=?, client_version=? WHERE id=?",
+                         (token_hash, now, name, hostname, data.client_version, existing["id"]))
             dev_id = existing["id"]
             services.audit(conn, company["id"], "device_reregister", f"{name} {existing['ip']}")
         else:
@@ -88,9 +136,9 @@ def register(data: RegisterIn, request: Request, conn=Depends(db.get_db)):
             if not new_ip:
                 raise HTTPException(403, "Нет свободных адресов в подсети")
             cur = conn.execute(
-                "INSERT INTO devices(company_id, name, hostname, public_key, ip, token_hash, is_approved, client_version) "
-                "VALUES (?,?,?,?,?,?,?,?)",
-                (company["id"], name, hostname, data.public_key, new_ip, token_hash,
+                "INSERT INTO devices(company_id, name, hostname, public_key, ip, token_hash, token_set_at, "
+                "is_approved, client_version) VALUES (?,?,?,?,?,?,?,?,?)",
+                (company["id"], name, hostname, data.public_key, new_ip, token_hash, now,
                  0 if company["require_approval"] else 1, data.client_version))
             dev_id = cur.lastrowid
             services.audit(conn, company["id"], "device_register", f"{name} {new_ip} from {ip}")
@@ -172,6 +220,18 @@ def get_messages(ctx=Depends(current_device)):
         conn.commit()
     return {"messages": [{"id": r["id"], "from_id": r["from_device_id"], "from_name": r["from_name"] or "—",
                           "from_ip": r["from_ip"] or "", "text": r["text"], "time": r["created_at"]} for r in rows]}
+
+
+@router.post("/logout")
+def logout(ctx=Depends(current_device)):
+    """«Выйти из сети» в клиенте: токен больше не действует, ПК снимается с wg0."""
+    conn, dev, company = ctx
+    with db.write_lock:
+        services.revoke_tokens(conn, "id=?", (dev["id"],))
+        services.audit(conn, company["id"], "device_logout", f"{dev['name']} {dev['ip']}")
+        conn.commit()
+        services.reconcile(conn)
+    return {"ok": True}
 
 
 @router.post("/heartbeat")
