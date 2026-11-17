@@ -707,15 +707,17 @@ def direct_wan(admin):
         nsx("srv", f"iptables -D {rule}")
 
     print("\n    путь через интернет пропал → снова через сервер")
-    cut = "FORWARD -i wan -s 11.0.0.12 -j DROP"          # провайдер/роутер перестал пропускать
-    nsx("r1", f"iptables -I {cut}")
+    cut = [("r1", "FORWARD -i wan -s 11.0.0.12 -j DROP"), ("r2", "FORWARD -i wan -s 11.0.0.11 -j DROP")]
+    for ns, rule in cut:                                  # между офисами пакеты больше не ходят
+        nsx(ns, f"iptables -I {rule}")
     w1.step(); w2.step()
     time.sleep(rc.DIRECT_RX_TIMEOUT_WAN + 2)
     w1.step(); w2.step()
     check("сосед без пакетов удалён", not direct_peers(w1).get(k2, {}).get("allowed_ips")
           and not direct_peers(w2).get(k1, {}).get("allowed_ips"), f"{direct_peers(w1)} {direct_peers(w2)}")
     check("связь через сервер работает", ping_retry("w1", w2.ip) and ping_retry("w2", w1.ip))
-    nsx("r1", f"iptables -D {cut}")
+    for ns, rule in cut:
+        nsx(ns, f"iptables -D {rule}")
 
     print("\n    роутер с симметричным NAT (новый порт на каждый адрес) → прямого пути нет, работает сервер")
     nsx("r2", "iptables -t nat -R POSTROUTING 1 -o wan -j MASQUERADE --random-fully")
