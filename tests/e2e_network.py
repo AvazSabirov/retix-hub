@@ -159,6 +159,7 @@ class LinuxTunnel:
         return "running" if nsx(self.ns, f"ip link show {self.iface}", check=False).returncode == 0 else "missing"
 
     def install(self, conf: str):
+        self.conf = conf
         self.uninstall()
         make_wg_iface(self.ns, self.iface)
         address, allowed, lines = "", [], []
@@ -186,12 +187,33 @@ class LinuxTunnel:
     def probe(self, ip):
         return any(nsx(self.ns, f"ping -c 1 -W 1 {ip}", check=False).returncode == 0 for _ in range(2))
 
-    def last_handshake(self):
+    def last_handshake(self, key=""):
         r = nsx(self.ns, f"wg show {self.iface} latest-handshakes", check=False)
-        try:
-            return max(int(x.split()[1]) for x in r.stdout.splitlines() if x.strip())
-        except ValueError:
-            return 0
+        times = {x.split()[0]: int(x.split()[1]) for x in r.stdout.splitlines() if len(x.split()) == 2}
+        return times.get(key, 0) if key else max(times.values(), default=0)
+
+    def dump(self):
+        r = nsx(self.ns, f"wg show {self.iface} dump", check=False)
+        return rc.parse_wg_dump(r.stdout) if r.returncode == 0 else None
+
+    def set_peer(self, key, endpoint="", allowed_ips=None, keepalive=None):
+        cmd = f"wg set {self.iface} peer {key}"
+        if endpoint:
+            cmd += f" endpoint {endpoint}"
+        if allowed_ips is not None:
+            cmd += f" allowed-ips {allowed_ips or chr(34) * 2}"
+        if keepalive is not None:
+            cmd += f" persistent-keepalive {keepalive}"
+        return nsx(self.ns, cmd, check=False).returncode == 0
+
+    def remove_peer(self, key):
+        nsx(self.ns, f"wg set {self.iface} peer {key} remove", check=False)
+
+    def saved_conf(self):
+        return getattr(self, "conf", "")
+
+    def set_listen_port(self, port):
+        return nsx(self.ns, f"wg set {self.iface} listen-port {port}", check=False).returncode == 0
 
 
 class Pc:
@@ -205,6 +227,7 @@ class Pc:
 
     def _host(self):
         rc.socket.gethostname = lambda: self.hostname
+        rc.local_addresses = lambda: [f"{NS[self.ns]}/24"]   # адрес ПК в «офисной» сети 192.168.77.0/24
 
     def login(self, password="join123"):
         self._host()
@@ -222,6 +245,14 @@ class Pc:
                 elif kind == "peers":
                     self.peers = data["peers"]
         return st
+
+    def reboot(self):
+        """Перезагрузка ПК: служба WireGuard поднимается сама с конфигом (без пиров, добавленных на лету,
+        и с новым случайным портом), программа запускается заново — помнит только state.json."""
+        self.tunnel.install(self.tunnel.conf)
+        self.state = rc.State(self.state.path)
+        self.w = rc.Worker(self.state, queue.Queue(), tunnel=self.tunnel)
+        self.peers = []
 
     def until(self, status, tries=12):
         st = None
@@ -252,6 +283,11 @@ def main():
         if not shutil.which(tool):
             sys.exit(f"нет {tool}")
     print(f"WireGuard: {'модуль ядра' if KERNEL_WG else 'wireguard-go (userspace)'}")
+    import logging
+    client_log = Path(tempfile.mkdtemp(prefix="retix-e2e-log-")) / "client.log"
+    logging.basicConfig(filename=client_log, level=logging.INFO, format="%(asctime)s %(threadName)s %(message)s")
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
+    print(f"журнал клиентов: {client_log}")
     rc.run = lambda args, timeout=60: (0, "")
     rc.ensure_firewall = lambda subnet, ports="445": None
     rc.ensure_autostart = lambda: None
@@ -275,6 +311,9 @@ def run_scenarios(srv: ServerProc):
     for login in ("alpha", "beta"):
         admin.post(API + "/admin/companies", data={"login": login, "name": login.title(), "cabinet_password": "cab123",
                                                    "join_password": "join123", "max_devices": 10})
+        # новые компании по умолчанию ждут одобрения ПК — в этих сценариях оно не нужно
+        cab = requests.Session(); cab.post(API + "/cabinet/login", data={"login": login, "password": "cab123"})
+        cab.post(API + "/cabinet/settings", data={"share_name": "share", "share_ports": "445"})
     cab_a = requests.Session(); cab_a.post(API + "/cabinet/login", data={"login": "alpha", "password": "cab123"})
 
     a1 = Pc("a1", "PC1", "alpha", "Склад PC1")
@@ -348,7 +387,9 @@ def run_scenarios(srv: ServerProc):
     online = {p["name"]: p["online"] for p in a2.peers}
     check("сервер видит ПК alpha онлайн (по handshake)", online.get("Склад PC1") and online.get("Бухгалтерия"), str(online))
 
-    print("\n10. Блокировка ПК")
+    direct_lan(srv, cab_a, a1, a2, a3, b1)
+
+    print("\n11. Блокировка ПК")
     cab_a.post(API + f"/cabinet/devices/{a2.dev_id}/block")
     check("пир Бухгалтерии удалён с сервера", a2.w.state.keypair()[1] not in server_peers())
     check("заблокированный ПК не достучится до PC1", not ping("a2", a1.ip))
@@ -359,7 +400,7 @@ def run_scenarios(srv: ServerProc):
     a2.until(rc.Status.ONLINE)
     check("после разблокировки связь вернулась", ping_retry("a2", a1.ip))
 
-    print("\n11. Удаление ПК → авто-перерегистрация")
+    print("\n12. Удаление ПК → авто-перерегистрация")
     old_ip = a3.ip
     cab_a.post(API + f"/cabinet/devices/{a3.dev_id}/delete")
     check("удалённый ПК отрезан", not ping("a3", a1.ip))
@@ -368,7 +409,7 @@ def run_scenarios(srv: ServerProc):
     check("тот же IP", a3.ip == old_ip, f"{old_ip} -> {a3.ip}")
     check("связь восстановлена", ping_retry("a3", a1.ip))
 
-    print("\n12. Сервер упал и поднялся (перезагрузка)")
+    print("\n13. Сервер упал и поднялся (перезагрузка)")
     srv.stop()
     nsx("srv", "ip link del wg0", check=False)            # как после ребута: интерфейса нет
     time.sleep(0.5)
@@ -384,7 +425,7 @@ def run_scenarios(srv: ServerProc):
     check("SMB снова доступен", tcp("a2", a1.ip, 445))
     check("изоляция после рестарта на месте", not ping("b1", a1.ip))
 
-    print("\n13. Отключение компании")
+    print("\n14. Отключение компании")
     page = admin.get(API + "/admin").text
     import re
     beta_id = dict(re.findall(r"<b>(\w+)</b>.*?/admin/companies/(\d+)", page, flags=re.S))["beta"]
@@ -394,7 +435,7 @@ def run_scenarios(srv: ServerProc):
     check("пиров beta на сервере нет", b1.w.state.keypair()[1] not in server_peers())
     check("alpha продолжает работать", ping_retry("a2", a1.ip))
 
-    print("\n14. Смена пароля подключения с отключением всех")
+    print("\n15. Смена пароля подключения с отключением всех")
     cab_a.post(API + "/cabinet/join-password", data={"new_password": "newpass1", "kick_all": "1"})
     a3.step()
     st = a3.step()
@@ -402,9 +443,122 @@ def run_scenarios(srv: ServerProc):
     check("вход с новым паролем", a3.login("newpass1") is None)
     check("снова онлайн", a3.until(rc.Status.ONLINE)["status"] == rc.Status.ONLINE)
 
-    print("\n15. Выход из сети")
+    print("\n16. Выход из сети")
     a3.w.logout()
     check("туннель удалён", a3.tunnel.service_state() == "missing")
+
+
+def direct_peers(pc) -> dict:
+    """Прямые пиры ПК (все, кроме сервера): ключ -> {endpoint, allowed_ips, …}."""
+    d = pc.tunnel.dump() or {"peers": {}}
+    return {k: v for k, v in d["peers"].items() if "," not in v["allowed_ips"]}   # у сервера — подсеть,10.66.0.1/32
+
+
+def settle(*pcs, rounds=4):
+    for _ in range(rounds):
+        for pc in pcs:
+            pc.step()
+        time.sleep(0.5)
+        for pc in pcs:
+            pc.w.direct.poll()      # то, что Worker делает раз в секунду между шагами
+
+
+def direct_lan(srv, cab_a, a1, a2, a3, b1):
+    print("\n10. Прямой путь по локальной сети (как в Radmin VPN)")
+    rc.DIRECT_KEEPALIVE, rc.DIRECT_RX_TIMEOUT = 1, 8   # в тесте путь «пропадает» быстрее
+    cab_a.post(API + "/cabinet/settings", data={"full_lan": "1", "share_name": "share", "share_ports": "445"})
+    settle(a1, a2)
+    time.sleep(2.5)                 # монитор сервера (каждые 2 с) видит адреса ПК
+    settle(a1, a2)
+    k1, k2 = a1.w.state.keypair()[1], a2.w.state.keypair()[1]
+    p12, p21 = direct_peers(a1).get(k2, {}), direct_peers(a2).get(k1, {})
+    check("PC1 → Бухгалтерия: напрямую по локальному адресу (AllowedIPs /32)",
+          p12.get("allowed_ips") == f"{a2.ip}/32" and p12.get("endpoint", "").startswith("192.168.77.12:"),
+          f"{p12} direct={a1.w.cfg.get('direct')} lan={a1.w.lan} port={a1.w.direct.listen_port}")
+    check("Бухгалтерия → PC1: напрямую", p21.get("allowed_ips") == f"{a1.ip}/32", str(p21))
+    check("пир сервера не изменился (подсеть компании — через сервер)",
+          a1.w.cfg["server_public_key"] in (a1.tunnel.dump() or {"peers": {}})["peers"]
+          and len(direct_peers(a1)) == 1)
+    a1.step()
+    check("в программе Бухгалтерия отмечена «напрямую»",
+          any(p["name"] == "Бухгалтерия" and p.get("direct") for p in a1.peers), str(a1.peers))
+    page = cab_a.get(API + "/cabinet").text
+    check("кабинет показывает прямые пути", "напрямую: Бухгалтерия" in page and "напрямую: Склад PC1" in page)
+
+    # доказательство: сервер больше не пропускает трафик между ними, а связь есть
+    drop = [f"FORWARD -s {a1.ip} -d {a2.ip} -j DROP", f"FORWARD -s {a2.ip} -d {a1.ip} -j DROP"]
+    for rule in drop:
+        nsx("srv", f"iptables -I {rule}")
+    check("ping PC1 ↔ Бухгалтерия идёт мимо сервера", ping_retry("a1", a2.ip) and ping_retry("a2", a1.ip))
+    check("SMB PC1 ← Бухгалтерия мимо сервера", tcp("a2", a1.ip, 445))
+    check("контроль: Запасной (ещё не сообщил адреса) — через сервер", ping_retry("a1", a3.ip))
+    for rule in drop:
+        nsx("srv", f"iptables -D {rule}")
+
+    print("\n    чужие не пролезут прямым путём")
+    b1.step(2)
+    check("Beta (та же локальная сеть, другая компания) прямых пиров не получает", not direct_peers(b1))
+    port1 = a1.tunnel.dump()["listen_port"]
+    nsx("b1", f"wg set wg-b1 peer {k1} endpoint 192.168.77.11:{port1} allowed-ips {a1.ip}/32 persistent-keepalive 1")
+    time.sleep(1)
+    check("Beta сам добавил PC1 в свой WireGuard — PC1 его не знает, связи нет", not ping("b1", a1.ip))
+    nsx("b1", f"wg set wg-b1 peer {k1} remove")
+
+    print("\n    прямой путь пропал → снова через сервер")
+    lan_drop = [("a1", "INPUT -s 192.168.77.12 -p udp -j DROP"), ("a2", "INPUT -s 192.168.77.11 -p udp -j DROP")]
+    for ns, rule in lan_drop:
+        nsx(ns, f"iptables -I {rule}")
+    a1.step(); a2.step()            # последние пакеты, пришедшие до блокировки
+    time.sleep(rc.DIRECT_RX_TIMEOUT + 2)
+    a1.step(); a2.step()
+    check("сосед без пакетов удалён из WireGuard", not direct_peers(a1) and not direct_peers(a2),
+          f"{direct_peers(a1)} {direct_peers(a2)}")
+    check("связь PC1 ↔ Бухгалтерия идёт через сервер", ping_retry("a1", a2.ip) and ping_retry("a2", a1.ip))
+    for ns, rule in lan_drop:
+        nsx(ns, f"iptables -D {rule}")
+
+    print("\n    «любой трафик» выключен → прямых путей нет")
+    a1.w.direct.backoff.clear(); a2.w.direct.backoff.clear()
+    settle(a1, a2)
+    check("после восстановления сети прямой путь вернулся", direct_peers(a1).get(k2, {}).get("allowed_ips") == f"{a2.ip}/32")
+
+    print("\n    нет интернета, оба ПК перезагрузились → прямой путь по сохранённым соседям")
+    ip1, ip2 = a1.ip, a2.ip            # после перезагрузки конфигурации от сервера ещё нет
+    srv.stop()
+    nsx("srv", "ip link del wg0", check=False)          # сервера нет совсем: ни API, ни WireGuard
+    for pc in (a1, a2):
+        pc.reboot()
+    check("после перезагрузки прямых пиров в туннеле нет", not direct_peers(a1) and not direct_peers(a2))
+    settle(a1, a2, rounds=3)
+    st = a1.step()
+    check("клиент: «Только локальная сеть»", st and st["status"] == rc.Status.LAN_ONLY, str(st))
+    check("прямой путь поднят по сохранённому списку",
+          direct_peers(a1).get(k2, {}).get("allowed_ips") == f"{ip2}/32"
+          and direct_peers(a2).get(k1, {}).get("allowed_ips") == f"{ip1}/32",
+          f"{direct_peers(a1)} {direct_peers(a2)}")
+    check("ping PC1 ↔ Бухгалтерия без сервера", ping_retry("a1", ip2) and ping_retry("a2", ip1))
+    check("SMB PC1 ← Бухгалтерия без сервера", tcp("a2", ip1, 445))
+    check("в программе Бухгалтерия «в сети», напрямую",
+          any(p["name"] == "Бухгалтерия" and p["online"] and p.get("direct") for p in a1.peers), str(a1.peers))
+    a1.w.set_enabled(False)
+    st = a1.step()
+    check("OFF без сервера: туннель снят", st["status"] == rc.Status.OFF and a1.tunnel.service_state() == "missing", str(st))
+    a1.w.set_enabled(True)
+    settle(a1, a2, rounds=3)
+    check("ON без сервера: туннель из последнего конфига, снова напрямую",
+          a1.step()["status"] == rc.Status.LAN_ONLY and ping_retry("a1", ip2) and ping_retry("a2", ip1))
+    check("контроль: Запасной (не сосед) без сервера недоступен", not ping("a1", a3.ip))
+    srv.start()
+    for pc in (a1, a2):
+        pc.until(rc.Status.ONLINE)
+    settle(a1, a2)
+    check("сервер вернулся: «В сети», прямой путь на месте",
+          a1.step()["status"] == rc.Status.ONLINE and direct_peers(a1).get(k2, {}).get("allowed_ips") == f"{a2.ip}/32")
+    cab_a.post(API + "/cabinet/settings", data={"share_name": "share", "share_ports": "445"})
+    a1.step(); a2.step()
+    check("прямые пиры удалены у обоих", not direct_peers(a1) and not direct_peers(a2))
+    check("PC1 → Бухгалтерия:22 снова закрыт (правила сервера снова действуют)", not tcp("a2", a1.ip, 22))
+    check("ping через сервер работает", ping_retry("a2", a1.ip))
 
 
 if __name__ == "__main__":

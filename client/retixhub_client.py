@@ -37,7 +37,7 @@ import requests
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
 
-VERSION = "1.0.10"
+VERSION = "1.0.11"
 APP_NAME = "RetixHub"          # служебное имя: папки, задачи, мьютекс
 APP_TITLE = "Retix Hub"        # то, что видит пользователь
 TUNNEL = "retixhub"
@@ -56,10 +56,22 @@ WG_EXE = WG_DIR / "wg.exe"
 SERVICE = f"WireGuardTunnel${TUNNEL}"
 FW_RULE = "RetixHub SMB"          # входящие общие папки (SMB) и Radmin Server (4899) из подсети компании
 FW_RULE_PING = "RetixHub Ping"    # входящий ping из подсети компании
+FW_RULE_DIRECT = "RetixHub Direct"  # входящие пакеты WireGuard от ПК своей локальной сети (прямой путь)
 
 CHECK_EVERY = 8          # сек — основной цикл
 HANDSHAKE_OK = 180       # сек — handshake свежее этого = туннель жив
 HEARTBEAT_EVERY = 60
+
+# Прямой путь по локальной сети (компания с «любым трафиком»): см. DirectPaths
+DIRECT_KEEPALIVE = 10      # сек — keepalive соседу по локальной сети (в локалке трафик бесплатный)
+DIRECT_PROBE_SECONDS = 15  # сек — столько ждём handshake по одному адресу соседа
+DIRECT_RX_TIMEOUT = 35     # сек — от прямого соседа нет пакетов (3 keepalive) — путь потерян
+DIRECT_RETRY_FAILED = 300  # сек — ни один адрес не ответил: снова пробуем не раньше
+DIRECT_RETRY_LOST = 60     # сек — прямой путь пропал: снова пробуем не раньше
+DIRECT_TICK = 1            # сек — пока идёт проверка пути, handshake смотрим чаще основного цикла
+LAN_CHECK_EVERY = 60       # сек — как часто перечитывать адреса своей локальной сети
+DIRECT_CACHE_DAYS = 3      # сохранённые соседи действуют без сервера столько дней после его последнего ответа
+DIRECT_CACHE_REFRESH = 3600  # сек — как часто переписывать неизменившийся список соседей на диск
 
 UPDATE_FIRST = 60        # сек после запуска — первая проверка новой версии
 UPDATE_EVERY = 600       # сек — дальше каждые 10 минут
@@ -157,10 +169,10 @@ class State:
 
     FIELDS = {"server_url": "", "company_login": "", "company_name": "", "device_name": "", "token": "",
               "private_key": "", "join_password": "", "last_conf_hash": "", "fw_subnet": "",
-              "autostart_done": False, "enabled": True, "auto_update": True, "update_attempt": {},
+              "fw_direct": 0, "direct_cache": {}, "autostart_done": False, "enabled": True, "auto_update": True, "update_attempt": {},
               "update_state": "none", "update_pubkey": "", "update_pins": {}, "profiles": {}}
     PROFILE_FIELDS = ("server_url", "company_login", "company_name", "device_name", "token", "private_key",
-                      "join_password")
+                      "join_password", "direct_cache")
 
     def __init__(self, path: Path | None = None):
         self.path = path or STATE_FILE
@@ -357,8 +369,10 @@ class Api:
     def peers(self):
         return self._req("GET", "/api/peers")
 
-    def heartbeat(self):
-        return self._req("POST", "/api/heartbeat", json={"client_version": VERSION})
+    def heartbeat(self, lan: list | None = None, wg_port: int = 0, direct: list | None = None):
+        return self._req("POST", "/api/heartbeat", json={"client_version": VERSION, "lan": list(lan or []),
+                                                         "wg_port": int(wg_port or 0),
+                                                         "direct": list(direct or [])})
 
     def send_message(self, to: int, text: str):
         return self._req("POST", "/api/messages", json={"to": to, "text": text})
@@ -417,6 +431,69 @@ def check_cfg(cfg: dict) -> None:
             raise ValueError(key)
     if cfg.get("share_ports") and not PORTS_RE.match(str(cfg["share_ports"])):
         raise ValueError("порты")
+
+
+LAN_ENDPOINT_RE = re.compile(r"^(\d{1,3}(?:\.\d{1,3}){3}):(\d{1,5})$")
+
+
+def lan_ip_ok(ip: ipaddress.IPv4Address) -> bool:
+    """Адрес из локальной сети: частный, не 127.*, не 169.254.*, не сеть Retix Hub."""
+    return (ip.is_private and not ip.is_loopback and not ip.is_link_local and not ip.is_multicast
+            and not ip.is_unspecified and ip not in VPN_NET)
+
+
+def lan_endpoint_ok(value) -> bool:
+    m = LAN_ENDPOINT_RE.match(str(value))
+    try:
+        return bool(m) and lan_ip_ok(_ipv4(m.group(1))) and 0 < int(m.group(2)) < 65536
+    except ValueError:
+        return False
+
+
+def direct_neighbors(cfg: dict, own_key: str = "") -> list[dict]:
+    """Соседи по локальной сети из ответа сервера — только то, что можно безопасно отдать WireGuard:
+    ключ, IP соседа в подсети компании (не свой и не сервера) и его частные адреса в локальной сети."""
+    if not cfg.get("direct_enabled"):
+        return []
+    out, seen = [], {own_key, str(cfg.get("server_public_key"))}
+    for n in cfg.get("direct") or []:
+        try:
+            key, ip = str(n["public_key"]), str(n["ip"])
+            if not KEY_RE.match(key) or key in seen:
+                raise ValueError(f"ключ {key[:8]}…")
+            if not peer_ip_ok(ip, cfg["subnet"]) or ip in (cfg["ip"], cfg["server_ip"]):
+                raise ValueError(f"адрес {ip!r}")
+            endpoints = [str(e) for e in n.get("endpoints") or [] if lan_endpoint_ok(e)][:4]
+            if not endpoints:
+                raise ValueError(f"нет адресов в локальной сети у {ip}")
+            out.append({"id": int(n["id"]), "public_key": key, "ip": ip, "endpoints": endpoints})
+            seen.add(key)
+        except (KeyError, TypeError, ValueError, AttributeError) as e:
+            log.warning("сосед по локальной сети отклонён: %s", e)
+    return out
+
+
+def local_addresses() -> list[str]:
+    """Свои IPv4 в локальных сетях: ["192.168.1.15/24", …] (без туннеля, 127.*, 169.254.*)."""
+    if WINDOWS:
+        ps = ("Get-NetIPAddress -AddressFamily IPv4 -AddressState Preferred -ErrorAction SilentlyContinue | "
+              "ForEach-Object { $_.IPAddress + '/' + $_.PrefixLength }")
+        code, out = run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps], timeout=20)
+    else:
+        code, out = run(["ip", "-4", "-o", "addr", "show"], timeout=10)
+        out = "\n".join(w[i + 1] for w in (line.split() for line in out.splitlines())
+                        for i, x in enumerate(w[:-1]) if x == "inet")
+    if code != 0:
+        return []
+    found = []
+    for line in out.split():
+        try:
+            iface = ipaddress.IPv4Interface(line.strip())
+        except ValueError:
+            continue
+        if lan_ip_ok(iface.ip) and iface.network.prefixlen >= 8 and str(iface) not in found:
+            found.append(str(iface))
+    return found[:16]
 
 
 def peer_ip_ok(ip, subnet: str) -> bool:
@@ -488,14 +565,196 @@ class Tunnel:
         return False
 
     @staticmethod
-    def last_handshake() -> int:
+    def last_handshake(key: str = "") -> int:
+        """Последний handshake с пиром key (сервер). Без key — самый свежий из всех."""
         rc, out = run([str(WG_EXE), "show", TUNNEL, "latest-handshakes"], timeout=10)
         if rc != 0:
             return 0
+        times = {}
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) == 2 and parts[1].isdigit():
+                times[parts[0]] = int(parts[1])
+        return times.get(key, 0) if key else max(times.values(), default=0)
+
+    @staticmethod
+    def dump() -> dict | None:
+        """Живое состояние туннеля: порт и пиры (wg show dump). None — туннеля нет."""
+        rc, out = run([str(WG_EXE), "show", TUNNEL, "dump"], timeout=10)
+        return parse_wg_dump(out) if rc == 0 else None
+
+    @staticmethod
+    def set_peer(key: str, endpoint: str = "", allowed_ips: str | None = None, keepalive: int | None = None) -> bool:
+        """Добавить/изменить пира на лету (wg set): без переустановки туннеля и без разрыва связи."""
+        args = [str(WG_EXE), "set", TUNNEL, "peer", key]
+        if endpoint:
+            args += ["endpoint", endpoint]
+        if allowed_ips is not None:
+            args += ["allowed-ips", allowed_ips]
+        if keepalive is not None:
+            args += ["persistent-keepalive", str(keepalive)]
+        rc, out = run(args, timeout=10)
+        if rc != 0:
+            log.warning("wg set: %s", out.strip())
+        return rc == 0
+
+    @staticmethod
+    def remove_peer(key: str) -> None:
+        run([str(WG_EXE), "set", TUNNEL, "peer", key, "remove"], timeout=10)
+
+    @staticmethod
+    def saved_conf() -> str:
+        """Конфиг последнего туннеля (лежит в DATA_DIR — только SYSTEM и администраторы)."""
         try:
-            return max(int(line.split()[1]) for line in out.splitlines() if line.strip())
-        except (ValueError, IndexError):
-            return 0
+            return CONF_FILE.read_text("utf-8") if CONF_FILE.exists() else ""
+        except OSError:
+            return ""
+
+    @staticmethod
+    def set_listen_port(port: int) -> bool:
+        rc, out = run([str(WG_EXE), "set", TUNNEL, "listen-port", str(port)], timeout=10)
+        if rc != 0:
+            log.warning("wg set listen-port: %s", out.strip())
+        return rc == 0
+
+
+def parse_wg_dump(out: str) -> dict:
+    """wg show <tunnel> dump: первая строка — интерфейс (…, listen-port), дальше по строке на пира."""
+    lines = [line for line in out.splitlines() if line.strip()]
+    port, peers, own = 0, {}, ""
+    if lines:
+        head = lines[0].split("\t")
+        port = int(head[2]) if len(head) >= 3 and head[2].isdigit() else 0
+        own = head[1] if len(head) >= 2 else ""
+    for line in lines[1:]:
+        p = line.split("\t")
+        if len(p) < 7:
+            continue
+        try:
+            peers[p[0]] = {"endpoint": "" if p[2] == "(none)" else p[2],
+                           "allowed_ips": "" if p[3] == "(none)" else p[3],
+                           "handshake": int(p[4] or 0), "rx": int(p[5] or 0)}
+        except ValueError:
+            continue
+    return {"listen_port": port, "peers": peers, "public_key": own}
+
+
+class DirectPaths:
+    """Прямой путь к ПК своей локальной сети — мимо сервера, как в Radmin VPN.
+
+    Сервер сообщает соседей (ПК компании за тем же роутером) и их адреса в локальной сети. Сосед
+    добавляется в WireGuard без AllowedIPs: трафик к нему по-прежнему идёт через сервер, а WireGuard
+    тем временем делает handshake по локальному адресу. Прошёл — у соседа AllowedIPs = его IP/32: это
+    точнее подсети компании у сервера, и пакеты к соседу идут напрямую (маршрут Windows не меняется —
+    /32 и так внутри подсети туннеля). Handshake не прошёл ни по одному адресу, или от соседа перестали
+    приходить пакеты, или сервер его больше не называет — сосед удаляется, трафик снова идёт через сервер.
+    Пира сервера этот класс не трогает никогда."""
+
+    def __init__(self, tunnel):
+        self.tunnel = tunnel
+        self.server_key = ""
+        self.wanted: dict[str, dict] = {}                  # ключ -> сосед от сервера
+        self.probes: dict[str, dict] = {}                  # ключ -> {"started", "idx"}: идёт проверка
+        self.rx: dict[str, tuple[int, float]] = {}         # ключ -> (принято байт, когда выросло)
+        self.backoff: dict[str, tuple[float, tuple]] = {}  # ключ -> (до какого времени не пробовать, адреса)
+        self.active: dict[str, int] = {}                   # ключ -> id соседа: связь напрямую
+        self.listen_port = 0
+        self.own_port = 0                                  # порт, который задали сами (set_listen_port)
+        self.port_done = False                             # порт туннеля уже приведён к сохранённому
+        self.endpoints: dict[str, str] = {}                # ключ -> адрес, по которому сосед отвечает сейчас
+
+    def probing(self) -> bool:
+        return bool(self.probes)
+
+    def active_ids(self) -> list[int]:
+        return sorted(self.active.values())
+
+    def reset(self) -> None:
+        """Туннель снят или переустановлен — прямых пиров в нём больше нет."""
+        self.wanted.clear(); self.probes.clear(); self.rx.clear(); self.active.clear(); self.endpoints.clear()
+        self.listen_port = self.own_port = 0
+        self.port_done = False
+
+    def sync(self, neighbors: list[dict], server_key: str) -> None:
+        self.server_key = server_key
+        self.wanted = {n["public_key"]: n for n in neighbors}
+        self.poll()
+
+    def poll(self) -> None:
+        state = self.tunnel.dump()
+        if state is None:
+            return
+        self.listen_port = state["listen_port"] or self.own_port
+        # свои прямые пиры — без AllowedIPs или с одним /32; пир сервера (подсеть компании) не трогаем никогда,
+        # даже если ключ сервера здесь неизвестен или устарел (сохранённые соседи без связи с сервером)
+        live = {k: v for k, v in state["peers"].items()
+                if k != self.server_key and ("," not in v["allowed_ips"])
+                and (not v["allowed_ips"] or v["allowed_ips"].endswith("/32"))}
+        protected = state["peers"].keys() - live.keys()     # пир сервера (по ключу или по его AllowedIPs)
+        now = time.time()
+        for key in live.keys() - self.wanted.keys():
+            self._drop(key, "больше не сосед по локальной сети")
+        for key, n in self.wanted.items():
+            if key in protected:
+                log.warning("сосед %s с ключом пира сервера — пропускаем", n["ip"])
+                continue
+            self._check(key, n, live.get(key), now)
+
+    def _check(self, key: str, n: dict, peer: dict | None, now: float) -> None:
+        endpoints = tuple(n["endpoints"])
+        until, failed = self.backoff.get(key, (0.0, ()))
+        if now < until and failed == endpoints:
+            if peer:
+                self._drop(key, "ждём перед новой попыткой")
+            return
+        allowed = f"{n['ip']}/32"
+        if peer is None:
+            log.info("прямой путь к %s: проверяем %s", n["ip"], endpoints[0])
+            self.active.pop(key, None)
+            self.rx.pop(key, None)
+            self.probes[key] = {"started": now, "idx": 0}
+            self.tunnel.set_peer(key, endpoint=endpoints[0], keepalive=DIRECT_KEEPALIVE)
+            return
+        last = self.rx.get(key)
+        if last is None or peer["rx"] != last[0]:
+            self.rx[key] = last = (peer["rx"], now)
+        if peer["allowed_ips"]:                               # уже напрямую
+            if peer["allowed_ips"] != allowed:
+                self.tunnel.set_peer(key, allowed_ips=allowed)
+            if now - last[1] > DIRECT_RX_TIMEOUT:
+                self._fail(key, endpoints, DIRECT_RETRY_LOST, f"от {n['ip']} нет пакетов — снова через сервер")
+            else:
+                self.active[key] = n["id"]
+                if peer["endpoint"]:
+                    self.endpoints[key] = peer["endpoint"]
+            return
+        probe = self.probes.setdefault(key, {"started": now, "idx": 0})
+        if peer["handshake"] and now - peer["handshake"] < HANDSHAKE_OK:
+            self.tunnel.set_peer(key, allowed_ips=allowed)
+            self.probes.pop(key, None)
+            self.active[key] = n["id"]
+            self.rx[key] = (peer["rx"], now)
+            self.backoff.pop(key, None)
+            log.info("прямой путь к %s по локальной сети (%s)", n["ip"], peer["endpoint"] or endpoints[0])
+        elif now - probe["started"] > DIRECT_PROBE_SECONDS:
+            probe["idx"] += 1
+            if probe["idx"] >= len(endpoints):
+                self._fail(key, endpoints, DIRECT_RETRY_FAILED, f"{n['ip']} не ответил по локальной сети")
+            else:
+                probe["started"] = now
+                self.tunnel.set_peer(key, endpoint=endpoints[probe["idx"]])
+
+    def _drop(self, key: str, why: str) -> None:
+        if key in self.active:
+            log.info("прямой путь закрыт: %s", why)
+        self.tunnel.remove_peer(key)
+        for d in (self.active, self.probes, self.rx, self.endpoints):
+            d.pop(key, None)
+
+    def _fail(self, key: str, endpoints: tuple, delay: int, why: str) -> None:
+        log.info("прямой путь: %s", why)
+        self._drop(key, why)
+        self.backoff[key] = (time.time() + delay, endpoints)
 
 
 def install_wireguard_if_needed() -> bool:
@@ -523,6 +782,15 @@ def ensure_firewall(subnet: str | None, ports: str = "445") -> None:
         run(["netsh", "advfirewall", "firewall", "add", "rule", f"name={FW_RULE_PING}", "dir=in", "action=allow",
              "protocol=icmpv4:8,any", f"remoteip={subnet}", "profile=any"])
         log.info("firewall: общие папки (%s) и ping разрешены из %s", ports, subnet)
+
+
+def ensure_direct_firewall(port: int) -> None:
+    """Входящие пакеты WireGuard из своей локальной сети на порт туннеля (прямой путь между ПК)."""
+    run(["netsh", "advfirewall", "firewall", "delete", "rule", f"name={FW_RULE_DIRECT}"])
+    if port:
+        run(["netsh", "advfirewall", "firewall", "add", "rule", f"name={FW_RULE_DIRECT}", "dir=in", "action=allow",
+             "protocol=UDP", f"localport={port}", "remoteip=localsubnet", "profile=any"])
+        log.info("firewall: прямой путь — UDP %s из локальной сети", port)
 
 
 RADMIN_PORT = 4899
@@ -901,6 +1169,7 @@ class Status:
     CONNECTING = "connecting"
     ONLINE = "online"
     SERVER_DOWN = "server_down"
+    LAN_ONLY = "lan_only"  # сервер недоступен, но ПК офиса связаны напрямую (сохранённые соседи)
     PENDING = "pending"
     BLOCKED = "blocked"
     ERROR = "error"
@@ -923,6 +1192,11 @@ class Worker(threading.Thread):
         self.last_heartbeat = 0.0
         self.cfg: dict | None = None
         self.paused = False  # после «Выйти из сети»
+        self.direct = DirectPaths(self.tunnel)   # прямые пути к ПК своей локальной сети
+        self.lan: list[str] = []                 # свои адреса в локальной сети (для соседей)
+        self.lan_checked = 0.0
+        self.reported = None                     # что последний раз сообщили серверу о локальной сети
+        self.last_peers: list[dict] = []         # список компьютеров с последнего ответа сервера
         # шаг цикла и смена компании (вход, переключение, выход) не идут одновременно
         self.op_lock = threading.RLock()
 
@@ -930,8 +1204,8 @@ class Worker(threading.Thread):
     def emit(self, kind: str, **data):
         self.events.put((kind, data))
 
-    def status(self, status: str, text: str = ""):
-        self.emit("status", status=status, text=text, cfg=self.cfg)
+    def status(self, status: str, text: str = "", cfg: dict | None = None):
+        self.emit("status", status=status, text=text, cfg=cfg or self.cfg)
 
     # --- команды из GUI (вызываются в отдельном потоке)
     def login(self, server: str, company: str, password: str, device: str, remember: bool):
@@ -945,7 +1219,8 @@ class Worker(threading.Thread):
             if target != self.state.current_key() and self.state.get("company_login"):
                 self.state.stash_current()
                 if not self.state.activate(target):   # уже в списке — тот же ключ, тот же ПК на сервере
-                    self.state.set(token="", private_key="", join_password="", company_name="", last_conf_hash="")
+                    self.state.set(token="", private_key="", join_password="", company_name="", last_conf_hash="",
+                                   direct_cache={})
             self.state.set(server_url=server, company_login=company, device_name=device.strip())
             try:
                 self._register(password)
@@ -994,6 +1269,13 @@ class Worker(threading.Thread):
         self.last_install = 0.0
         self.reinstall_backoff = 60
         self.last_heartbeat = 0.0
+        self.direct.reset()
+        self.lan, self.lan_checked, self.reported = [], 0.0, None
+        self.last_peers = []
+
+    def _uninstall(self):
+        self.tunnel.uninstall()
+        self.direct.reset()
 
     def logout(self):
         with self.op_lock:
@@ -1006,13 +1288,16 @@ class Worker(threading.Thread):
                 self.api.logout()   # токен больше не действует, ПК снят с сервера WireGuard
             except (ApiError, ServerUnreachable):
                 pass
-        self.state.set(token="", join_password="", last_conf_hash="")
+        self.state.set(token="", join_password="", last_conf_hash="", direct_cache={})
         try:
-            self.tunnel.uninstall()
+            self._uninstall()
         finally:
             if self.state.get("fw_subnet"):
                 ensure_firewall(None)
                 self.state.set(fw_subnet="")
+            if self.state.get("fw_direct"):
+                ensure_direct_firewall(0)
+                self.state.set(fw_direct=0)
         self.cfg = None
         self.emit("peers", peers=[])
         self.status(Status.NEED_LOGIN)
@@ -1060,8 +1345,178 @@ class Worker(threading.Thread):
             except Exception as e:  # noqa: BLE001
                 log.exception("ошибка цикла")
                 self.status(Status.ERROR, str(e))
-            self.wake.wait(CHECK_EVERY)
+            self._wait(time.time() + CHECK_EVERY)
             self.wake.clear()
+
+    def _wait(self, deadline: float):
+        """Пауза до следующего шага. Пока проверяется прямой путь к соседу — раз в секунду смотрим
+        handshake (только wg show, без запросов к серверу): обе стороны включают прямой путь почти
+        одновременно, и соседу не приходится ждать до следующего шага."""
+        while not self.stop_flag:
+            left = deadline - time.time()
+            if left <= 0:
+                return
+            fast = self.direct.probing() and not self.paused
+            if self.wake.wait(min(left, DIRECT_TICK) if fast else left):
+                return
+            if fast:
+                try:
+                    with self.op_lock:
+                        self.direct.poll()
+                except Exception:  # noqa: BLE001
+                    log.exception("прямой путь")
+
+    def _direct_step(self, now: float):
+        enabled = bool(self.cfg.get("direct_enabled"))
+        if enabled and now - self.lan_checked > LAN_CHECK_EVERY:
+            self.lan, self.lan_checked = local_addresses(), now
+        elif not enabled:
+            self.lan = []
+        _, pub = self.state.keypair()
+        try:
+            self.direct.sync(direct_neighbors(self.cfg, pub) if enabled else [], self.cfg["server_public_key"])
+        except Exception:  # noqa: BLE001
+            log.exception("прямой путь")
+        if enabled and self.lan:
+            self._ensure_port()
+        want = self.direct.listen_port if enabled and self.lan else 0
+        if want != (self.state.get("fw_direct") or 0):
+            ensure_direct_firewall(want)
+            self.state.set(fw_direct=want)
+
+    # --- сохранённые соседи: прямой путь без сервера (нет интернета, перезагрузка без интернета)
+    # После каждого ответа сервера в state.json (папка только для SYSTEM и администраторов) записываются
+    # соседи, с которыми прямой путь уже работал и которых сервер называет сейчас, и порт своего туннеля.
+    # Сервер недоступен — прямые пути поднимаются по этому списку (с той же проверкой handshake).
+    # Сервер ответил — его список заменяет сохранённый: заблокированный/удалённый ПК исчезает сразу.
+
+    def _direct_cache(self) -> dict:
+        c = self.state.get("direct_cache")
+        return c if isinstance(c, dict) else {}
+
+    def _ensure_port(self):
+        """Порт туннеля — тот же, что раньше: соседи знают его по сохранённому списку, даже если оба ПК
+        перезагрузились без интернета. Нет сохранённого или он занят — свой случайный (если WireGuard не
+        сообщил порт сам). Сервер узнает новый адрес ПК по первому же пакету (роуминг WireGuard)."""
+        if self.direct.port_done:
+            return
+        saved = self._direct_cache().get("my_port")
+        saved = saved if isinstance(saved, int) and 1024 <= saved < 65536 else 0
+        if saved and self.direct.listen_port != saved and self.tunnel.set_listen_port(saved):
+            self.direct.listen_port = self.direct.own_port = saved
+        elif not self.direct.listen_port:
+            port = 49152 + int.from_bytes(os.urandom(2), "big") % 16000
+            if self.tunnel.set_listen_port(port):
+                self.direct.listen_port = self.direct.own_port = port
+        self.direct.port_done = bool(self.direct.listen_port)
+
+    def _save_direct_cache(self, now: float):
+        cfg = self.cfg or {}
+        old = self._direct_cache()
+        if not cfg.get("direct_enabled"):
+            if old:
+                self.state.set(direct_cache={})
+            return
+        _, pub = self.state.keypair()
+        prev = {n.get("public_key"): n for n in old.get("neighbors") or [] if isinstance(n, dict)}
+        names = {p.get("id"): p for p in self.last_peers}
+        neighbors = []
+        for n in direct_neighbors(cfg, pub):                 # только те, кого сервер называет сейчас
+            key, before = n["public_key"], prev.get(n["public_key"]) or {}
+            if key in self.direct.active:
+                verified = now
+                first = [e for e in [self.direct.endpoints.get(key, "")] if lan_endpoint_ok(e)]
+            elif before:
+                verified = before.get("verified_at") or 0
+                first = [e for e in (before.get("endpoints") or [])[:1] if lan_endpoint_ok(e)]
+            else:
+                continue                                     # прямой путь с ним ещё не работал
+            p = names.get(n["id"]) or before
+            neighbors.append({"id": n["id"], "public_key": key, "ip": n["ip"],
+                              "endpoints": list(dict.fromkeys(first + n["endpoints"]))[:4],
+                              "verified_at": int(verified), "name": str(p.get("name") or "")[:64],
+                              "hostname": str(p.get("hostname") or "")[:64]})
+        new = {"cfg": {"device_id": cfg.get("device_id"), "device_name": str(cfg.get("device_name") or "")[:64],
+                       "company": str(cfg.get("company") or "")[:100], "ip": cfg["ip"], "subnet": cfg["subnet"],
+                       "server_ip": cfg["server_ip"], "server_public_key": cfg["server_public_key"],
+                       "show_peers": cfg.get("show_peers") is not False, "direct_enabled": True},
+               "my_port": self.direct.listen_port or old.get("my_port") or 0, "neighbors": neighbors}
+
+        def same(a, b):   # без отметок времени: «сосед на связи» не повод писать на диск каждые 8 с
+            strip = lambda c: dict(c, saved_at=0, neighbors=[dict(x, verified_at=0) for x in c.get("neighbors") or []])
+            return strip(a) == strip(b)
+        if not same(new, old) or now - (old.get("saved_at") or 0) > DIRECT_CACHE_REFRESH:
+            self.state.set(direct_cache=dict(new, saved_at=int(now)))
+
+    def _offline_direct(self, now: float) -> bool:
+        """Сервер недоступен: прямые пути по сохранённым соседям. True — хотя бы с одним ПК связь напрямую."""
+        cache = self._direct_cache()
+        cfg = cache.get("cfg") if isinstance(cache.get("cfg"), dict) else {}
+        ttl = DIRECT_CACHE_DAYS * 86400
+        fresh = now - (cache.get("saved_at") or 0) < ttl
+        try:
+            if not (fresh and cfg.get("direct_enabled") and KEY_RE.match(str(cfg.get("server_public_key")))
+                    and peer_ip_ok(cfg.get("ip"), cfg.get("subnet"))):
+                raise ValueError("нет сохранённых соседей")
+            if not self._offline_tunnel():
+                return False
+            _, pub = self.state.keypair()
+            saved = [n for n in cache.get("neighbors") or []
+                     if isinstance(n, dict) and now - (n.get("verified_at") or 0) < ttl]
+            neighbors = direct_neighbors(dict(cfg, direct=saved), pub)
+            server_key = cfg["server_public_key"]
+        except (ValueError, TypeError, KeyError):
+            if not self.direct.wanted:
+                return False
+            neighbors, server_key = [], self.direct.server_key   # срок вышел — прямые пути закрываем
+        try:
+            self.direct.sync(neighbors, server_key)
+            if neighbors:
+                self._ensure_port()
+        except Exception:  # noqa: BLE001
+            log.exception("прямой путь без сервера")
+        return bool(self.direct.active_ids())
+
+    def _offline_tunnel(self) -> bool:
+        """Без сервера: туннель этого ПК и этой компании работает. Служба остановлена — запускаем; туннель
+        снят (кнопка OFF, потом ON) — ставим из последнего конфига, если он этой компании (её ключ)."""
+        priv, pub = self.state.keypair()
+        svc = self.tunnel.service_state()
+        if svc == "missing":
+            conf = self.tunnel.saved_conf()
+            if not conf or f"PrivateKey = {priv}\n" not in conf:
+                return False
+            log.info("сервер недоступен — туннель из последнего конфига, для локальной сети")
+            self.tunnel.install(conf)
+            self.direct.reset()
+            self.state.set(last_conf_hash=hashlib.sha256(conf.encode()).hexdigest())
+            self.last_install = time.time()
+        elif svc == "stopped":
+            self.tunnel.start()
+        state = self.tunnel.dump()
+        # туннель другой компании (переключились без сервера) — её соседей в него не добавляем
+        return bool(state) and state.get("public_key") == pub
+
+    def _offline_view(self) -> dict:
+        """Что показать в окне без ответа сервера (после перезагрузки без интернета)."""
+        cfg = self._direct_cache().get("cfg") or {}
+        return {"device_name": cfg.get("device_name") or self.state.get("device_name"), "ip": cfg.get("ip"),
+                "company": cfg.get("company") or self.state.get("company_name"),
+                "show_peers": cfg.get("show_peers", True)}
+
+    def _offline_peers(self) -> list[dict]:
+        """Список компьютеров без сервера: в сети — те, с кем связь напрямую."""
+        cache = self._direct_cache()
+        cfg = cache.get("cfg") or {}
+        base = self.last_peers or [
+            {"id": n.get("id"), "name": n.get("name") or n.get("ip"), "hostname": n.get("hostname") or "",
+             "ip": n.get("ip"), "is_me": False, "is_share_host": False}
+            for n in cache.get("neighbors") or [] if isinstance(n, dict) and peer_ip_ok(n.get("ip"), cfg.get("subnet"))]
+        if cfg.get("show_peers") is False:
+            base = [p for p in base if p.get("is_me")]
+        direct = set(self.direct.active_ids())
+        return [dict(p, online=bool(p.get("is_me")) or p.get("id") in direct, direct=p.get("id") in direct)
+                for p in base]
 
     def step(self):
         if not self.tunnel.installed() and not install_wireguard_if_needed():
@@ -1071,7 +1526,7 @@ class Worker(threading.Thread):
         # 0. выключено кнопкой
         if self.state.get("enabled") is False:
             if self.tunnel.service_state() != "missing":
-                self.tunnel.uninstall()
+                self._uninstall()
             self.emit("peers", peers=[])
             self.status(Status.OFF, "Отключено. Нажмите кнопку, чтобы подключиться.")
             return
@@ -1101,7 +1556,13 @@ class Worker(threading.Thread):
         except ServerUnreachable:
             # туннель НЕ удаляем: как только сервер вернётся, WireGuard сам восстановит связь
             self.server_was_down = True
-            self.status(Status.SERVER_DOWN, "Сервер недоступен. Как появится — подключимся.")
+            if self._offline_direct(time.time()):
+                n = len(self.direct.active_ids())
+                self.status(Status.LAN_ONLY, f"Нет связи с сервером — компьютеры офиса доступны напрямую ({n})",
+                            cfg=self.cfg or self._offline_view())
+                self.emit("peers", peers=self._offline_peers())
+            else:
+                self.status(Status.SERVER_DOWN, "Сервер недоступен. Как появится — подключимся.")
             return
         except ApiError as e:
             if e.status == 401:  # устройство удалено или токены сброшены -> регистрируемся заново
@@ -1111,7 +1572,8 @@ class Worker(threading.Thread):
                 return
             if e.status == 403:
                 if self.tunnel.service_state() != "missing":
-                    self.tunnel.uninstall()
+                    self._uninstall()
+                self.state.set(direct_cache={})
                 self.status(Status.BLOCKED, e.detail)
                 return
             raise
@@ -1128,10 +1590,17 @@ class Worker(threading.Thread):
 
         if self.cfg["status"] == "blocked":
             if self.tunnel.service_state() != "missing":
-                self.tunnel.uninstall()
+                self._uninstall()
+            self.state.set(direct_cache={})
             self.status(Status.BLOCKED, "Устройство заблокировано администратором")
             return
         if self.cfg["status"] == "pending":
+            # ПК снова ждёт одобрения (например, вход скопирован на другой ПК): прямых путей у него быть не должно
+            self.state.set(direct_cache={})
+            try:
+                self.direct.sync([], self.cfg["server_public_key"])
+            except Exception:  # noqa: BLE001
+                log.exception("прямой путь")
             self.status(Status.PENDING, "Ожидает одобрения администратора компании")
             return
 
@@ -1141,7 +1610,7 @@ class Worker(threading.Thread):
         conf_hash = hashlib.sha256(conf.encode()).hexdigest()
         svc = self.tunnel.service_state()
         now = time.time()
-        hs = self.tunnel.last_handshake() if svc == "running" else 0
+        hs = self.tunnel.last_handshake(self.cfg["server_public_key"]) if svc == "running" else 0
         hs_ok = bool(hs) and now - hs < HANDSHAKE_OK
         # «живой» = свежий handshake И реально проходит ping до сервера внутри VPN.
         # Одного handshake мало: после перезагрузки сервера он у клиента ещё «свежий», а сессии уже нет.
@@ -1161,6 +1630,7 @@ class Worker(threading.Thread):
             log.info("переустановка туннеля: %s", reason)
             self.status(Status.CONNECTING, f"Подключение… ({reason})")
             self.tunnel.install(conf)
+            self.direct.reset()    # новый туннель — без прямых пиров, проверим их заново
             self.state.set(last_conf_hash=conf_hash)
             if reason == "нет связи с сервером":
                 self.reinstall_backoff = min(self.reinstall_backoff * 2, 600)
@@ -1182,15 +1652,22 @@ class Worker(threading.Thread):
             ensure_firewall(self.cfg["subnet"], ports)
             self.state.set(fw_subnet=want_fw)
 
-        # 5. список компьютеров компании
+        # 5. прямые пути к ПК своей локальной сети (компания с «любым трафиком между ПК»)
+        self._direct_step(now)
+
+        # 6. список компьютеров компании
         try:
             peers = self.api.peers()["peers"]
         except (ApiError, ServerUnreachable):
             peers = []
-        peers = [p for p in peers if peer_ip_ok(p.get("ip"), self.cfg["subnet"])]
+        direct = set(self.direct.active_ids())
+        peers = [dict(p, direct=p.get("id") in direct) for p in peers if peer_ip_ok(p.get("ip"), self.cfg["subnet"])]
         self.emit("peers", peers=peers)
+        if peers:
+            self.last_peers = peers
+        self._save_direct_cache(now)
 
-        # 6. новые сообщения от других ПК
+        # 7. новые сообщения от других ПК
         try:
             msgs = self.api.messages()["messages"]
             if msgs:
@@ -1199,10 +1676,13 @@ class Worker(threading.Thread):
         except (ApiError, ServerUnreachable):
             pass
 
-        if now - self.last_heartbeat > HEARTBEAT_EVERY:
+        # адреса локальной сети, порт туннеля и прямые пути изменились — сообщаем серверу сразу
+        port = self.direct.listen_port if self.lan else 0
+        report = (tuple(self.lan), port, tuple(self.direct.active_ids()))
+        if now - self.last_heartbeat > HEARTBEAT_EVERY or report != self.reported:
             try:
-                self.api.heartbeat()
-                self.last_heartbeat = now
+                self.api.heartbeat(self.lan, port, self.direct.active_ids())
+                self.last_heartbeat, self.reported = now, report
             except (ApiError, ServerUnreachable):
                 pass
 
@@ -1332,6 +1812,7 @@ STATUS_VIEW = {
     Status.ONLINE: ("В сети", C["green"]),
     Status.CONNECTING: ("Подключение…", C["orange"]),
     Status.SERVER_DOWN: ("Сервер недоступен", C["red"]),
+    Status.LAN_ONLY: ("Только локальная сеть", C["orange"]),
     Status.PENDING: ("Ждёт одобрения", C["orange"]),
     Status.BLOCKED: ("Заблокировано", C["red"]),
     Status.NEED_LOGIN: ("Не подключено", C["off"]),
@@ -1892,7 +2373,11 @@ class App(tk.Tk):
                 self._lost_job = None
                 if self.status_now != Status.ONLINE and self.net_up:
                     self.net_up = False
-                    self.tray.notify("Сеть недоступна", f"Нет связи с сетью «{company}». Переподключаемся…")
+                    if self.status_now == Status.LAN_ONLY:
+                        self.tray.notify("Нет связи с сервером",
+                                         f"Компьютеры офиса в сети «{company}» доступны напрямую.")
+                    else:
+                        self.tray.notify("Сеть недоступна", f"Нет связи с сетью «{company}». Переподключаемся…")
             self._lost_job = self.after(0 if status == Status.BLOCKED else self.LOST_AFTER_MS, lost)
 
     def _on_status(self, status, text, cfg):
@@ -1949,7 +2434,8 @@ class App(tk.Tk):
             online = p["online"] and self.status_now not in (Status.SERVER_DOWN, Status.BLOCKED, Status.OFF)
             self.tree.insert("", "end", iid=str(p["id"]), text=" " + p["name"],
                              image=self.img_on if online else self.img_off,
-                             values=(p["ip"],), tags=() if online else ("off",))
+                             values=(p["ip"] + ("  ⇄ LAN" if online and p.get("direct") else ""),),
+                             tags=() if online else ("off",))
         if sel and self.tree.exists(sel[0]):
             self.tree.selection_set(sel[0])
         online = sum(1 for p in others if p["online"])
@@ -2248,6 +2734,7 @@ class App(tk.Tk):
             f"Компьютер:  {p.get('hostname') or '—'}",
             f"IP-адрес:  {p['ip']}",
             f"Статус:  {'в сети' if p['online'] else 'не в сети'}",
+            f"Связь:  {'напрямую по локальной сети' if p.get('direct') else 'через сервер Retix Hub'}",
             f"Последняя связь:  {seen}",
             f"Версия Retix Hub:  {p.get('client_version') or '—'}",
             "",
@@ -2495,13 +2982,14 @@ def uninstall_cleanup() -> int:
     """retixhub.exe --uninstall: вызывает деинсталлятор. Снимает туннель, правила firewall и автозапуск.
     WireGuard и %ProgramData%\\RetixHub (ключ и вход) остаются — при повторной установке
     ПК вернётся в сеть сам."""
-    for step in (Tunnel.uninstall, lambda: ensure_firewall(None), remove_autostart):
+    for step in (Tunnel.uninstall, lambda: ensure_firewall(None), lambda: ensure_direct_firewall(0),
+                 remove_autostart):
         try:
             step()
         except Exception:  # noqa: BLE001
             log.exception("uninstall")
     state = State()
-    state.set(last_conf_hash="", fw_subnet="", autostart_done=False)
+    state.set(last_conf_hash="", fw_subnet="", fw_direct=0, autostart_done=False)
     return 0
 
 
