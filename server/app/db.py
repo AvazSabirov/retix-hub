@@ -50,6 +50,7 @@ CREATE TABLE IF NOT EXISTS devices (
     direct_ids      TEXT NOT NULL DEFAULT '',   -- JSON [id ПК], с которыми связь сейчас идёт напрямую
     wan_ok          INTEGER NOT NULL DEFAULT 0, -- клиент умеет прямой путь через интернет (1.0.12+)
     speed_limit     INTEGER NOT NULL DEFAULT 0, -- Мбит/с через сервер для этого ПК (приём и отправка), 0 — без
+    radmin_server   INTEGER NOT NULL DEFAULT 0, -- на ПК стоит Radmin Server (сообщает клиент 1.0.12+)
     last_seen       TEXT,
     update_state    TEXT NOT NULL DEFAULT '',   -- что ПК сообщает об обновлении: downloading:1.0.6 …
     update_state_at TEXT,
@@ -131,6 +132,7 @@ MIGRATIONS = [
     ("devices", "direct_ids", "TEXT NOT NULL DEFAULT ''"),
     ("devices", "wan_ok", "INTEGER NOT NULL DEFAULT 0"),
     ("devices", "speed_limit", "INTEGER NOT NULL DEFAULT 0"),
+    ("devices", "radmin_server", "INTEGER NOT NULL DEFAULT 0"),
     ("companies", "speed_limit", "INTEGER NOT NULL DEFAULT 0"),
 ]
 

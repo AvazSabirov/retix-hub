@@ -1392,3 +1392,23 @@ class TestSpeedLimit:
                 assert filters.count("police") == 3
         finally:
             sh(f"ip netns del {ns}", check=False)
+
+
+class TestRadminServerFlag:
+    """ПК сообщает, стоит ли на нём Radmin Server; другие ПК компании видят это в /api/peers."""
+
+    def test_reported_and_shown_to_peers(self, ctx):
+        ctx.company("firma")
+        a, b = ctx.register("firma", name="A"), ctx.register("firma", name="B")
+        peers = lambda pc: {p["name"]: p for p in ctx.api.get("/api/peers", headers=ctx.h(pc["token"])).json()["peers"]}
+        assert peers(a)["B"]["radmin_server"] is False                     # пока не сообщил — нет
+        ctx.api.post("/api/heartbeat", headers=ctx.h(b["token"]), json={"client_version": "1.0.12", "radmin_server": True})
+        assert peers(a)["B"]["radmin_server"] is True
+        ctx.api.post("/api/heartbeat", headers=ctx.h(b["token"]), json={"client_version": "1.0.11"})   # старый клиент
+        assert peers(a)["B"]["radmin_server"] is True                      # поля нет — значение не трогаем
+        ctx.api.post("/api/heartbeat", headers=ctx.h(b["token"]), json={"radmin_server": False})       # удалили
+        assert peers(a)["B"]["radmin_server"] is False
+
+    def test_not_on_public_pages(self, ctx):
+        r = ctx.TestClient(ctx.app).get("/")
+        assert r.status_code == 200 and "Radmin" not in r.text

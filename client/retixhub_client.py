@@ -375,11 +375,14 @@ class Api:
     def peers(self):
         return self._req("GET", "/api/peers")
 
-    def heartbeat(self, lan: list | None = None, wg_port: int = 0, direct: list | None = None):
+    def heartbeat(self, lan: list | None = None, wg_port: int = 0, direct: list | None = None,
+                  radmin_server: bool | None = None):
         # wan: этот клиент умеет прямой путь через интернет — сервер может свести его с ПК других офисов
-        return self._req("POST", "/api/heartbeat", json={"client_version": VERSION, "lan": list(lan or []),
-                                                         "wg_port": int(wg_port or 0),
-                                                         "direct": list(direct or []), "wan": True})
+        body = {"client_version": VERSION, "lan": list(lan or []), "wg_port": int(wg_port or 0),
+                "direct": list(direct or []), "wan": True}
+        if radmin_server is not None:
+            body["radmin_server"] = bool(radmin_server)
+        return self._req("POST", "/api/heartbeat", json=body)
 
     def send_message(self, to: int, text: str):
         return self._req("POST", "/api/messages", json={"to": to, "text": text})
@@ -853,6 +856,26 @@ def ensure_direct_firewall(port: int) -> None:
 
 
 RADMIN_PORT = 4899
+RADMIN_SERVER_SERVICE = "RServer3"   # служба Radmin Server 3
+RADMIN_CHECK_EVERY = 300             # сек — как часто проверять, стоит ли на этом ПК Radmin Server
+
+
+def radmin_server_installed() -> bool:
+    """Стоит ли на этом ПК Radmin Server: служба RServer3 или её файл. Об этом ПК сообщает серверу,
+    и у других ПК компании меню управления к нему появляется, только если он есть."""
+    if not WINDOWS:
+        return False
+    code, out = run(["sc", "query", RADMIN_SERVER_SERVICE], timeout=15)
+    if code == 0 and "1060" not in out:
+        return True
+    windir = Path(os.environ.get("SystemRoot", r"C:\Windows"))
+    return any((windir / d / "rserver30" / "rserver3.exe").is_file() for d in ("SysWOW64", "System32"))
+
+
+def radmin_menu_allowed(peer: dict | None, viewer: Path | None) -> bool:
+    """Меню «Полное управление / Только просмотр / Передача файлов» — только если на том ПК есть
+    Radmin Server (он сам сообщил серверу), а на этом — Radmin Viewer."""
+    return bool(peer) and peer.get("radmin_server") is True and viewer is not None
 
 
 def lan_ports(cfg: dict) -> str:
@@ -1255,6 +1278,8 @@ class Worker(threading.Thread):
         self.lan: list[str] = []                 # свои адреса в локальной сети (для соседей)
         self.lan_checked = 0.0
         self.reported = None                     # что последний раз сообщили серверу о локальной сети
+        self.radmin_server: bool | None = None   # стоит ли здесь Radmin Server (None — ещё не проверяли)
+        self.radmin_checked = 0.0
         self.last_peers: list[dict] = []         # список компьютеров с последнего ответа сервера
         # шаг цикла и смена компании (вход, переключение, выход) не идут одновременно
         self.op_lock = threading.RLock()
@@ -1746,11 +1771,17 @@ class Worker(threading.Thread):
             pass
 
         # адреса локальной сети, порт туннеля и прямые пути изменились — сообщаем серверу сразу
+        if now - self.radmin_checked > RADMIN_CHECK_EVERY:
+            try:
+                self.radmin_server = radmin_server_installed()
+            except Exception:  # noqa: BLE001
+                log.exception("проверка Radmin Server")
+            self.radmin_checked = now
         port = self.direct.listen_port if self.lan else 0
-        report = (tuple(self.lan), port, tuple(self.direct.active_ids()))
+        report = (tuple(self.lan), port, tuple(self.direct.active_ids()), self.radmin_server)
         if now - self.last_heartbeat > HEARTBEAT_EVERY or report != self.reported:
             try:
-                self.api.heartbeat(self.lan, port, self.direct.active_ids())
+                self.api.heartbeat(self.lan, port, self.direct.active_ids(), self.radmin_server)
                 self.last_heartbeat, self.reported = now, report
             except (ApiError, ServerUnreachable):
                 pass
@@ -2324,22 +2355,9 @@ class App(tk.Tk):
         self.tree.bind("<Return>", lambda _e: self.open_shares())
         self.tree.bind("<Button-3>", self.peer_menu)
 
-        self.ctx = dark_menu(self)
-        self.ctx.add_command(label="Сообщение", command=self.message)
-        self.ctx.add_separator()
-        self.ctx.add_command(label="Копировать IP-адрес", command=self.copy_ip)
-        self.ctx.add_separator()
-        self.ctx.add_command(label="Пинг", command=self.ping)
-        self.ctx.add_command(label="Общие папки", command=self.open_shares)
-        self.ctx.add_command(label="Подключить сетевой диск…", command=self.map_drive)
-        self.ctx.add_separator()
-        self.ctx.add_command(label="Полное управление", command=lambda: self.radmin("full"),
-                             font=("Segoe UI", 9, "bold"))
-        self.ctx.add_command(label="Только просмотр", command=lambda: self.radmin("view"))
-        self.ctx.add_command(label="Передача файлов", command=lambda: self.radmin("files"))
-        self.ctx.add_command(label="Удалённый рабочий стол (RDP)", command=self.remote_desktop)
-        self.ctx.add_separator()
-        self.ctx.add_command(label="Свойства", command=self.properties)
+        # меню правой кнопки: с пунктами Radmin Viewer — только если у того ПК есть Radmin Server, а здесь Viewer
+        self.ctx_menus = {radmin: self._build_peer_menu(radmin) for radmin in (True, False)}
+        self.ctx = self.ctx_menus[False]
 
         self.msg_lbl = tk.Label(self, text="", bg=C["bg"], fg=C["muted"], anchor="w", justify="left",
                                 wraplength=330, padx=10)
@@ -2666,11 +2684,33 @@ class App(tk.Tk):
             return None
         return next((p for p in self.peers if str(p["id"]) == sel[0]), None)
 
+    def _build_peer_menu(self, radmin: bool):
+        m = dark_menu(self)
+        m.add_command(label="Сообщение", command=self.message)
+        m.add_separator()
+        m.add_command(label="Копировать IP-адрес", command=self.copy_ip)
+        m.add_separator()
+        m.add_command(label="Пинг", command=self.ping)
+        m.add_command(label="Общие папки", command=self.open_shares)
+        m.add_command(label="Подключить сетевой диск…", command=self.map_drive)
+        m.add_separator()
+        if radmin:
+            m.add_command(label="Полное управление", command=lambda: self.radmin("full"),
+                          font=("Segoe UI", 9, "bold"))
+            m.add_command(label="Только просмотр", command=lambda: self.radmin("view"))
+            m.add_command(label="Передача файлов", command=lambda: self.radmin("files"))
+        m.add_command(label="Удалённый рабочий стол (RDP)", command=self.remote_desktop)
+        m.add_separator()
+        m.add_command(label="Свойства", command=self.properties)
+        return m
+
     def peer_menu(self, event):
         row = self.tree.identify_row(event.y)
         if not row:
             return
         self.tree.selection_set(row)
+        viewer = find_radmin_viewer(self.state_.get("radmin_path") or "")
+        self.ctx = self.ctx_menus[radmin_menu_allowed(self.selected_peer(), viewer)]
         try:
             self.ctx.tk_popup(event.x_root, event.y_root)
         finally:
@@ -2809,7 +2849,8 @@ class App(tk.Tk):
             f"Версия Retix Hub:  {p.get('client_version') or '—'}",
             "",
             f"Общие папки:  \\\\{p['ip']}",
-            f"Radmin:  {p['ip']}:{(self.cfg or {}).get('radmin_port') or RADMIN_PORT}",
+            *([f"Radmin:  {p['ip']}:{(self.cfg or {}).get('radmin_port') or RADMIN_PORT}"]
+              if p.get("radmin_server") else []),
         ]), parent=self)
 
     def copy_ip(self):

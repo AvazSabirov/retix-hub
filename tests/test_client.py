@@ -1485,3 +1485,28 @@ def test_heartbeat_reports_wan_support(make_client, company, server):
     conn = sqlite3.connect(Path(server.data) / "vpn.db", timeout=10)
     assert conn.execute("SELECT wan_ok FROM devices WHERE name='A'").fetchone()[0] == 1
     conn.close()
+
+
+# ================================================================== меню управления через Radmin Viewer
+
+def test_radmin_menu_only_with_server_there_and_viewer_here(tmp_path):
+    viewer = tmp_path / "Radmin.exe"; viewer.write_bytes(b"MZ")
+    assert rc.radmin_menu_allowed({"radmin_server": True}, viewer)
+    assert not rc.radmin_menu_allowed({"radmin_server": True}, None)          # здесь нет Radmin Viewer
+    assert not rc.radmin_menu_allowed({"radmin_server": False}, viewer)       # там нет Radmin Server
+    assert not rc.radmin_menu_allowed({}, viewer)                             # старый клиент не сообщил
+    assert not rc.radmin_menu_allowed(None, viewer)
+    assert not rc.radmin_server_installed()                                   # не Windows — нет
+
+
+def test_radmin_server_reported_to_other_pcs(make_client, company, monkeypatch):
+    has = {"v": True}
+    monkeypatch.setattr(rc, "radmin_server_installed", lambda: has["v"])
+    a = make_client("PC1"); login(a, company, name="Касса"); a.step(2)
+    b = make_client("PC2"); login(b, company, name="Офис"); b.step(2)
+    a.step()
+    assert {p["name"]: p["radmin_server"] for p in a.peers} == {"Касса": True, "Офис": True}
+    has["v"] = False
+    b.w.radmin_checked = 0                 # следующая проверка — сразу (обычно раз в 5 минут)
+    b.step(); a.step()
+    assert {p["name"]: p["radmin_server"] for p in a.peers}["Офис"] is False
