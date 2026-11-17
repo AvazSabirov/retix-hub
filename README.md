@@ -282,8 +282,8 @@ build.bat
 
 ```bash
 pip install -r server/requirements.txt -r client/requirements.txt pytest httpx
-python -m pytest tests/test_server.py tests/test_client.py -q   # 188 тестов, ~4 мин
-sudo python3 tests/e2e_network.py                               # 52 проверки на настоящей сети
+python -m pytest tests/test_server.py tests/test_client.py -q   # 245 тестов, ~5 мин
+sudo python3 tests/e2e_network.py                               # 103 проверки на настоящей сети
 ```
 
 * `test_server.py` — суперадмин, регистрация, лимиты, изоляция компаний, кабинет, блок/одобрение,
