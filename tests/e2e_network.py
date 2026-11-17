@@ -159,6 +159,7 @@ class LinuxTunnel:
         return "running" if nsx(self.ns, f"ip link show {self.iface}", check=False).returncode == 0 else "missing"
 
     def install(self, conf: str):
+        self.conf = conf
         self.uninstall()
         make_wg_iface(self.ns, self.iface)
         address, allowed, lines = "", [], []
@@ -241,6 +242,14 @@ class Pc:
                 elif kind == "peers":
                     self.peers = data["peers"]
         return st
+
+    def reboot(self):
+        """Перезагрузка ПК: служба WireGuard поднимается сама с конфигом (без пиров, добавленных на лету,
+        и с новым случайным портом), программа запускается заново — помнит только state.json."""
+        self.tunnel.install(self.tunnel.conf)
+        self.state = rc.State(self.state.path)
+        self.w = rc.Worker(self.state, queue.Queue(), tunnel=self.tunnel)
+        self.peers = []
 
     def until(self, status, tries=12):
         st = None
@@ -375,7 +384,7 @@ def run_scenarios(srv: ServerProc):
     online = {p["name"]: p["online"] for p in a2.peers}
     check("сервер видит ПК alpha онлайн (по handshake)", online.get("Склад PC1") and online.get("Бухгалтерия"), str(online))
 
-    direct_lan(cab_a, a1, a2, a3, b1)
+    direct_lan(srv, cab_a, a1, a2, a3, b1)
 
     print("\n11. Блокировка ПК")
     cab_a.post(API + f"/cabinet/devices/{a2.dev_id}/block")
@@ -439,7 +448,7 @@ def run_scenarios(srv: ServerProc):
 def direct_peers(pc) -> dict:
     """Прямые пиры ПК (все, кроме сервера): ключ -> {endpoint, allowed_ips, …}."""
     d = pc.tunnel.dump() or {"peers": {}}
-    return {k: v for k, v in d["peers"].items() if k != pc.w.cfg["server_public_key"]}
+    return {k: v for k, v in d["peers"].items() if "," not in v["allowed_ips"]}   # у сервера — подсеть,10.66.0.1/32
 
 
 def settle(*pcs, rounds=4):
@@ -451,7 +460,7 @@ def settle(*pcs, rounds=4):
             pc.w.direct.poll()      # то, что Worker делает раз в секунду между шагами
 
 
-def direct_lan(cab_a, a1, a2, a3, b1):
+def direct_lan(srv, cab_a, a1, a2, a3, b1):
     print("\n10. Прямой путь по локальной сети (как в Radmin VPN)")
     rc.DIRECT_KEEPALIVE, rc.DIRECT_RX_TIMEOUT = 1, 8   # в тесте путь «пропадает» быстрее
     cab_a.post(API + "/cabinet/settings", data={"full_lan": "1", "share_name": "share", "share_ports": "445"})
@@ -509,6 +518,32 @@ def direct_lan(cab_a, a1, a2, a3, b1):
     a1.w.direct.backoff.clear(); a2.w.direct.backoff.clear()
     settle(a1, a2)
     check("после восстановления сети прямой путь вернулся", direct_peers(a1).get(k2, {}).get("allowed_ips") == f"{a2.ip}/32")
+
+    print("\n    нет интернета, оба ПК перезагрузились → прямой путь по сохранённым соседям")
+    ip1, ip2 = a1.ip, a2.ip            # после перезагрузки конфигурации от сервера ещё нет
+    srv.stop()
+    nsx("srv", "ip link del wg0", check=False)          # сервера нет совсем: ни API, ни WireGuard
+    for pc in (a1, a2):
+        pc.reboot()
+    check("после перезагрузки прямых пиров в туннеле нет", not direct_peers(a1) and not direct_peers(a2))
+    settle(a1, a2, rounds=3)
+    st = a1.step()
+    check("клиент: «Только локальная сеть»", st and st["status"] == rc.Status.LAN_ONLY, str(st))
+    check("прямой путь поднят по сохранённому списку",
+          direct_peers(a1).get(k2, {}).get("allowed_ips") == f"{ip2}/32"
+          and direct_peers(a2).get(k1, {}).get("allowed_ips") == f"{ip1}/32",
+          f"{direct_peers(a1)} {direct_peers(a2)}")
+    check("ping PC1 ↔ Бухгалтерия без сервера", ping_retry("a1", ip2) and ping_retry("a2", ip1))
+    check("SMB PC1 ← Бухгалтерия без сервера", tcp("a2", ip1, 445))
+    check("в программе Бухгалтерия «в сети», напрямую",
+          any(p["name"] == "Бухгалтерия" and p["online"] and p.get("direct") for p in a1.peers), str(a1.peers))
+    check("контроль: Запасной (не сосед) без сервера недоступен", not ping("a1", a3.ip))
+    srv.start()
+    for pc in (a1, a2):
+        pc.until(rc.Status.ONLINE)
+    settle(a1, a2)
+    check("сервер вернулся: «В сети», прямой путь на месте",
+          a1.step()["status"] == rc.Status.ONLINE and direct_peers(a1).get(k2, {}).get("allowed_ips") == f"{a2.ip}/32")
     cab_a.post(API + "/cabinet/settings", data={"share_name": "share", "share_ports": "445"})
     a1.step(); a2.step()
     check("прямые пиры удалены у обоих", not direct_peers(a1) and not direct_peers(a2))

@@ -70,6 +70,8 @@ DIRECT_RETRY_FAILED = 300  # сек — ни один адрес не ответ
 DIRECT_RETRY_LOST = 60     # сек — прямой путь пропал: снова пробуем не раньше
 DIRECT_TICK = 1            # сек — пока идёт проверка пути, handshake смотрим чаще основного цикла
 LAN_CHECK_EVERY = 60       # сек — как часто перечитывать адреса своей локальной сети
+DIRECT_CACHE_DAYS = 3      # сохранённые соседи действуют без сервера столько дней после его последнего ответа
+DIRECT_CACHE_REFRESH = 3600  # сек — как часто переписывать неизменившийся список соседей на диск
 
 UPDATE_FIRST = 60        # сек после запуска — первая проверка новой версии
 UPDATE_EVERY = 600       # сек — дальше каждые 10 минут
@@ -167,10 +169,10 @@ class State:
 
     FIELDS = {"server_url": "", "company_login": "", "company_name": "", "device_name": "", "token": "",
               "private_key": "", "join_password": "", "last_conf_hash": "", "fw_subnet": "",
-              "fw_direct": 0, "autostart_done": False, "enabled": True, "auto_update": True, "update_attempt": {},
+              "fw_direct": 0, "direct_cache": {}, "autostart_done": False, "enabled": True, "auto_update": True, "update_attempt": {},
               "update_state": "none", "update_pubkey": "", "update_pins": {}, "profiles": {}}
     PROFILE_FIELDS = ("server_url", "company_login", "company_name", "device_name", "token", "private_key",
-                      "join_password")
+                      "join_password", "direct_cache")
 
     def __init__(self, path: Path | None = None):
         self.path = path or STATE_FILE
@@ -649,6 +651,8 @@ class DirectPaths:
         self.active: dict[str, int] = {}                   # ключ -> id соседа: связь напрямую
         self.listen_port = 0
         self.own_port = 0                                  # порт, который задали сами (set_listen_port)
+        self.port_done = False                             # порт туннеля уже приведён к сохранённому
+        self.endpoints: dict[str, str] = {}                # ключ -> адрес, по которому сосед отвечает сейчас
 
     def probing(self) -> bool:
         return bool(self.probes)
@@ -658,8 +662,9 @@ class DirectPaths:
 
     def reset(self) -> None:
         """Туннель снят или переустановлен — прямых пиров в нём больше нет."""
-        self.wanted.clear(); self.probes.clear(); self.rx.clear(); self.active.clear()
+        self.wanted.clear(); self.probes.clear(); self.rx.clear(); self.active.clear(); self.endpoints.clear()
         self.listen_port = self.own_port = 0
+        self.port_done = False
 
     def sync(self, neighbors: list[dict], server_key: str) -> None:
         self.server_key = server_key
@@ -671,7 +676,11 @@ class DirectPaths:
         if state is None:
             return
         self.listen_port = state["listen_port"] or self.own_port
-        live = {k: v for k, v in state["peers"].items() if k != self.server_key}
+        # свои прямые пиры — без AllowedIPs или с одним /32; пир сервера (подсеть компании) не трогаем никогда,
+        # даже если ключ сервера здесь неизвестен или устарел (сохранённые соседи без связи с сервером)
+        live = {k: v for k, v in state["peers"].items()
+                if k != self.server_key and ("," not in v["allowed_ips"])
+                and (not v["allowed_ips"] or v["allowed_ips"].endswith("/32"))}
         now = time.time()
         for key in live.keys() - self.wanted.keys():
             self._drop(key, "больше не сосед по локальной сети")
@@ -703,6 +712,8 @@ class DirectPaths:
                 self._fail(key, endpoints, DIRECT_RETRY_LOST, f"от {n['ip']} нет пакетов — снова через сервер")
             else:
                 self.active[key] = n["id"]
+                if peer["endpoint"]:
+                    self.endpoints[key] = peer["endpoint"]
             return
         probe = self.probes.setdefault(key, {"started": now, "idx": 0})
         if peer["handshake"] and now - peer["handshake"] < HANDSHAKE_OK:
@@ -724,7 +735,7 @@ class DirectPaths:
         if key in self.active:
             log.info("прямой путь закрыт: %s", why)
         self.tunnel.remove_peer(key)
-        for d in (self.active, self.probes, self.rx):
+        for d in (self.active, self.probes, self.rx, self.endpoints):
             d.pop(key, None)
 
     def _fail(self, key: str, endpoints: tuple, delay: int, why: str) -> None:
@@ -1145,6 +1156,7 @@ class Status:
     CONNECTING = "connecting"
     ONLINE = "online"
     SERVER_DOWN = "server_down"
+    LAN_ONLY = "lan_only"  # сервер недоступен, но ПК офиса связаны напрямую (сохранённые соседи)
     PENDING = "pending"
     BLOCKED = "blocked"
     ERROR = "error"
@@ -1171,6 +1183,7 @@ class Worker(threading.Thread):
         self.lan: list[str] = []                 # свои адреса в локальной сети (для соседей)
         self.lan_checked = 0.0
         self.reported = None                     # что последний раз сообщили серверу о локальной сети
+        self.last_peers: list[dict] = []         # список компьютеров с последнего ответа сервера
         # шаг цикла и смена компании (вход, переключение, выход) не идут одновременно
         self.op_lock = threading.RLock()
 
@@ -1178,8 +1191,8 @@ class Worker(threading.Thread):
     def emit(self, kind: str, **data):
         self.events.put((kind, data))
 
-    def status(self, status: str, text: str = ""):
-        self.emit("status", status=status, text=text, cfg=self.cfg)
+    def status(self, status: str, text: str = "", cfg: dict | None = None):
+        self.emit("status", status=status, text=text, cfg=cfg or self.cfg)
 
     # --- команды из GUI (вызываются в отдельном потоке)
     def login(self, server: str, company: str, password: str, device: str, remember: bool):
@@ -1244,6 +1257,7 @@ class Worker(threading.Thread):
         self.last_heartbeat = 0.0
         self.direct.reset()
         self.lan, self.lan_checked, self.reported = [], 0.0, None
+        self.last_peers = []
 
     def _uninstall(self):
         self.tunnel.uninstall()
@@ -1260,7 +1274,7 @@ class Worker(threading.Thread):
                 self.api.logout()   # токен больше не действует, ПК снят с сервера WireGuard
             except (ApiError, ServerUnreachable):
                 pass
-        self.state.set(token="", join_password="", last_conf_hash="")
+        self.state.set(token="", join_password="", last_conf_hash="", direct_cache={})
         try:
             self._uninstall()
         finally:
@@ -1349,16 +1363,126 @@ class Worker(threading.Thread):
             self.direct.sync(direct_neighbors(self.cfg, pub) if enabled else [], self.cfg["server_public_key"])
         except Exception:  # noqa: BLE001
             log.exception("прямой путь")
-        if enabled and self.lan and not self.direct.listen_port:
-            # порт туннеля неизвестен (WireGuard не сообщил случайный) — задаём свой; сервер узнает новый
-            # адрес ПК по первому же пакету (роуминг WireGuard), связь не рвётся
-            port = 49152 + int.from_bytes(os.urandom(2), "big") % 16000
-            if self.tunnel.set_listen_port(port):
-                self.direct.listen_port = self.direct.own_port = port
+        if enabled and self.lan:
+            self._ensure_port()
         want = self.direct.listen_port if enabled and self.lan else 0
         if want != (self.state.get("fw_direct") or 0):
             ensure_direct_firewall(want)
             self.state.set(fw_direct=want)
+
+    # --- сохранённые соседи: прямой путь без сервера (нет интернета, перезагрузка без интернета)
+    # После каждого ответа сервера в state.json (папка только для SYSTEM и администраторов) записываются
+    # соседи, с которыми прямой путь уже работал и которых сервер называет сейчас, и порт своего туннеля.
+    # Сервер недоступен — прямые пути поднимаются по этому списку (с той же проверкой handshake).
+    # Сервер ответил — его список заменяет сохранённый: заблокированный/удалённый ПК исчезает сразу.
+
+    def _direct_cache(self) -> dict:
+        c = self.state.get("direct_cache")
+        return c if isinstance(c, dict) else {}
+
+    def _ensure_port(self):
+        """Порт туннеля — тот же, что раньше: соседи знают его по сохранённому списку, даже если оба ПК
+        перезагрузились без интернета. Нет сохранённого или он занят — свой случайный (если WireGuard не
+        сообщил порт сам). Сервер узнает новый адрес ПК по первому же пакету (роуминг WireGuard)."""
+        if self.direct.port_done:
+            return
+        saved = self._direct_cache().get("my_port")
+        saved = saved if isinstance(saved, int) and 1024 <= saved < 65536 else 0
+        if saved and self.direct.listen_port != saved and self.tunnel.set_listen_port(saved):
+            self.direct.listen_port = self.direct.own_port = saved
+        elif not self.direct.listen_port:
+            port = 49152 + int.from_bytes(os.urandom(2), "big") % 16000
+            if self.tunnel.set_listen_port(port):
+                self.direct.listen_port = self.direct.own_port = port
+        self.direct.port_done = bool(self.direct.listen_port)
+
+    def _save_direct_cache(self, now: float):
+        cfg = self.cfg or {}
+        old = self._direct_cache()
+        if not cfg.get("direct_enabled"):
+            if old:
+                self.state.set(direct_cache={})
+            return
+        _, pub = self.state.keypair()
+        prev = {n.get("public_key"): n for n in old.get("neighbors") or [] if isinstance(n, dict)}
+        names = {p.get("id"): p for p in self.last_peers}
+        neighbors = []
+        for n in direct_neighbors(cfg, pub):                 # только те, кого сервер называет сейчас
+            key, before = n["public_key"], prev.get(n["public_key"]) or {}
+            if key in self.direct.active:
+                verified = now
+                first = [e for e in [self.direct.endpoints.get(key, "")] if lan_endpoint_ok(e)]
+            elif before:
+                verified = before.get("verified_at") or 0
+                first = [e for e in (before.get("endpoints") or [])[:1] if lan_endpoint_ok(e)]
+            else:
+                continue                                     # прямой путь с ним ещё не работал
+            p = names.get(n["id"]) or before
+            neighbors.append({"id": n["id"], "public_key": key, "ip": n["ip"],
+                              "endpoints": list(dict.fromkeys(first + n["endpoints"]))[:4],
+                              "verified_at": int(verified), "name": str(p.get("name") or "")[:64],
+                              "hostname": str(p.get("hostname") or "")[:64]})
+        new = {"cfg": {"device_id": cfg.get("device_id"), "device_name": str(cfg.get("device_name") or "")[:64],
+                       "company": str(cfg.get("company") or "")[:100], "ip": cfg["ip"], "subnet": cfg["subnet"],
+                       "server_ip": cfg["server_ip"], "server_public_key": cfg["server_public_key"],
+                       "show_peers": cfg.get("show_peers") is not False, "direct_enabled": True},
+               "my_port": self.direct.listen_port or old.get("my_port") or 0, "neighbors": neighbors}
+
+        def same(a, b):   # без отметок времени: «сосед на связи» не повод писать на диск каждые 8 с
+            strip = lambda c: dict(c, saved_at=0, neighbors=[dict(x, verified_at=0) for x in c.get("neighbors") or []])
+            return strip(a) == strip(b)
+        if not same(new, old) or now - (old.get("saved_at") or 0) > DIRECT_CACHE_REFRESH:
+            self.state.set(direct_cache=dict(new, saved_at=int(now)))
+
+    def _offline_direct(self, now: float) -> bool:
+        """Сервер недоступен: прямые пути по сохранённым соседям. True — хотя бы с одним ПК связь напрямую."""
+        cache = self._direct_cache()
+        cfg = cache.get("cfg") if isinstance(cache.get("cfg"), dict) else {}
+        ttl = DIRECT_CACHE_DAYS * 86400
+        fresh = now - (cache.get("saved_at") or 0) < ttl
+        try:
+            if not (fresh and cfg.get("direct_enabled") and KEY_RE.match(str(cfg.get("server_public_key")))
+                    and peer_ip_ok(cfg.get("ip"), cfg.get("subnet"))):
+                raise ValueError("нет сохранённых соседей")
+            if self.tunnel.service_state() != "running":
+                return False
+            _, pub = self.state.keypair()
+            saved = [n for n in cache.get("neighbors") or []
+                     if isinstance(n, dict) and now - (n.get("verified_at") or 0) < ttl]
+            neighbors = direct_neighbors(dict(cfg, direct=saved), pub)
+            server_key = cfg["server_public_key"]
+        except (ValueError, TypeError, KeyError):
+            if not self.direct.wanted:
+                return False
+            neighbors, server_key = [], self.direct.server_key   # срок вышел — прямые пути закрываем
+        try:
+            self.direct.sync(neighbors, server_key)
+            if neighbors:
+                self._ensure_port()
+        except Exception:  # noqa: BLE001
+            log.exception("прямой путь без сервера")
+        return bool(self.direct.active_ids())
+
+    def _offline_view(self) -> dict:
+        """Что показать в окне без ответа сервера (после перезагрузки без интернета)."""
+        cfg = self._direct_cache().get("cfg") or {}
+        return {"device_name": cfg.get("device_name") or self.state.get("device_name"), "ip": cfg.get("ip"),
+                "company": cfg.get("company") or self.state.get("company_name"),
+                "show_peers": cfg.get("show_peers", True)}
+
+    def _offline_peers(self) -> list[dict]:
+        """Список компьютеров без сервера: в сети — те, с кем связь напрямую."""
+        cache = self._direct_cache()
+        cfg = cache.get("cfg") or {}
+        base = self.last_peers or [
+            {"id": n.get("id"), "name": n.get("name") or n.get("ip"), "hostname": n.get("hostname") or "",
+             "ip": n.get("ip"), "is_me": False, "is_share_host": False}
+            for n in cache.get("neighbors") or [] if isinstance(n, dict) and peer_ip_ok(n.get("ip"), cfg.get("subnet"))]
+        if cfg.get("show_peers") is False:
+            base = [p for p in base if p.get("is_me")]
+        direct = set(self.direct.active_ids())
+        return [dict(p, online=bool(p.get("is_me")) or p.get("id") in direct, direct=p.get("id") in direct)
+                for p in base]
 
     def step(self):
         if not self.tunnel.installed() and not install_wireguard_if_needed():
@@ -1398,7 +1522,13 @@ class Worker(threading.Thread):
         except ServerUnreachable:
             # туннель НЕ удаляем: как только сервер вернётся, WireGuard сам восстановит связь
             self.server_was_down = True
-            self.status(Status.SERVER_DOWN, "Сервер недоступен. Как появится — подключимся.")
+            if self._offline_direct(time.time()):
+                n = len(self.direct.active_ids())
+                self.status(Status.LAN_ONLY, f"Нет связи с сервером — компьютеры офиса доступны напрямую ({n})",
+                            cfg=self.cfg or self._offline_view())
+                self.emit("peers", peers=self._offline_peers())
+            else:
+                self.status(Status.SERVER_DOWN, "Сервер недоступен. Как появится — подключимся.")
             return
         except ApiError as e:
             if e.status == 401:  # устройство удалено или токены сброшены -> регистрируемся заново
@@ -1409,6 +1539,7 @@ class Worker(threading.Thread):
             if e.status == 403:
                 if self.tunnel.service_state() != "missing":
                     self._uninstall()
+                self.state.set(direct_cache={})
                 self.status(Status.BLOCKED, e.detail)
                 return
             raise
@@ -1426,6 +1557,7 @@ class Worker(threading.Thread):
         if self.cfg["status"] == "blocked":
             if self.tunnel.service_state() != "missing":
                 self._uninstall()
+            self.state.set(direct_cache={})
             self.status(Status.BLOCKED, "Устройство заблокировано администратором")
             return
         if self.cfg["status"] == "pending":
@@ -1491,6 +1623,9 @@ class Worker(threading.Thread):
         direct = set(self.direct.active_ids())
         peers = [dict(p, direct=p.get("id") in direct) for p in peers if peer_ip_ok(p.get("ip"), self.cfg["subnet"])]
         self.emit("peers", peers=peers)
+        if peers:
+            self.last_peers = peers
+        self._save_direct_cache(now)
 
         # 7. новые сообщения от других ПК
         try:
@@ -1637,6 +1772,7 @@ STATUS_VIEW = {
     Status.ONLINE: ("В сети", C["green"]),
     Status.CONNECTING: ("Подключение…", C["orange"]),
     Status.SERVER_DOWN: ("Сервер недоступен", C["red"]),
+    Status.LAN_ONLY: ("Только локальная сеть", C["orange"]),
     Status.PENDING: ("Ждёт одобрения", C["orange"]),
     Status.BLOCKED: ("Заблокировано", C["red"]),
     Status.NEED_LOGIN: ("Не подключено", C["off"]),
@@ -2197,7 +2333,11 @@ class App(tk.Tk):
                 self._lost_job = None
                 if self.status_now != Status.ONLINE and self.net_up:
                     self.net_up = False
-                    self.tray.notify("Сеть недоступна", f"Нет связи с сетью «{company}». Переподключаемся…")
+                    if self.status_now == Status.LAN_ONLY:
+                        self.tray.notify("Нет связи с сервером",
+                                         f"Компьютеры офиса в сети «{company}» доступны напрямую.")
+                    else:
+                        self.tray.notify("Сеть недоступна", f"Нет связи с сетью «{company}». Переподключаемся…")
             self._lost_job = self.after(0 if status == Status.BLOCKED else self.LOST_AFTER_MS, lost)
 
     def _on_status(self, status, text, cfg):
