@@ -8,6 +8,7 @@
     <div><span class="muted">Онлайн</span><b>{{ online }} / {{ devices|length }}</b></div>
     <div><span class="muted">Лимит устройств</span><b>{{ company.max_devices }}</b></div>
     <div><span class="muted">Подсеть</span><b>{{ subnet }}</b></div>
+    <div><span class="muted" title="Задаёт администратор Retix Hub. Прямой путь мимо сервера не ограничивается">Скорость через сервер</span><b>{{ (company.speed_limit ~ ' Мбит/с') if company.speed_limit else 'без ограничения' }}</b></div>
   </div>
 </div>
 
@@ -25,7 +26,7 @@
       <input type="hidden" name="share_name" value="{{ company.share_name }}">
       <label><span>Порты между ПК, если «любой трафик» выключен (общие папки Windows — 445)</span><input type="text" name="share_ports" value="{{ company.share_ports }}"></label>
       <p class="muted">По умолчанию ПК компании видят друг друга (ping), общие папки — те, к которым пользователь ПК сам открыл доступ, — и Radmin Server (порт 4899, подключение из Radmin Viewer).</p>
-      <p class="muted">С «любым трафиком» ПК одной локальной сети (один офис) связываются напрямую, мимо сервера — быстрее. Если прямой путь не работает, трафик сам идёт через сервер.</p>
+      <p class="muted">С «любым трафиком» ПК связываются напрямую, мимо сервера — быстрее: в одном офисе — по локальной сети, в разных офисах — через интернет, если это позволяют роутеры. Если прямой путь не работает, трафик сам идёт через сервер.</p>
       <button class="primary">Сохранить</button>
     </form>
   </div>

@@ -8,8 +8,12 @@
     a1, a2, a3 — ПК компании alpha (a1 — с общей папкой)
     b1      — ПК компании beta
     inet    — «интернет» за сервером (203.0.113.9)
+    r1, r2  — роутеры двух других офисов компании gamma (NAT, как дома: MASQUERADE и закрытый вход)
+              внешние адреса 11.0.0.11 и 11.0.0.12, у сервера в этой «сети интернета» — 11.0.0.1
+    w1, w2  — ПК за r1 (192.168.10.2) и за r2 (192.168.20.2): прямой путь через интернет
 Клиентами управляет настоящая логика retixhub_client.Worker, вместо службы Windows — LinuxTunnel.
-Нужны: root, iproute2, wireguard-tools, iptables, netcat-openbsd, (ядро с WireGuard или wireguard-go).
+Нужны: root, iproute2, wireguard-tools, iptables, netcat-openbsd, iperf3, conntrack,
+(ядро с WireGuard или wireguard-go).
 """
 import os
 import queue
@@ -37,6 +41,8 @@ import retixhub_client as rc  # noqa: E402
 API = "http://192.168.77.1:8100"
 NS = {"srv": "192.168.77.1", "a1": "192.168.77.11", "a2": "192.168.77.12", "a3": "192.168.77.13",
       "b1": "192.168.77.21"}
+# офисы за NAT: ПК -> (роутер, адрес ПК в его локальной сети, внешний адрес роутера)
+WAN = {"w1": ("r1", "192.168.10.2", "11.0.0.11"), "w2": ("r2", "192.168.20.2", "11.0.0.12")}
 KERNEL_WG = subprocess.run("ip link add rxprobe type wireguard && ip link del rxprobe", shell=True,
                            capture_output=True).returncode == 0
 
@@ -88,12 +94,13 @@ def make_wg_iface(ns, name):
 def teardown():
     sh("pkill -f 'app.main' ", check=False)
     sh("pkill -f 'nc -lk'", check=False)
-    for ns in list(NS) + ["inet"]:
+    for ns in list(NS) + ["inet"] + list(WAN) + [r for r, _, _ in WAN.values()]:
         # процессы внутри namespace (wireguard-go) держат его живым — завершаем их
         sh(f"ip netns pids {ns} 2>/dev/null | xargs -r kill -9", check=False)
         sh(f"ip netns del {ns}", check=False)
         sh(f"ip link del v-{ns}", check=False)
     sh("ip link del rxbr", check=False)
+    sh("ip link del rxwan", check=False)
     sh("rm -f /var/run/wireguard/wg-*.sock /var/run/wireguard/wg0.sock", check=False)
     time.sleep(0.5)
 
@@ -116,6 +123,28 @@ def setup():
     nsx("srv", "ip addr add 203.0.113.1/24 dev srv-up"); nsx("srv", "ip link set srv-up up")
     nsx("inet", "ip addr add 203.0.113.9/24 dev eth0"); nsx("inet", "ip link set eth0 up"); nsx("inet", "ip link set lo up")
     nsx("inet", "ip route add default via 203.0.113.1")
+    # «интернет» между офисами: сервер 11.0.0.1 и роутеры r1, r2 на одном мосту
+    sh("ip link add rxwan type bridge && ip link set rxwan up")
+    sh("ip link add v-srvwan type veth peer name srv-wan netns srv && ip link set v-srvwan master rxwan up")
+    nsx("srv", "ip addr add 11.0.0.1/24 dev srv-wan"); nsx("srv", "ip link set srv-wan up")
+    for pc, (router, lan_ip, wan_ip) in WAN.items():
+        net = lan_ip.rsplit(".", 1)[0]
+        sh(f"ip netns add {router}"); sh(f"ip netns add {pc}")
+        sh(f"ip link add v-{router} type veth peer name wan netns {router} && ip link set v-{router} master rxwan up")
+        sh(f"ip link add lan netns {router} type veth peer name eth0 netns {pc}")
+        for cmd in ("ip link set lo up", f"ip addr add {wan_ip}/24 dev wan", "ip link set wan up",
+                    f"ip addr add {net}.1/24 dev lan", "ip link set lan up", "ip route add default via 11.0.0.1",
+                    "sysctl -qw net.ipv4.ip_forward=1",
+                    "iptables -t nat -A POSTROUTING -o wan -j MASQUERADE",
+                    # как домашний роутер: снаружи — только ответы на своё
+                    "iptables -A INPUT -i wan -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT",
+                    "iptables -A INPUT -i wan -j DROP",
+                    "iptables -A FORWARD -i wan -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT",
+                    "iptables -A FORWARD -i wan -j DROP"):
+            nsx(router, cmd)
+        for cmd in ("ip link set lo up", f"ip addr add {lan_ip}/24 dev eth0", "ip link set eth0 up",
+                    f"ip route add default via {net}.1"):
+            nsx(pc, cmd)
 
 
 class ServerProc:
@@ -227,7 +256,8 @@ class Pc:
 
     def _host(self):
         rc.socket.gethostname = lambda: self.hostname
-        rc.local_addresses = lambda: [f"{NS[self.ns]}/24"]   # адрес ПК в «офисной» сети 192.168.77.0/24
+        lan_ip = NS.get(self.ns) or WAN[self.ns][1]
+        rc.local_addresses = lambda: [f"{lan_ip}/24"]   # адрес ПК в своей «офисной» сети
 
     def login(self, password="join123"):
         self._host()
@@ -279,7 +309,7 @@ def server_peers():
 def main():
     if os.geteuid() != 0:
         sys.exit("нужен root")
-    for tool in ("ip", "wg", "iptables", "nc", "ping"):
+    for tool in ("ip", "wg", "iptables", "nc", "ping", "iperf3", "conntrack", "tc"):
         if not shutil.which(tool):
             sys.exit(f"нет {tool}")
     print(f"WireGuard: {'модуль ядра' if KERNEL_WG else 'wireguard-go (userspace)'}")
@@ -388,6 +418,7 @@ def run_scenarios(srv: ServerProc):
     check("сервер видит ПК alpha онлайн (по handshake)", online.get("Склад PC1") and online.get("Бухгалтерия"), str(online))
 
     direct_lan(srv, cab_a, a1, a2, a3, b1)
+    speed_limit(admin, cab_a, a1, a2)
 
     print("\n11. Блокировка ПК")
     cab_a.post(API + f"/cabinet/devices/{a2.dev_id}/block")
@@ -446,6 +477,8 @@ def run_scenarios(srv: ServerProc):
     print("\n16. Выход из сети")
     a3.w.logout()
     check("туннель удалён", a3.tunnel.service_state() == "missing")
+
+    direct_wan(admin)
 
 
 def direct_peers(pc) -> dict:
@@ -559,6 +592,161 @@ def direct_lan(srv, cab_a, a1, a2, a3, b1):
     check("прямые пиры удалены у обоих", not direct_peers(a1) and not direct_peers(a2))
     check("PC1 → Бухгалтерия:22 снова закрыт (правила сервера снова действуют)", not tcp("a2", a1.ip, 22))
     check("ping через сервер работает", ping_retry("a2", a1.ip))
+
+
+# ------------------------------------------------------------------ скорость через сервер
+
+def iperf(src_ns, dst_ns, dst_ip, seconds=3) -> float:
+    """Мбит/с по TCP от src к dst (через туннель)."""
+    import json
+    srv_proc = subprocess.Popen(f"ip netns exec {dst_ns} iperf3 -s -1 -p 5201", shell=True,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    time.sleep(0.5)
+    r = nsx(src_ns, f"timeout {seconds + 15} iperf3 -c {dst_ip} -p 5201 -t {seconds} -J --connect-timeout 3000",
+            check=False)
+    srv_proc.kill()
+    try:
+        return json.loads(r.stdout)["end"]["sum_received"]["bits_per_second"] / 1e6
+    except (ValueError, KeyError):
+        return 0.0
+
+
+def company_id(admin, login) -> str:
+    import re
+    page = admin.get(API + "/admin").text
+    return dict(re.findall(r"<b>(\w+)</b>.*?/admin/companies/(\d+)", page, flags=re.S))[login]
+
+
+def speed_limit(admin, cab_a, a1, a2):
+    print("\n10б. Скорость через сервер (tc на wg0)")
+    # iperf3 на порту 5201: на время замеров открываем его между ПК (как порт в кабинете)
+    cab_a.post(API + "/cabinet/settings", data={"share_name": "share", "share_ports": "445,5201"})
+    cid = company_id(admin, "alpha")
+    form = {"name": "Alpha", "max_devices": 10, "is_active": "1"}
+    free = iperf("a1", "a2", a2.ip)
+    check("без ограничения: PC1 → Бухгалтерия быстрее 20 Мбит/с", free > 20, f"{free:.1f}")
+
+    admin.post(API + f"/admin/companies/{cid}/update", data=form | {"speed_limit": "5"})
+    qdisc = nsx("srv", "tc qdisc show dev wg0").stdout
+    check("на wg0 появилась очередь HTB", "htb 1:" in qdisc, qdisc)
+    got = iperf("a1", "a2", a2.ip)
+    check("компания 5 Мбит/с: PC1 → Бухгалтерия не быстрее", 3 < got < 5.8, f"{got:.1f}")
+    got = iperf("a2", "a1", a1.ip)
+    check("и в обратную сторону — та же сумма компании", 3 < got < 5.8, f"{got:.1f}")
+
+    admin.post(API + f"/admin/companies/{cid}/update", data=form | {"speed_limit": "0"})
+    admin.post(API + f"/admin/companies/{cid}/devices/{a2.dev_id}/speed", data={"value": "2"})
+    got = iperf("a1", "a2", a2.ip)
+    check("ПК 2 Мбит/с: Бухгалтерия получает не быстрее", 1.2 < got < 2.4, f"{got:.1f}")
+    police = "police" in nsx("srv", "tc filter show dev wg0 parent ffff:", check=False).stdout
+    if police:
+        got = iperf("a2", "a1", a1.ip)
+        check("ПК 2 Мбит/с: отправляет не быстрее", 1.0 < got < 2.6, f"{got:.1f}")
+    else:
+        print("    (ядро без act_police: ограничение отправки с ПК здесь не проверить)")
+        got = iperf("a2", "a1", a1.ip)
+        check("PC1 без ограничения получает быстро (ограничен только приём Бухгалтерии)", got > 20, f"{got:.1f}")
+
+    admin.post(API + f"/admin/companies/{cid}/devices/{a2.dev_id}/speed", data={"value": ""})
+    qdisc = nsx("srv", "tc qdisc show dev wg0").stdout
+    check("ограничения сняты — очередей на wg0 нет", "htb" not in qdisc and "ingress" not in qdisc, qdisc)
+    got = iperf("a1", "a2", a2.ip)
+    check("снова быстро", got > 20, f"{got:.1f}")
+    cab_a.post(API + "/cabinet/settings", data={"share_name": "share", "share_ports": "445"})
+
+
+# ------------------------------------------------------------------ прямой путь через интернет
+
+def server_rx(pc) -> int:
+    """Сколько сервер принял по WireGuard от этого ПК (байт)."""
+    for line in nsx("srv", "wg show wg0 transfer").stdout.splitlines():
+        key, rx, _ = line.split()
+        if key == pc.w.state.keypair()[1]:
+            return int(rx)
+    return 0
+
+
+def direct_wan(admin):
+    print("\n17. Прямой путь через интернет: два офиса за разными роутерами (NAT)")
+    admin.post(API + "/admin/companies", data={"login": "gamma", "name": "Gamma", "cabinet_password": "cab123",
+                                               "join_password": "join123", "max_devices": 10})
+    cab = requests.Session(); cab.post(API + "/cabinet/login", data={"login": "gamma", "password": "cab123"})
+    cab.post(API + "/cabinet/settings", data={"full_lan": "1", "share_name": "share", "share_ports": "445"})
+    rc.DIRECT_KEEPALIVE_WAN, rc.DIRECT_RX_TIMEOUT_WAN = 2, 8   # в тесте путь «пропадает» быстрее
+    w1, w2 = Pc("w1", "TASH-PC", "gamma", "Ташкент"), Pc("w2", "SAM-PC", "gamma", "Самарканд")
+    for pc in (w1, w2):
+        check(f"{pc.name} (за NAT): вход и «Подключено»",
+              pc.login() is None and pc.until(rc.Status.ONLINE)["status"] == rc.Status.ONLINE)
+    check("через сервер Ташкент ↔ Самарканд связаны", ping_retry("w1", w2.ip) and ping_retry("w2", w1.ip))
+    time.sleep(2.5)                 # монитор сервера (каждые 2 с) видит внешние адреса ПК
+    settle(w1, w2, rounds=3)
+    time.sleep(2)
+    settle(w1, w2, rounds=3)
+    k1, k2 = w1.w.state.keypair()[1], w2.w.state.keypair()[1]
+    p12, p21 = direct_peers(w1).get(k2, {}), direct_peers(w2).get(k1, {})
+    check("сервер видит ПК по внешним адресам роутеров",
+          [n["endpoints"][0].split(":")[0] for n in w1.w.cfg.get("direct_wan") or []] == ["11.0.0.12"],
+          str(w1.w.cfg.get("direct_wan")))
+    check("Ташкент → Самарканд: напрямую через роутер Самарканда (AllowedIPs /32)",
+          p12.get("allowed_ips") == f"{w2.ip}/32" and p12.get("endpoint", "").startswith("11.0.0.12:"), str(p12))
+    check("Самарканд → Ташкент: напрямую через роутер Ташкента",
+          p21.get("allowed_ips") == f"{w1.ip}/32" and p21.get("endpoint", "").startswith("11.0.0.11:"), str(p21))
+    w1.step()
+    check("в программе Самарканд отмечен «напрямую через интернет»",
+          any(p["name"] == "Самарканд" and p.get("direct_wan") for p in w1.peers), str(w1.peers))
+
+    drop = [f"FORWARD -s {w1.ip} -d {w2.ip} -j DROP", f"FORWARD -s {w2.ip} -d {w1.ip} -j DROP"]
+    for rule in drop:
+        nsx("srv", f"iptables -I {rule}")
+    check("ping Ташкент ↔ Самарканд идёт мимо сервера", ping_retry("w1", w2.ip) and ping_retry("w2", w1.ip))
+    before = server_rx(w1)
+    nsx("w1", f"ping -c 40 -i 0.05 -s 1200 -q {w2.ip}", check=False)
+    grown = server_rx(w1) - before
+    check("40 КБ ping не прошли через сервер (сервер принял от ПК < 8 КБ)", grown < 8000, f"{grown} байт")
+    for rule in drop:
+        nsx("srv", f"iptables -D {rule}")
+
+    print("\n    путь через интернет пропал → снова через сервер")
+    cut = "FORWARD -i wan -s 11.0.0.12 -j DROP"          # провайдер/роутер перестал пропускать
+    nsx("r1", f"iptables -I {cut}")
+    w1.step(); w2.step()
+    time.sleep(rc.DIRECT_RX_TIMEOUT_WAN + 2)
+    w1.step(); w2.step()
+    check("сосед без пакетов удалён", not direct_peers(w1).get(k2, {}).get("allowed_ips")
+          and not direct_peers(w2).get(k1, {}).get("allowed_ips"), f"{direct_peers(w1)} {direct_peers(w2)}")
+    check("связь через сервер работает", ping_retry("w1", w2.ip) and ping_retry("w2", w1.ip))
+    nsx("r1", f"iptables -D {cut}")
+
+    print("\n    роутер с симметричным NAT (новый порт на каждый адрес) → прямого пути нет, работает сервер")
+    nsx("r2", "iptables -t nat -R POSTROUTING 1 -o wan -j MASQUERADE --random-fully")
+    nsx("r1", "conntrack -F", check=False); nsx("r2", "conntrack -F", check=False)
+    for pc in (w1, w2):
+        pc.w.direct.backoff.clear()
+    rc.DIRECT_PROBE_WAN = 6
+    for _ in range(3):
+        settle(w1, w2, rounds=3)
+        time.sleep(2.5)
+    check("прямого пути нет", not direct_peers(w1).get(k2, {}).get("allowed_ips")
+          and not direct_peers(w2).get(k1, {}).get("allowed_ips"), f"{direct_peers(w1)} {direct_peers(w2)}")
+    check("клиент ждёт общего окна для новой попытки", k2 in w1.w.direct.backoff and k1 in w2.w.direct.backoff)
+    check("ping через сервер работает", ping_retry("w1", w2.ip) and ping_retry("w2", w1.ip))
+
+    print("\n    роутер снова обычный → прямой путь вернулся")
+    nsx("r2", "iptables -t nat -R POSTROUTING 1 -o wan -j MASQUERADE")
+    nsx("r2", "conntrack -F", check=False)
+    w2.step(); time.sleep(2.5)       # сервер узнаёт новый внешний порт Самарканда
+    for pc in (w1, w2):
+        pc.w.direct.backoff.clear()
+    rc.DIRECT_PROBE_WAN = 25
+    settle(w1, w2, rounds=3); time.sleep(2); settle(w1, w2, rounds=3)
+    check("напрямую снова", direct_peers(w1).get(k2, {}).get("allowed_ips") == f"{w2.ip}/32"
+          and direct_peers(w2).get(k1, {}).get("allowed_ips") == f"{w1.ip}/32", f"{direct_peers(w1)} {direct_peers(w2)}")
+
+    print("\n    «любой трафик» выключен → прямых путей нет, правила сервера снова действуют")
+    cab.post(API + "/cabinet/settings", data={"share_name": "share", "share_ports": "445"})
+    w1.step(); w2.step()
+    check("прямые пиры удалены у обоих", not direct_peers(w1) and not direct_peers(w2))
+    check("ping через сервер работает", ping_retry("w1", w2.ip))
 
 
 if __name__ == "__main__":

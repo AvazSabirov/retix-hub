@@ -42,6 +42,8 @@ class HeartbeatIn(BaseModel):
     lan: list[str] | None = Field(default=None, max_length=services.LAN_MAX_ADDRS)
     wg_port: int = Field(default=0, ge=0, le=65535)
     direct: list[int] = Field(default_factory=list, max_length=254)
+    # клиент 1.0.12+: умеет прямой путь через интернет к ПК других офисов (пробой NAT)
+    wan: bool = False
 
 
 def _token_reused(conn, device_id: int, now: int) -> None:
@@ -250,8 +252,8 @@ def heartbeat(data: HeartbeatIn, ctx=Depends(current_device)):
     conn.execute("UPDATE devices SET last_seen=CURRENT_TIMESTAMP, client_version=? WHERE id=?",
                  (data.client_version, dev["id"]))
     if data.lan is not None:
-        conn.execute("UPDATE devices SET lan_addrs=?, wg_port=?, lan_at=?, direct_ids=? WHERE id=?",
+        conn.execute("UPDATE devices SET lan_addrs=?, wg_port=?, lan_at=?, direct_ids=?, wan_ok=? WHERE id=?",
                      (json.dumps(services.clean_lan(data.lan)), data.wg_port, int(time.time()),
-                      json.dumps(sorted(set(data.direct))), dev["id"]))
+                      json.dumps(sorted(set(data.direct))), 1 if data.wan else 0, dev["id"]))
     conn.commit()
     return {"ok": True}

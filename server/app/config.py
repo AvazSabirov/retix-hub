@@ -54,6 +54,7 @@ COOKIE_SECURE = os.getenv("COOKIE_SECURE", "1") == "1"
 # WG_DRY_RUN=1 — не трогать wg/iptables, только логировать (для разработки)
 DRY_RUN = os.getenv("WG_DRY_RUN", "0") == "1"
 IPTABLES = os.getenv("IPTABLES", "iptables")  # или iptables-legacy
+TC = os.getenv("TC", "tc")  # ограничение скорости через сервер (iproute2)
 
 
 def _secret_key() -> str:

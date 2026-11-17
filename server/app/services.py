@@ -147,6 +147,23 @@ def _lan_ready(dev, now: float) -> bool:
     return bool(dev["wg_port"]) and now - dev["lan_at"] < LAN_FRESH_SECONDS
 
 
+ENDPOINT_V4_RE = re.compile(r"^(\d{1,3}(?:\.\d{1,3}){3}):(\d{1,5})$")
+
+
+def _internet_endpoint(endpoint: str) -> str:
+    """'203.0.113.5:51234' — внешний IPv4 и порт, с которых сервер видит пакеты ПК; иначе ''."""
+    m = ENDPOINT_V4_RE.match(endpoint or "")
+    try:
+        ok = bool(m) and ipaddress.IPv4Address(m.group(1)).is_global and 0 < int(m.group(2)) < 65536
+    except ValueError:
+        ok = False
+    return endpoint if ok else ""
+
+
+def _wan_ready(dev, now: float) -> bool:
+    return bool(dev["wan_ok"]) and now - dev["lan_at"] < LAN_FRESH_SECONDS
+
+
 def direct_neighbors(conn, dev, company) -> list[dict]:
     """Соседи по локальной сети, с которыми ПК может связываться напрямую.
     Соседи — ПК той же компании, которые выходят в интернет с того же внешнего IP (один офис за одним
@@ -181,6 +198,34 @@ def direct_neighbors(conn, dev, company) -> list[dict]:
     return result
 
 
+# ---------- прямой путь через интернет ----------
+# ПК компании с «любым трафиком» в разных офисах тоже пробуют связаться напрямую (пробой NAT). Сервер видит,
+# с какого внешнего адреса и порта приходят пакеты WireGuard каждого ПК: это и есть «дверь» в его роутере,
+# открытая для сокета туннеля. Сервер отдаёт эти адреса обоим ПК, они одновременно шлют друг другу handshake,
+# и каждый роутер пропускает ответ на свой же исходящий пакет. Не все роутеры так умеют (симметричный NAT,
+# часть мобильных операторов) — тогда handshake не проходит и трафик, как раньше, идёт через сервер.
+
+def wan_neighbors(conn, dev, company) -> list[dict]:
+    """ПК той же компании за ДРУГИМ внешним IP, с которыми можно попробовать прямой путь через интернет.
+    Оба ПК должны уметь это (клиент 1.0.12+, wan в heartbeat) — иначе пробовать бессмысленно."""
+    now = time.time()
+    if not company["full_lan"] or device_status(dev) != "active" or not dev["token_hash"] \
+            or not _wan_ready(dev, now):
+        return []
+    mine = _internet_endpoint(dev["endpoint"])
+    if not mine:
+        return []
+    result = []
+    rows = conn.execute("SELECT * FROM devices WHERE company_id=? AND id<>? AND is_blocked=0 AND is_approved=1 "
+                        "AND token_hash IS NOT NULL ORDER BY id", (company["id"], dev["id"])).fetchall()
+    for o in rows:
+        theirs = _internet_endpoint(o["endpoint"])
+        if not theirs or _public_ip(theirs) == _public_ip(mine) or not is_online(o) or not _wan_ready(o, now):
+            continue                                    # тот же внешний IP — это один офис (direct_neighbors)
+        result.append({"id": o["id"], "public_key": o["public_key"], "ip": o["ip"], "endpoints": [theirs]})
+    return result
+
+
 def client_config(conn, dev, company) -> dict:
     """Всё, что нужно клиенту, чтобы собрать .conf WireGuard."""
     share = share_host(conn, company["id"])
@@ -209,6 +254,8 @@ def client_config(conn, dev, company) -> dict:
         # прямой путь по локальной сети: включён ли в компании и с кем можно попробовать
         "direct_enabled": bool(company["full_lan"]),
         "direct": direct_neighbors(conn, dev, company),
+        "direct_wan": wan_neighbors(conn, dev, company),   # ПК других офисов: прямой путь через интернет
+        "time": int(time.time()),   # часы сервера: ПК пробуют прямой путь через интернет одновременно
     }
 
 
@@ -231,6 +278,32 @@ def build_forward_rules(conn) -> list[str]:
     return rules
 
 
+SPEED_MAX = 10000  # Мбит/с
+
+
+def clean_speed(value) -> int | None:
+    """Скорость в Мбит/с: 0 — без ограничения. Пусто — 0. Не число или вне 0…10000 — None."""
+    value = str(value if value is not None else "").strip()
+    if not value:
+        return 0
+    if not value.isdigit() or int(value) > SPEED_MAX:
+        return None
+    return int(value)
+
+
+def build_shaping(conn) -> list[dict]:
+    """Ограничения скорости через сервер: компании и ПК, которые сейчас в wg0."""
+    out = []
+    for c in conn.execute("SELECT id, subnet_index, speed_limit FROM companies WHERE is_active=1 "
+                          "ORDER BY subnet_index").fetchall():
+        devices = sorted((int(r["ip"].rsplit(".", 1)[1]), int(r["speed_limit"])) for r in conn.execute(
+            "SELECT ip, speed_limit FROM devices WHERE company_id=? AND speed_limit>0 AND is_blocked=0 "
+            "AND is_approved=1 AND token_hash IS NOT NULL", (c["id"],)))
+        if c["speed_limit"] > 0 or devices:
+            out.append({"subnet": c["subnet_index"], "mbit": int(c["speed_limit"]), "devices": devices})
+    return out
+
+
 def reconcile(conn=None) -> bool:
     """Приводит wg0 и iptables в соответствие с базой. База — источник правды."""
     own = conn is None
@@ -243,6 +316,7 @@ def reconcile(conn=None) -> bool:
                 "AND d.token_hash IS NOT NULL").fetchall()  # токен отозван (выход, «отключить все») — вне сети
             wg.sync_peers({r["public_key"]: r["ip"] for r in rows})
             wg.apply_firewall(build_forward_rules(conn))
+            wg.apply_shaping(build_shaping(conn))
         return True
     except Exception:
         log.exception("reconcile failed")
@@ -301,6 +375,12 @@ def device_action(conn, company_id: int, device_id: int, action: str, value: str
             conn.execute("UPDATE devices SET show_peers=? WHERE id=?", (1 if action == "peers_on" else 0, device_id))
             msg = (f"{dev['name']} видит другие компьютеры в программе" if action == "peers_on" else
                    f"{dev['name']} больше не видит другие компьютеры в программе (сеть не изменилась)")
+        elif action == "speed":
+            mbit = clean_speed(value)
+            if mbit is None:
+                raise ValueError(f"Скорость — целое число Мбит/с от 0 до {SPEED_MAX} (0 — без ограничения)")
+            conn.execute("UPDATE devices SET speed_limit=? WHERE id=?", (mbit, device_id))
+            msg = f"{dev['name']}: скорость через сервер " + (f"до {mbit} Мбит/с" if mbit else "без ограничения")
         elif action == "rename":
             name = (value or "").strip()[:64]
             if not name:

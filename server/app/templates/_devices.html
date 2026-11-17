@@ -1,6 +1,6 @@
 {% macro devices_table(devices, prefix) %}
 <table class="cards">
-  <thead><tr><th>Статус</th><th>Имя</th><th>Компьютер</th><th>IP</th><th>Последняя связь</th><th>Клиент</th><th title="Видит ли этот ПК в программе другие компьютеры и может ли им писать. Сеть (папки, Radmin, ping) от этого не меняется">Видит ПК</th><th>Действия</th></tr></thead>
+  <thead><tr><th>Статус</th><th>Имя</th><th>Компьютер</th><th>IP</th><th>Последняя связь</th><th>Клиент</th><th title="Скорость через сервер для этого ПК, Мбит/с: и приём, и отправка. Пусто или 0 — без ограничения. Прямой путь мимо сервера не ограничивается">Скорость</th><th title="Видит ли этот ПК в программе другие компьютеры и может ли им писать. Сеть (папки, Radmin, ping) от этого не меняется">Видит ПК</th><th>Действия</th></tr></thead>
   <tbody>
   {% for d in devices %}
   <tr>
@@ -15,9 +15,14 @@
       </form>
     </td>
     <td data-label="Компьютер">{{ d.hostname or '—' }}</td>
-    <td data-label="IP"><code>{{ d.ip }}</code>{% if d.direct_peers %}<br><small class="muted" title="С этими ПК связь идёт напрямую по локальной сети, мимо сервера">напрямую: {{ d.direct_peers | join(', ') }}</small>{% endif %}</td>
+    <td data-label="IP"><code>{{ d.ip }}</code>{% if d.direct_peers %}<br><small class="muted" title="С этими ПК связь идёт напрямую (по локальной сети или через интернет), мимо сервера">напрямую: {{ d.direct_peers | join(', ') }}</small>{% endif %}</td>
     <td data-label="Последняя связь" class="muted">{{ (d.last_rx_at or d.last_handshake) | ago }}{% if d.endpoint %}<br><small>{{ d.endpoint }}</small>{% endif %}</td>
     <td data-label="Клиент" class="muted">{{ d.client_version or '—' }}</td>
+    <td data-label="Скорость, Мбит/с">
+      <form class="rename speed" method="post" action="{{ prefix }}{{ d.id }}/speed">
+        <input type="number" name="value" value="{{ d.speed_limit or '' }}" min="0" max="10000" placeholder="∞" title="Мбит/с через сервер, пусто — без ограничения"><button class="small" title="Сохранить скорость">✓</button>
+      </form>
+    </td>
     <td data-label="Видит другие ПК">
       <form method="post" action="{{ prefix }}{{ d.id }}/{{ 'peers_off' if d.show_peers else 'peers_on' }}">
         <button class="small" title="{{ 'Скрыть другие компьютеры в программе этого ПК (сеть останется)' if d.show_peers else 'Показать этому ПК другие компьютеры в программе' }}">{{ 'да' if d.show_peers else 'нет' }}</button>
@@ -36,7 +41,7 @@
     </td>
   </tr>
   {% else %}
-  <tr class="empty-row"><td colspan="8" class="muted empty">Устройств пока нет. Установите клиент на компьютер и войдите логином компании.</td></tr>
+  <tr class="empty-row"><td colspan="9" class="muted empty">Устройств пока нет. Установите клиент на компьютер и войдите логином компании.</td></tr>
   {% endfor %}
   </tbody>
 </table>

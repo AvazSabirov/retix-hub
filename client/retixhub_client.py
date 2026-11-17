@@ -37,7 +37,7 @@ import requests
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
 
-VERSION = "1.0.11"
+VERSION = "1.0.12"
 APP_NAME = "RetixHub"          # служебное имя: папки, задачи, мьютекс
 APP_TITLE = "Retix Hub"        # то, что видит пользователь
 TUNNEL = "retixhub"
@@ -72,6 +72,12 @@ DIRECT_TICK = 1            # сек — пока идёт проверка пу�
 LAN_CHECK_EVERY = 60       # сек — как часто перечитывать адреса своей локальной сети
 DIRECT_CACHE_DAYS = 3      # сохранённые соседи действуют без сервера столько дней после его последнего ответа
 DIRECT_CACHE_REFRESH = 3600  # сек — как часто переписывать неизменившийся список соседей на диск
+# Прямой путь через интернет к ПК другого офиса (пробой NAT): дольше проверка, реже keepalive
+DIRECT_KEEPALIVE_WAN = 20    # сек — держит открытой «дверь» в роутере (NAT забывает UDP через 30–60 с)
+DIRECT_PROBE_WAN = 25        # сек — ждём handshake: соседу нужно успеть начать одновременно с нами
+DIRECT_RX_TIMEOUT_WAN = 50   # сек — от соседа нет пакетов (2,5 keepalive) — путь потерян
+DIRECT_SLOT_WAN_FAILED = 600  # сек — не получилось (роутер не умеет): снова в начале следующего окна
+DIRECT_SLOT_WAN_LOST = 60     # сек — путь пропал: снова в начале следующего окна
 
 UPDATE_FIRST = 60        # сек после запуска — первая проверка новой версии
 UPDATE_EVERY = 600       # сек — дальше каждые 10 минут
@@ -370,9 +376,10 @@ class Api:
         return self._req("GET", "/api/peers")
 
     def heartbeat(self, lan: list | None = None, wg_port: int = 0, direct: list | None = None):
+        # wan: этот клиент умеет прямой путь через интернет — сервер может свести его с ПК других офисов
         return self._req("POST", "/api/heartbeat", json={"client_version": VERSION, "lan": list(lan or []),
                                                          "wg_port": int(wg_port or 0),
-                                                         "direct": list(direct or [])})
+                                                         "direct": list(direct or []), "wan": True})
 
     def send_message(self, to: int, text: str):
         return self._req("POST", "/api/messages", json={"to": to, "text": text})
@@ -448,6 +455,38 @@ def lan_endpoint_ok(value) -> bool:
         return bool(m) and lan_ip_ok(_ipv4(m.group(1))) and 0 < int(m.group(2)) < 65536
     except ValueError:
         return False
+
+
+def wan_endpoint_ok(value) -> bool:
+    """Внешний адрес соседа в интернете (как его видит сервер): публичный IPv4 и порт."""
+    m = LAN_ENDPOINT_RE.match(str(value))
+    try:
+        return bool(m) and _ipv4(m.group(1)).is_global and 0 < int(m.group(2)) < 65536
+    except ValueError:
+        return False
+
+
+def wan_neighbors(cfg: dict, own_key: str = "", skip=()) -> list[dict]:
+    """ПК других офисов для прямого пути через интернет (direct_wan от сервера, клиент 1.0.12+). Проверки те
+    же, что у соседей по локальной сети, но адрес — публичный. skip — ключи, уже известные как соседи по LAN."""
+    if not cfg.get("direct_enabled"):
+        return []
+    out, seen = [], {own_key, str(cfg.get("server_public_key")), *skip}
+    for n in cfg.get("direct_wan") or []:
+        try:
+            key, ip = str(n["public_key"]), str(n["ip"])
+            if not KEY_RE.match(key) or key in seen:
+                raise ValueError(f"ключ {key[:8]}…")
+            if not peer_ip_ok(ip, cfg["subnet"]) or ip in (cfg["ip"], cfg["server_ip"]):
+                raise ValueError(f"адрес {ip!r}")
+            endpoints = [str(e) for e in n.get("endpoints") or [] if wan_endpoint_ok(e)][:2]
+            if not endpoints:
+                raise ValueError(f"нет внешнего адреса у {ip}")
+            out.append({"id": int(n["id"]), "public_key": key, "ip": ip, "endpoints": endpoints, "wan": True})
+            seen.add(key)
+        except (KeyError, TypeError, ValueError, AttributeError) as e:
+            log.warning("сосед через интернет отклонён: %s", e)
+    return out
 
 
 def direct_neighbors(cfg: dict, own_key: str = "") -> list[dict]:
@@ -648,7 +687,11 @@ class DirectPaths:
     точнее подсети компании у сервера, и пакеты к соседу идут напрямую (маршрут Windows не меняется —
     /32 и так внутри подсети туннеля). Handshake не прошёл ни по одному адресу, или от соседа перестали
     приходить пакеты, или сервер его больше не называет — сосед удаляется, трафик снова идёт через сервер.
-    Пира сервера этот класс не трогает никогда."""
+    Пира сервера этот класс не трогает никогда.
+
+    Сосед из другого офиса (wan) — то же самое, но адрес — внешний, с которого его видит сервер: оба ПК шлют
+    handshake друг другу одновременно, и роутер каждого пропускает ответ на свой исходящий пакет (пробой NAT).
+    Одновременность важна, поэтому повторные попытки — в начале общего окна по часам сервера (clock)."""
 
     def __init__(self, tunnel):
         self.tunnel = tunnel
@@ -662,12 +705,22 @@ class DirectPaths:
         self.own_port = 0                                  # порт, который задали сами (set_listen_port)
         self.port_done = False                             # порт туннеля уже приведён к сохранённому
         self.endpoints: dict[str, str] = {}                # ключ -> адрес, по которому сосед отвечает сейчас
+        self.clock = 0.0                                   # часы сервера минус свои: окна попыток через интернет
 
     def probing(self) -> bool:
         return bool(self.probes)
 
     def active_ids(self) -> list[int]:
         return sorted(self.active.values())
+
+    def wan_ids(self) -> set[int]:
+        """С кем связь напрямую через интернет (остальные из active_ids — по локальной сети)."""
+        return {i for k, i in self.active.items() if (self.wanted.get(k) or {}).get("wan")}
+
+    def next_slot(self, now: float, period: int) -> float:
+        """Начало следующего окна длиной period по часам сервера — у обоих ПК одно и то же."""
+        server_now = now + self.clock
+        return (server_now // period + 1) * period - self.clock
 
     def reset(self) -> None:
         """Туннель снят или переустановлен — прямых пиров в нём больше нет."""
@@ -702,18 +755,20 @@ class DirectPaths:
 
     def _check(self, key: str, n: dict, peer: dict | None, now: float) -> None:
         endpoints = tuple(n["endpoints"])
+        wan = bool(n.get("wan"))
+        where = "через интернет" if wan else "по локальной сети"
         until, failed = self.backoff.get(key, (0.0, ()))
-        if now < until and failed == endpoints:
+        if now < until and (failed == endpoints or wan):
             if peer:
                 self._drop(key, "ждём перед новой попыткой")
             return
         allowed = f"{n['ip']}/32"
         if peer is None:
-            log.info("прямой путь к %s: проверяем %s", n["ip"], endpoints[0])
+            log.info("прямой путь к %s %s: проверяем %s", n["ip"], where, endpoints[0])
             self.active.pop(key, None)
             self.rx.pop(key, None)
             self.probes[key] = {"started": now, "idx": 0}
-            self.tunnel.set_peer(key, endpoint=endpoints[0], keepalive=DIRECT_KEEPALIVE)
+            self.tunnel.set_peer(key, endpoint=endpoints[0], keepalive=DIRECT_KEEPALIVE_WAN if wan else DIRECT_KEEPALIVE)
             return
         last = self.rx.get(key)
         if last is None or peer["rx"] != last[0]:
@@ -721,8 +776,9 @@ class DirectPaths:
         if peer["allowed_ips"]:                               # уже напрямую
             if peer["allowed_ips"] != allowed:
                 self.tunnel.set_peer(key, allowed_ips=allowed)
-            if now - last[1] > DIRECT_RX_TIMEOUT:
-                self._fail(key, endpoints, DIRECT_RETRY_LOST, f"от {n['ip']} нет пакетов — снова через сервер")
+            if now - last[1] > (DIRECT_RX_TIMEOUT_WAN if wan else DIRECT_RX_TIMEOUT):
+                self._fail(key, endpoints, DIRECT_SLOT_WAN_LOST if wan else DIRECT_RETRY_LOST,
+                           f"от {n['ip']} нет пакетов — снова через сервер", wan)
             else:
                 self.active[key] = n["id"]
                 if peer["endpoint"]:
@@ -735,11 +791,12 @@ class DirectPaths:
             self.active[key] = n["id"]
             self.rx[key] = (peer["rx"], now)
             self.backoff.pop(key, None)
-            log.info("прямой путь к %s по локальной сети (%s)", n["ip"], peer["endpoint"] or endpoints[0])
-        elif now - probe["started"] > DIRECT_PROBE_SECONDS:
+            log.info("прямой путь к %s %s (%s)", n["ip"], where, peer["endpoint"] or endpoints[0])
+        elif now - probe["started"] > (DIRECT_PROBE_WAN if wan else DIRECT_PROBE_SECONDS):
             probe["idx"] += 1
             if probe["idx"] >= len(endpoints):
-                self._fail(key, endpoints, DIRECT_RETRY_FAILED, f"{n['ip']} не ответил по локальной сети")
+                self._fail(key, endpoints, DIRECT_SLOT_WAN_FAILED if wan else DIRECT_RETRY_FAILED,
+                           f"{n['ip']} не ответил {where}", wan)
             else:
                 probe["started"] = now
                 self.tunnel.set_peer(key, endpoint=endpoints[probe["idx"]])
@@ -751,10 +808,12 @@ class DirectPaths:
         for d in (self.active, self.probes, self.rx, self.endpoints):
             d.pop(key, None)
 
-    def _fail(self, key: str, endpoints: tuple, delay: int, why: str) -> None:
+    def _fail(self, key: str, endpoints: tuple, delay: int, why: str, wan: bool = False) -> None:
         log.info("прямой путь: %s", why)
         self._drop(key, why)
-        self.backoff[key] = (time.time() + delay, endpoints)
+        now = time.time()
+        # через интернет — в начале общего окна: сосед тоже не дождался и попробует в то же время
+        self.backoff[key] = (self.next_slot(now, delay) if wan else now + delay, endpoints)
 
 
 def install_wireguard_if_needed() -> bool:
@@ -1374,7 +1433,11 @@ class Worker(threading.Thread):
             self.lan = []
         _, pub = self.state.keypair()
         try:
-            self.direct.sync(direct_neighbors(self.cfg, pub) if enabled else [], self.cfg["server_public_key"])
+            if isinstance(self.cfg.get("time"), int) and not isinstance(self.cfg.get("time"), bool):
+                self.direct.clock = self.cfg["time"] - now
+            lan = direct_neighbors(self.cfg, pub) if enabled else []
+            wan = wan_neighbors(self.cfg, pub, skip={n["public_key"] for n in lan}) if enabled else []
+            self.direct.sync(lan + wan, self.cfg["server_public_key"])
         except Exception:  # noqa: BLE001
             log.exception("прямой путь")
         if enabled and self.lan:
@@ -1465,6 +1528,11 @@ class Worker(threading.Thread):
                      if isinstance(n, dict) and now - (n.get("verified_at") or 0) < ttl]
             neighbors = direct_neighbors(dict(cfg, direct=saved), pub)
             server_key = cfg["server_public_key"]
+            # прямые пути через интернет, которые уже работают, остаются: интернет может быть, а сервера нет.
+            # Пропадёт и интернет — от соседа не будет пакетов, и путь закроется сам.
+            have = {n["public_key"] for n in neighbors}
+            neighbors += [n for k, n in self.direct.wanted.items()
+                          if n.get("wan") and k in self.direct.active and k not in have and server_key == self.direct.server_key]
         except (ValueError, TypeError, KeyError):
             if not self.direct.wanted:
                 return False
@@ -1514,9 +1582,9 @@ class Worker(threading.Thread):
             for n in cache.get("neighbors") or [] if isinstance(n, dict) and peer_ip_ok(n.get("ip"), cfg.get("subnet"))]
         if cfg.get("show_peers") is False:
             base = [p for p in base if p.get("is_me")]
-        direct = set(self.direct.active_ids())
-        return [dict(p, online=bool(p.get("is_me")) or p.get("id") in direct, direct=p.get("id") in direct)
-                for p in base]
+        direct, wan = set(self.direct.active_ids()), self.direct.wan_ids()
+        return [dict(p, online=bool(p.get("is_me")) or p.get("id") in direct, direct=p.get("id") in direct,
+                     direct_wan=p.get("id") in wan) for p in base]
 
     def step(self):
         if not self.tunnel.installed() and not install_wireguard_if_needed():
@@ -1660,8 +1728,9 @@ class Worker(threading.Thread):
             peers = self.api.peers()["peers"]
         except (ApiError, ServerUnreachable):
             peers = []
-        direct = set(self.direct.active_ids())
-        peers = [dict(p, direct=p.get("id") in direct) for p in peers if peer_ip_ok(p.get("ip"), self.cfg["subnet"])]
+        direct, wan = set(self.direct.active_ids()), self.direct.wan_ids()
+        peers = [dict(p, direct=p.get("id") in direct, direct_wan=p.get("id") in wan)
+                 for p in peers if peer_ip_ok(p.get("ip"), self.cfg["subnet"])]
         self.emit("peers", peers=peers)
         if peers:
             self.last_peers = peers
@@ -2434,7 +2503,8 @@ class App(tk.Tk):
             online = p["online"] and self.status_now not in (Status.SERVER_DOWN, Status.BLOCKED, Status.OFF)
             self.tree.insert("", "end", iid=str(p["id"]), text=" " + p["name"],
                              image=self.img_on if online else self.img_off,
-                             values=(p["ip"] + ("  ⇄ LAN" if online and p.get("direct") else ""),),
+                             values=(p["ip"] + (("  ⇄ WAN" if p.get("direct_wan") else "  ⇄ LAN")
+                                                if online and p.get("direct") else ""),),
                              tags=() if online else ("off",))
         if sel and self.tree.exists(sel[0]):
             self.tree.selection_set(sel[0])
@@ -2734,7 +2804,7 @@ class App(tk.Tk):
             f"Компьютер:  {p.get('hostname') or '—'}",
             f"IP-адрес:  {p['ip']}",
             f"Статус:  {'в сети' if p['online'] else 'не в сети'}",
-            f"Связь:  {'напрямую по локальной сети' if p.get('direct') else 'через сервер Retix Hub'}",
+            f"Связь:  {('напрямую через интернет' if p.get('direct_wan') else 'напрямую по локальной сети') if p.get('direct') else 'через сервер Retix Hub'}",
             f"Последняя связь:  {seen}",
             f"Версия Retix Hub:  {p.get('client_version') or '—'}",
             "",

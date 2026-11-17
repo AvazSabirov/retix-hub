@@ -1139,3 +1139,256 @@ class TestDirectLan:
         page = ctx.cabinet("office").get("/cabinet").text
         assert "напрямую: PC1" in page and "999" not in page.split("напрямую:")[1][:40]
         assert "мимо сервера" in page
+
+
+class TestDirectWan:
+    """Прямой путь через интернет: ПК разных офисов, сервер отдаёт их внешние адреса (пробой NAT)."""
+    OFFICE_A, OFFICE_B = "81.95.10.5", "84.54.20.7"     # публичные адреса двух офисов
+
+    def _pcs(self, ctx, full_lan=True, wan=(True, True), n=2):
+        from app import db
+        cid = ctx.company("chain")
+        if full_lan:
+            conn = db.connect(); conn.execute("UPDATE companies SET full_lan=1 WHERE id=?", (cid,)); conn.commit(); conn.close()
+        pcs = [ctx.register("chain", name=f"PC{i}") for i in range(n)]
+        for i, pc in enumerate(pcs):
+            self._report(ctx, pc, [f"192.168.{i + 1}.10/24"], 51000 + i, wan=wan[i] if i < len(wan) else True)
+            TestDirectLan._seen(pc, (self.OFFICE_A, self.OFFICE_B)[i % 2])
+        return cid, pcs
+
+    @staticmethod
+    def _report(ctx, pc, lan, port, wan=True, direct=()):
+        body = {"client_version": "1.0.12", "lan": lan, "wg_port": port, "direct": list(direct)}
+        r = ctx.api.post("/api/heartbeat", headers=ctx.h(pc["token"]), json=body | ({"wan": True} if wan else {}))
+        assert r.status_code == 200, r.text
+
+    def _me(self, ctx, pc):
+        return ctx.api.get("/api/me", headers=ctx.h(pc["token"])).json()
+
+    def test_other_offices_get_internet_addresses(self, ctx):
+        import time
+        _, (a, b) = self._pcs(ctx)
+        me = self._me(ctx, a)
+        assert me["direct"] == []                                         # не локальная сеть
+        assert me["direct_wan"] == [{"id": b["device_id"], "public_key": b["_key"], "ip": b["ip"],
+                                     "endpoints": [f"{self.OFFICE_B}:4{b['device_id']:04d}"]}]
+        assert self._me(ctx, b)["direct_wan"][0]["endpoints"] == [f"{self.OFFICE_A}:4{a['device_id']:04d}"]
+        assert abs(me["time"] - time.time()) < 5                          # часы сервера: общее окно попыток
+
+    def test_same_office_is_lan_not_internet(self, ctx):
+        _, (a, b) = self._pcs(ctx)
+        TestDirectLan._seen(b, self.OFFICE_A)
+        me = self._me(ctx, a)
+        assert me["direct_wan"] == [] and [n["id"] for n in me["direct"]] == [b["device_id"]]
+
+    def test_only_with_full_lan(self, ctx):
+        _, (a, b) = self._pcs(ctx, full_lan=False)
+        assert self._me(ctx, a)["direct_wan"] == []
+
+    def test_old_client_on_either_side(self, ctx):
+        """Клиент до 1.0.12 соседа через интернет не добавит — пробовать с ним бессмысленно."""
+        _, (a, b) = self._pcs(ctx, wan=(True, False))
+        assert self._me(ctx, a)["direct_wan"] == [] and self._me(ctx, b)["direct_wan"] == []
+        ctx.api.post("/api/heartbeat", headers=ctx.h(b["token"]), json={"client_version": "1.0.10"})
+        assert self._me(ctx, a)["direct_wan"] == []
+
+    def test_offline_stale_blocked_or_private_not_offered(self, ctx):
+        import time
+        from app import db
+        _, (a, b) = self._pcs(ctx)
+        TestDirectLan._seen(b, self.OFFICE_B, online=False)
+        assert self._me(ctx, a)["direct_wan"] == []                       # выключен
+        TestDirectLan._seen(b, "192.168.77.5")                            # сервер видит частный адрес — не интернет
+        assert self._me(ctx, a)["direct_wan"] == []
+        TestDirectLan._seen(b, "100.64.3.9")                              # CGNAT оператора — тоже не внешний
+        assert self._me(ctx, a)["direct_wan"] == []
+        TestDirectLan._seen(b, self.OFFICE_B)
+        TestDirectLan._seen(a, "10.0.0.5")                                # у самого ПК нет внешнего адреса
+        assert self._me(ctx, a)["direct_wan"] == []
+        TestDirectLan._seen(a, self.OFFICE_A)
+        conn = db.connect()
+        conn.execute("UPDATE devices SET lan_at=? WHERE id=?", (int(time.time()) - 3600, b["device_id"]))
+        conn.commit(); conn.close()
+        assert self._me(ctx, a)["direct_wan"] == []                       # давно не было heartbeat
+        self._report(ctx, b, [], 0)                                        # без локальной сети — можно
+        assert [n["id"] for n in self._me(ctx, a)["direct_wan"]] == [b["device_id"]]
+        conn = db.connect(); conn.execute("UPDATE devices SET is_blocked=1 WHERE id=?", (b["device_id"],)); conn.commit(); conn.close()
+        assert self._me(ctx, a)["direct_wan"] == []
+
+    def test_other_company_never(self, ctx):
+        _, (a,) = self._pcs(ctx, n=1)
+        from app import db
+        cid = ctx.company("rival")
+        conn = db.connect(); conn.execute("UPDATE companies SET full_lan=1 WHERE id=?", (cid,)); conn.commit(); conn.close()
+        r = ctx.register("rival", name="R")
+        self._report(ctx, r, [], 0); TestDirectLan._seen(r, self.OFFICE_B)
+        assert self._me(ctx, a)["direct_wan"] == [] and self._me(ctx, r)["direct_wan"] == []
+
+    def test_pending_device_gets_nothing(self, ctx):
+        _, (a, b) = self._pcs(ctx)
+        from app import db
+        conn = db.connect(); conn.execute("UPDATE devices SET is_approved=0 WHERE id=?", (a["device_id"],)); conn.commit(); conn.close()
+        assert self._me(ctx, a)["direct_wan"] == [] and self._me(ctx, b)["direct_wan"] == []
+
+
+class TestSpeedLimit:
+    """Скорость через сервер: на компанию (суперадмин) и на ПК (суперадмин и кабинет)."""
+
+    def test_script_company_and_devices(self, monkeypatch):
+        from app import wg
+        script = wg.shaping_script([{"subnet": 3, "mbit": 20, "devices": [(5, 50), (7, 4)]},
+                                    {"subnet": 12, "mbit": 0, "devices": [(2, 10)]}])
+        assert script[:4] == ["qdisc add dev wg0 root handle 1: htb default fffe",
+                              "class add dev wg0 parent 1: classid 1:fffe htb rate 10gbit quantum 1514",
+                              "qdisc add dev wg0 parent 1:fffe fq_codel",
+                              "qdisc add dev wg0 handle ffff: ingress"]
+        text = "\n".join(script)
+        # компания 3: 20 Мбит/с на всех, гарантия поровну между тремя классами (два ПК и остальные)
+        assert "class add dev wg0 parent 1: classid 1:3 htb rate 20mbit ceil 20mbit" in text
+        assert "classid 1:301 htb rate 6666kbit ceil 20mbit" in text
+        assert "match ip dst 10.66.3.0/24 flowid 1:301" in text
+        # ПК 10.66.3.5 просил 50 — больше компании не бывает; 10.66.3.7 — 4
+        assert "parent 1:3 classid 1:305 htb rate 6666kbit ceil 20mbit" in text
+        assert "parent 1:3 classid 1:307 htb rate 6666kbit ceil 4mbit" in text
+        assert "prio 1 u32 match ip dst 10.66.3.7/32 flowid 1:307" in text
+        assert "parent ffff: protocol ip prio 1 u32 match ip src 10.66.3.7/32 police rate 4mbit burst 65536b drop" in text
+        assert "src 10.66.3.5/32 police rate 20mbit" in text
+        # компания 12 без общего ограничения: ПК .2 — сам по себе, classid в hex (12 = 0xc)
+        assert "parent 1: classid 1:c02 htb rate 10mbit ceil 10mbit" in text
+        assert "10.66.12.0/24" not in text
+        assert wg.shaping_script([]) == []
+
+    def test_apply_only_on_change_and_clears_on_failure(self, monkeypatch):
+        from app import wg
+        calls = []
+
+        def run(args, input=None, check=True):
+            calls.append(" ".join(args))
+            if args[:2] == ["tc", "-batch"] and "fail" in calls:
+                raise RuntimeError("RTNETLINK answers: No such file or directory")
+            return "qdisc htb 1: root" if args[1:3] == ["qdisc", "show"] else ""
+        monkeypatch.setattr(wg, "DRY_RUN", False)
+        monkeypatch.setattr(wg, "run", run)
+        monkeypatch.setattr(wg, "_shaping_applied", None)
+        limits = [{"subnet": 1, "mbit": 5, "devices": []}]
+        wg.apply_shaping(limits)
+        assert calls == ["tc qdisc del dev wg0 root", "tc qdisc del dev wg0 ingress", "tc -batch -"]
+        calls.clear(); wg.apply_shaping(limits)
+        assert calls == ["tc qdisc show dev wg0"]                          # ничего не изменилось
+        calls.clear(); wg.apply_shaping([])
+        assert calls == ["tc qdisc del dev wg0 root", "tc qdisc del dev wg0 ingress"]
+        calls.clear(); wg.apply_shaping([])
+        assert calls == []                                                  # без ограничений tc не трогаем
+        calls.append("fail"); wg.apply_shaping(limits)
+        assert calls.count("tc -batch -") == 3                              # полный, без fq_codel, без police
+        assert calls[-2:] == ["tc qdisc del dev wg0 root", "tc qdisc del dev wg0 ingress"]   # лучше без, чем наполовину
+        assert wg._shaping_applied is None
+
+    def test_kernel_without_modules_gets_reduced_variant(self, monkeypatch, caplog):
+        """Нет fq_codel и act_police — ограничение приёма и компании всё равно работает (и это видно в журнале)."""
+        from app import wg
+        sent = []
+
+        def run(args, input=None, check=True):
+            if args[:2] == ["tc", "-batch"]:
+                sent.append(input)
+                if "fq_codel" in input or "police" in input:
+                    raise RuntimeError("Error: Specified qdisc kind is unknown.")
+            return ""
+        monkeypatch.setattr(wg, "DRY_RUN", False)
+        monkeypatch.setattr(wg, "run", run)
+        monkeypatch.setattr(wg, "_shaping_applied", None)
+        wg.apply_shaping([{"subnet": 1, "mbit": 5, "devices": [(2, 1)]}])
+        assert len(sent) == 3 and "police" not in sent[-1] and "fq_codel" not in sent[-1]
+        assert "1:102 htb rate" in sent[-1] and wg._shaping_applied
+        assert "без ограничения отправки" in caplog.text
+
+    def test_build_from_database(self, ctx, net):
+        from app import db
+        c1 = ctx.company("fast"); ctx.company("slow"); ctx.company("off")
+        a, b, c = (ctx.register("fast", name=n) for n in ("A", "B", "C"))
+        s1 = ctx.register("slow", name="S")
+        conn = db.connect()
+        conn.execute("UPDATE companies SET speed_limit=30 WHERE login='slow'")
+        conn.execute("UPDATE companies SET speed_limit=7, is_active=0 WHERE login='off'")
+        conn.execute("UPDATE devices SET speed_limit=5 WHERE id IN (?,?,?)", (a["device_id"], b["device_id"], c["device_id"]))
+        conn.execute("UPDATE devices SET is_blocked=1 WHERE id=?", (b["device_id"],))        # не в сети — не нужен
+        conn.execute("UPDATE devices SET token_hash=NULL WHERE id=?", (c["device_id"],))     # вышел из сети
+        conn.commit()
+        from app import services
+        limits = services.build_shaping(conn)
+        conn.close()
+        sub = {c["subnet"]: c for c in limits}
+        host = lambda d: int(d["ip"].rsplit(".", 1)[1])
+        assert sub[1] == {"subnet": 1, "mbit": 0, "devices": [(host(a), 5)]}
+        assert sub[2] == {"subnet": 2, "mbit": 30, "devices": []}
+        assert 3 not in sub                                                  # компания отключена
+        assert s1["ip"].startswith("10.66.2.") and c1
+
+    def test_admin_sets_company_speed(self, ctx, net):
+        cid = ctx.company("firma")
+        url = f"/admin/companies/{cid}/update"
+        form = {"name": "Firma", "max_devices": 20, "is_active": "1"}
+        r = ctx.admin.post(url, data=form | {"speed_limit": "25"})
+        assert "Сохранено" in r.text and "25 Мбит/с" in r.text
+        assert net["shaping"] == [{"subnet": 1, "mbit": 25, "devices": []}]
+        assert "25 Мбит/с" in ctx.cabinet("firma").get("/cabinet").text           # компания видит, но не меняет
+        r = ctx.admin.post(url, data=form)                                         # поля нет — не сбрасываем
+        assert net["shaping"][0]["mbit"] == 25
+        for bad in ("-1", "abc", "10001", "2.5"):
+            r = ctx.admin.post(url, data=form | {"speed_limit": bad})
+            assert "Скорость" in r.text and net["shaping"][0]["mbit"] == 25, bad
+        ctx.admin.post(url, data=form | {"speed_limit": "0"})
+        assert net["shaping"] == []
+        assert "speed=25" in ctx.admin.get(f"/admin/companies/{cid}").text            # журнал
+
+    def test_cabinet_and_admin_set_device_speed(self, ctx, net):
+        cid = ctx.company("firma"); ctx.company("rival")
+        d = ctx.register("firma", name="Kassa")
+        cab = ctx.cabinet("firma")
+        r = cab.post(f"/cabinet/devices/{d['device_id']}/speed", data={"value": "8"})
+        assert "Kassa: скорость через сервер до 8 Мбит/с" in r.text
+        assert net["shaping"] == [{"subnet": 1, "mbit": 0, "devices": [(2, 8)]}]
+        assert 'name="value" value="8"' in r.text
+        r = cab.post(f"/cabinet/devices/{d['device_id']}/speed", data={"value": "fast"})
+        assert "Скорость" in r.text and net["shaping"][0]["devices"] == [(2, 8)]
+        r = ctx.admin.post(f"/admin/companies/{cid}/devices/{d['device_id']}/speed", data={"value": ""})
+        assert "без ограничения" in r.text and net["shaping"] == []
+        r = ctx.cabinet("rival").post(f"/cabinet/devices/{d['device_id']}/speed", data={"value": "1"})
+        assert "не найдено" in r.text and net["shaping"] == []
+
+    @pytest.mark.skipif(not __import__("shutil").which("tc") or __import__("os").geteuid() != 0,
+                        reason="нужны root и tc")
+    def test_script_accepted_by_real_tc(self):
+        """Команды принимает настоящий tc: в отдельном network namespace на интерфейсе wg0 (tun, как у wireguard-go)."""
+        import subprocess
+        from app import wg
+        ns = "rxtc-test"
+        sh = lambda c, check=True: subprocess.run(c, shell=True, capture_output=True, text=True, check=check)
+        if sh(f"ip netns add {ns}", check=False).returncode != 0:
+            pytest.skip("network namespace недоступен")
+        try:
+            sh(f"ip netns exec {ns} ip tuntap add wg0 mode tun && ip netns exec {ns} ip link set wg0 up")
+            limits = [{"subnet": 3, "mbit": 20, "devices": [(5, 50), (7, 4)]},
+                      {"subnet": 254, "mbit": 0, "devices": [(254, 1)]}]
+            applied = None
+            for fair, police, _ in wg.SHAPING_VARIANTS:     # ядро песочницы может не знать fq_codel / police
+                sh(f"ip netns exec {ns} tc qdisc del dev wg0 root; ip netns exec {ns} tc qdisc del dev wg0 ingress",
+                   check=False)
+                script = wg.shaping_script(limits, fair, police)
+                r = subprocess.run(["ip", "netns", "exec", ns, "tc", "-batch", "-"], input="\n".join(script) + "\n",
+                                   capture_output=True, text=True)
+                if r.returncode == 0:
+                    applied = (fair, police)
+                    break
+                assert "unknown" in r.stderr or "module" in r.stderr, r.stderr   # только нехватка модуля
+            assert applied, r.stderr
+            classes = sh(f"ip netns exec {ns} tc class show dev wg0").stdout
+            for cls in ("1:3 ", "1:301", "1:305", "1:307", "1:fefe", "1:fffe"):
+                assert f"class htb {cls}" in classes, cls
+            assert sh(f"ip netns exec {ns} tc filter show dev wg0 parent 1:").stdout.count("flowid") == 4   # 3 ПК + компания 3
+            if applied[1]:
+                filters = sh(f"ip netns exec {ns} tc filter show dev wg0 parent ffff:").stdout
+                assert filters.count("police") == 3
+        finally:
+            sh(f"ip netns del {ns}", check=False)
