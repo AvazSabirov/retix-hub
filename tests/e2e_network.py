@@ -209,6 +209,9 @@ class LinuxTunnel:
     def remove_peer(self, key):
         nsx(self.ns, f"wg set {self.iface} peer {key} remove", check=False)
 
+    def saved_conf(self):
+        return getattr(self, "conf", "")
+
     def set_listen_port(self, port):
         return nsx(self.ns, f"wg set {self.iface} listen-port {port}", check=False).returncode == 0
 
@@ -537,6 +540,13 @@ def direct_lan(srv, cab_a, a1, a2, a3, b1):
     check("SMB PC1 ← Бухгалтерия без сервера", tcp("a2", ip1, 445))
     check("в программе Бухгалтерия «в сети», напрямую",
           any(p["name"] == "Бухгалтерия" and p["online"] and p.get("direct") for p in a1.peers), str(a1.peers))
+    a1.w.set_enabled(False)
+    st = a1.step()
+    check("OFF без сервера: туннель снят", st["status"] == rc.Status.OFF and a1.tunnel.service_state() == "missing", str(st))
+    a1.w.set_enabled(True)
+    settle(a1, a2, rounds=3)
+    check("ON без сервера: туннель из последнего конфига, снова напрямую",
+          a1.step()["status"] == rc.Status.LAN_ONLY and ping_retry("a1", ip2) and ping_retry("a2", ip1))
     check("контроль: Запасной (не сосед) без сервера недоступен", not ping("a1", a3.ip))
     srv.start()
     for pc in (a1, a2):

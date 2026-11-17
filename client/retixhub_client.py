@@ -603,6 +603,14 @@ class Tunnel:
         run([str(WG_EXE), "set", TUNNEL, "peer", key, "remove"], timeout=10)
 
     @staticmethod
+    def saved_conf() -> str:
+        """Конфиг последнего туннеля (лежит в DATA_DIR — только SYSTEM и администраторы)."""
+        try:
+            return CONF_FILE.read_text("utf-8") if CONF_FILE.exists() else ""
+        except OSError:
+            return ""
+
+    @staticmethod
     def set_listen_port(port: int) -> bool:
         rc, out = run([str(WG_EXE), "set", TUNNEL, "listen-port", str(port)], timeout=10)
         if rc != 0:
@@ -613,10 +621,11 @@ class Tunnel:
 def parse_wg_dump(out: str) -> dict:
     """wg show <tunnel> dump: первая строка — интерфейс (…, listen-port), дальше по строке на пира."""
     lines = [line for line in out.splitlines() if line.strip()]
-    port, peers = 0, {}
+    port, peers, own = 0, {}, ""
     if lines:
         head = lines[0].split("\t")
         port = int(head[2]) if len(head) >= 3 and head[2].isdigit() else 0
+        own = head[1] if len(head) >= 2 else ""
     for line in lines[1:]:
         p = line.split("\t")
         if len(p) < 7:
@@ -627,7 +636,7 @@ def parse_wg_dump(out: str) -> dict:
                            "handshake": int(p[4] or 0), "rx": int(p[5] or 0)}
         except ValueError:
             continue
-    return {"listen_port": port, "peers": peers}
+    return {"listen_port": port, "peers": peers, "public_key": own}
 
 
 class DirectPaths:
@@ -681,10 +690,14 @@ class DirectPaths:
         live = {k: v for k, v in state["peers"].items()
                 if k != self.server_key and ("," not in v["allowed_ips"])
                 and (not v["allowed_ips"] or v["allowed_ips"].endswith("/32"))}
+        protected = state["peers"].keys() - live.keys()     # пир сервера (по ключу или по его AllowedIPs)
         now = time.time()
         for key in live.keys() - self.wanted.keys():
             self._drop(key, "больше не сосед по локальной сети")
         for key, n in self.wanted.items():
+            if key in protected:
+                log.warning("сосед %s с ключом пира сервера — пропускаем", n["ip"])
+                continue
             self._check(key, n, live.get(key), now)
 
     def _check(self, key: str, n: dict, peer: dict | None, now: float) -> None:
@@ -1206,7 +1219,8 @@ class Worker(threading.Thread):
             if target != self.state.current_key() and self.state.get("company_login"):
                 self.state.stash_current()
                 if not self.state.activate(target):   # уже в списке — тот же ключ, тот же ПК на сервере
-                    self.state.set(token="", private_key="", join_password="", company_name="", last_conf_hash="")
+                    self.state.set(token="", private_key="", join_password="", company_name="", last_conf_hash="",
+                                   direct_cache={})
             self.state.set(server_url=server, company_login=company, device_name=device.strip())
             try:
                 self._register(password)
@@ -1444,7 +1458,7 @@ class Worker(threading.Thread):
             if not (fresh and cfg.get("direct_enabled") and KEY_RE.match(str(cfg.get("server_public_key")))
                     and peer_ip_ok(cfg.get("ip"), cfg.get("subnet"))):
                 raise ValueError("нет сохранённых соседей")
-            if self.tunnel.service_state() != "running":
+            if not self._offline_tunnel():
                 return False
             _, pub = self.state.keypair()
             saved = [n for n in cache.get("neighbors") or []
@@ -1462,6 +1476,26 @@ class Worker(threading.Thread):
         except Exception:  # noqa: BLE001
             log.exception("прямой путь без сервера")
         return bool(self.direct.active_ids())
+
+    def _offline_tunnel(self) -> bool:
+        """Без сервера: туннель этого ПК и этой компании работает. Служба остановлена — запускаем; туннель
+        снят (кнопка OFF, потом ON) — ставим из последнего конфига, если он этой компании (её ключ)."""
+        priv, pub = self.state.keypair()
+        svc = self.tunnel.service_state()
+        if svc == "missing":
+            conf = self.tunnel.saved_conf()
+            if not conf or f"PrivateKey = {priv}\n" not in conf:
+                return False
+            log.info("сервер недоступен — туннель из последнего конфига, для локальной сети")
+            self.tunnel.install(conf)
+            self.direct.reset()
+            self.state.set(last_conf_hash=hashlib.sha256(conf.encode()).hexdigest())
+            self.last_install = time.time()
+        elif svc == "stopped":
+            self.tunnel.start()
+        state = self.tunnel.dump()
+        # туннель другой компании (переключились без сервера) — её соседей в него не добавляем
+        return bool(state) and state.get("public_key") == pub
 
     def _offline_view(self) -> dict:
         """Что показать в окне без ответа сервера (после перезагрузки без интернета)."""
@@ -1561,6 +1595,12 @@ class Worker(threading.Thread):
             self.status(Status.BLOCKED, "Устройство заблокировано администратором")
             return
         if self.cfg["status"] == "pending":
+            # ПК снова ждёт одобрения (например, вход скопирован на другой ПК): прямых путей у него быть не должно
+            self.state.set(direct_cache={})
+            try:
+                self.direct.sync([], self.cfg["server_public_key"])
+            except Exception:  # noqa: BLE001
+                log.exception("прямой путь")
             self.status(Status.PENDING, "Ожидает одобрения администратора компании")
             return
 
