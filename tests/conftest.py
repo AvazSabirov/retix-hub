@@ -43,7 +43,7 @@ def app():
 def net(monkeypatch):
     """Последнее состояние, которое сервер отправил в wg и iptables."""
     from app import services
-    state = {"peers": {}, "rules": [], "calls": 0}
+    state = {"peers": {}, "rules": [], "calls": 0, "shaping": []}
 
     def sync_peers(desired):
         state["peers"] = dict(desired)
@@ -52,8 +52,12 @@ def net(monkeypatch):
     def apply_firewall(rules):
         state["rules"] = list(rules)
 
+    def apply_shaping(limits):
+        state["shaping"] = [dict(c) for c in limits]
+
     monkeypatch.setattr(services.wg, "sync_peers", sync_peers)
     monkeypatch.setattr(services.wg, "apply_firewall", apply_firewall)
+    monkeypatch.setattr(services.wg, "apply_shaping", apply_shaping)
     return state
 
 

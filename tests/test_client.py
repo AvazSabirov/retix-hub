@@ -163,8 +163,10 @@ class FakeTunnel:
                     and self.key in other.peers):
                 p["handshake"] = other.peers[self.key]["handshake"] = now
                 p["rx"] += 32; other.peers[self.key]["rx"] += 32
-                mine = next((ep for ep, t in self.lan.hosts.items() if t is self), "")
-                other.peers[self.key]["endpoint"] = mine     # роуминг WireGuard: адрес, откуда пришло
+                # роуминг WireGuard: адрес, откуда пришло — внешний адрес роутера, если сосед из другого офиса
+                wan = rc.wan_endpoint_ok(p["endpoint"])
+                mine = next((ep for ep, t in self.lan.hosts.items() if t is self and rc.wan_endpoint_ok(ep) == wan), "")
+                other.peers[self.key]["endpoint"] = mine
 
     def dump(self):
         if self.state != "running":
@@ -1346,3 +1348,165 @@ def test_state_machine_walk(make_client, company, company2, server, monkeypatch)
     walk(b)
     assert not direct_peer(b, a)
     assert key2 in a.state.get("profiles")
+
+
+# ================================================================== прямой путь через интернет (разные офисы)
+
+OFFICE_A, OFFICE_B = "81.95.10.5", "84.54.20.7"
+
+
+def wan_pair(make_client, company, server):
+    """Два ПК разных офисов: у каждого своя локальная сеть и свой роутер с внешним адресом. Сосед доступен
+    по внешнему адресу, только если оба шлют друг другу (FakeTunnel: handshake, когда пиры есть у обоих)."""
+    net = FakeLan()
+    full_lan(company)
+    a = make_client("PC1", net, "192.168.1.10", 51001); login(a, company, name="Ташкент"); a.step(2)
+    b = make_client("PC2", net, "192.168.5.11", 51002); login(b, company, name="Самарканд"); b.step(2)
+    mark_online(server, OFFICE_A, names=["Ташкент"]); mark_online(server, OFFICE_B, names=["Самарканд"])
+    for c, pub in ((a, OFFICE_A), (b, OFFICE_B)):
+        net.hosts[f"{pub}:{40000 + c.w.cfg['device_id']}"] = c.tunnel    # «дверь» в роутере офиса
+    return net, a, b
+
+
+def test_direct_path_wan(make_client, company, server):
+    """ПК разных офисов: сервер даёт внешние адреса, оба пробуют одновременно — связь напрямую через интернет.
+    Пир сервера не трогается, туннель не переустанавливается."""
+    net, a, b = wan_pair(make_client, company, server)
+    a.step(); b.step(); a.step(); b.step()
+    pa, pb = direct_peer(a, b), direct_peer(b, a)
+    assert pa and pa["allowed_ips"] == f"{b.w.cfg['ip']}/32"
+    assert pa["endpoint"] == f"{OFFICE_B}:{40000 + b.w.cfg['device_id']}"
+    assert pb and pb["allowed_ips"] == f"{a.w.cfg['ip']}/32" and pb["endpoint"].startswith(OFFICE_A)
+    assert a.w.cfg["direct"] == [] and [n["id"] for n in a.w.cfg["direct_wan"]] == [b.w.cfg["device_id"]]
+    assert a.w.direct.wan_ids() == {b.w.cfg["device_id"]} and a.w.direct.active_ids() == [b.w.cfg["device_id"]]
+    assert any(ka == rc.DIRECT_KEEPALIVE_WAN for k, _, _, ka in a.tunnel.sets if k == b.state.keypair()[1])
+    assert a.tunnel.violations == [] and a.tunnel.installs == 1
+    peers = {p["name"]: p for p in a.peers}
+    assert peers["Самарканд"]["direct"] and peers["Самарканд"]["direct_wan"]
+    mark_online(server, OFFICE_A, names=["Ташкент"]); mark_online(server, OFFICE_B, names=["Самарканд"])
+    assert "напрямую: Самарканд" in company.cab.get(BASE + "/cabinet").text
+    # прямой путь через интернет не сохраняется для работы без интернета (он без сервера не найдётся)
+    assert a.state.get("direct_cache")["neighbors"] == []
+
+
+def test_wan_nat_not_passable_falls_back_in_common_slot(make_client, company, server, monkeypatch):
+    """Роутер не умеет (симметричный NAT): handshake не проходит — трафик остаётся через сервер, а новая
+    попытка — в начале общего окна по часам сервера, у обоих ПК в одно и то же время."""
+    monkeypatch.setattr(rc, "DIRECT_PROBE_WAN", -1)
+    net, a, b = wan_pair(make_client, company, server)
+    net.blocked = True
+    a.step(); b.step()
+    assert direct_peer(a, b) and not direct_peer(a, b)["allowed_ips"]     # проверка — трафик ещё через сервер
+    a.step(); b.step()
+    assert not a.tunnel.peers and not b.tunnel.peers and a.w.direct.active_ids() == []
+    ka, kb = b.state.keypair()[1], a.state.keypair()[1]
+    ua, ub = a.w.direct.backoff[ka][0], b.w.direct.backoff[kb][0]
+    assert abs(ua - ub) < 2 and time.time() < ua <= time.time() + rc.DIRECT_SLOT_WAN_FAILED
+    assert abs((ua + a.w.direct.clock) % rc.DIRECT_SLOT_WAN_FAILED) < 1e-3 or \
+        abs((ua + a.w.direct.clock) % rc.DIRECT_SLOT_WAN_FAILED - rc.DIRECT_SLOT_WAN_FAILED) < 1e-3
+    a.step()
+    assert not a.tunnel.peers                                              # до окна не пробуем
+    # окно наступило, роутер «починили» — оба пробуют снова и соединяются
+    net.blocked = False
+    monkeypatch.setattr(rc, "DIRECT_PROBE_WAN", 25)
+    for c, k in ((a, ka), (b, kb)):
+        c.w.direct.backoff[k] = (time.time() - 1, c.w.direct.backoff[k][1])
+    a.step(); b.step(); a.step(); b.step()
+    assert direct_peer(a, b)["allowed_ips"] and direct_peer(b, a)["allowed_ips"]
+
+
+def test_wan_lost_falls_back(make_client, company, server, monkeypatch):
+    net, a, b = wan_pair(make_client, company, server)
+    a.step(); b.step(); a.step()
+    assert direct_peer(a, b)["allowed_ips"]
+    net.blocked = True
+    monkeypatch.setattr(rc, "DIRECT_RX_TIMEOUT", 10 ** 6)                  # таймаут локальной сети не при чём
+    monkeypatch.setattr(rc, "DIRECT_RX_TIMEOUT_WAN", -1)
+    a.step()
+    assert not a.tunnel.peers and a.w.direct.active_ids() == []
+    until = a.w.direct.backoff[b.state.keypair()[1]][0]
+    assert time.time() < until <= time.time() + rc.DIRECT_SLOT_WAN_LOST + 1
+
+
+def test_wan_kept_while_server_down(make_client, company, server):
+    """Сервер лёг, интернет есть — прямой путь через интернет продолжает работать."""
+    net, a, b = wan_pair(make_client, company, server)
+    a.step(); b.step(); a.step(); b.step()
+    server.stop()
+    try:
+        st = a.step()
+        assert st["status"] == rc.Status.LAN_ONLY and direct_peer(a, b)["allowed_ips"]
+        peers = {p["name"]: p for p in a.peers}
+        assert peers["Самарканд"]["online"] and peers["Самарканд"]["direct_wan"]
+    finally:
+        server.start()
+
+
+def test_wan_off_when_full_lan_off(make_client, company, server):
+    net, a, b = wan_pair(make_client, company, server)
+    a.step(); b.step(); a.step()
+    assert direct_peer(a, b)["allowed_ips"]
+    full_lan(company, on=False)
+    a.step(); b.step()
+    assert not a.tunnel.peers and not b.tunnel.peers
+
+
+def test_wan_neighbors_validation():
+    cfg = {"direct_enabled": True, "ip": "10.66.3.2", "subnet": "10.66.3.0/24", "server_ip": "10.66.0.1",
+           "server_public_key": "S" * 43 + "="}
+    good = {"id": 5, "public_key": "A" * 43 + "=", "ip": "10.66.3.7", "endpoints": ["84.54.20.7:40005"]}
+    assert rc.wan_neighbors(cfg | {"direct_wan": [good]}) == [good | {"wan": True}]
+    assert rc.wan_neighbors(cfg | {"direct_enabled": False, "direct_wan": [good]}) == []
+    assert rc.wan_neighbors(cfg | {"direct_wan": [good]}, skip={good["public_key"]}) == []   # уже сосед по LAN
+    bad = [
+        good | {"ip": "10.66.4.7"}, good | {"ip": "10.66.3.2"}, good | {"ip": "10.66.0.1"},
+        good | {"public_key": "S" * 43 + "="}, good | {"public_key": "x\nAllowedIPs=0.0.0.0/0"},
+        good | {"endpoints": ["192.168.1.11:51002"]},       # локальная сеть — не интернет
+        good | {"endpoints": ["100.64.1.1:40005"]},          # CGNAT
+        good | {"endpoints": ["127.0.0.1:1", "10.66.3.9:51820", "84.54.20.7:0", "84.54.20.7", "[::1]:5"]},
+        {"id": 1},
+    ]
+    assert rc.wan_neighbors(cfg | {"direct_wan": bad}) == []
+    # локальные адреса через «интернет»-список не проходят и наоборот
+    assert rc.direct_neighbors(cfg | {"direct": [good]}) == []
+
+
+def test_wan_slots_align_across_clocks():
+    """Окно попыток считается по часам сервера: ПК с отстающими часами попадает в тот же момент."""
+    on_time, behind = rc.DirectPaths(None), rc.DirectPaths(None)
+    on_time.clock, behind.clock = 0.0, 7.0                 # часы второго ПК отстают на 7 с
+    t = 1_700_000_123.0
+    assert on_time.next_slot(t, 600) == behind.next_slot(t - 7, 600) + 7 == 1_700_000_400.0
+
+
+def test_heartbeat_reports_wan_support(make_client, company, server):
+    import sqlite3
+    a = make_client("PC1"); login(a, company, name="A"); a.step(2)
+    conn = sqlite3.connect(Path(server.data) / "vpn.db", timeout=10)
+    assert conn.execute("SELECT wan_ok FROM devices WHERE name='A'").fetchone()[0] == 1
+    conn.close()
+
+
+# ================================================================== меню управления через Radmin Viewer
+
+def test_radmin_menu_only_with_server_there_and_viewer_here(tmp_path):
+    viewer = tmp_path / "Radmin.exe"; viewer.write_bytes(b"MZ")
+    assert rc.radmin_menu_allowed({"radmin_server": True}, viewer)
+    assert not rc.radmin_menu_allowed({"radmin_server": True}, None)          # здесь нет Radmin Viewer
+    assert not rc.radmin_menu_allowed({"radmin_server": False}, viewer)       # там нет Radmin Server
+    assert not rc.radmin_menu_allowed({}, viewer)                             # старый клиент не сообщил
+    assert not rc.radmin_menu_allowed(None, viewer)
+    assert not rc.radmin_server_installed()                                   # не Windows — нет
+
+
+def test_radmin_server_reported_to_other_pcs(make_client, company, monkeypatch):
+    has = {"v": True}
+    monkeypatch.setattr(rc, "radmin_server_installed", lambda: has["v"])
+    a = make_client("PC1"); login(a, company, name="Касса"); a.step(2)
+    b = make_client("PC2"); login(b, company, name="Офис"); b.step(2)
+    a.step()
+    assert {p["name"]: p["radmin_server"] for p in a.peers} == {"Касса": True, "Офис": True}
+    has["v"] = False
+    b.w.radmin_checked = 0                 # следующая проверка — сразу (обычно раз в 5 минут)
+    b.step(); a.step()
+    assert {p["name"]: p["radmin_server"] for p in a.peers}["Офис"] is False

@@ -109,14 +109,19 @@ def company_page(request: Request, company_id: int, conn=Depends(require_admin),
 
 @router.post("/companies/{company_id}/update")
 def update_company(company_id: int, name: str = Form(""), max_devices: int = Form(20),
-                   is_active: str = Form(""), require_approval: str = Form(""), conn=Depends(require_admin)):
+                   is_active: str = Form(""), require_approval: str = Form(""), speed_limit: str | None = Form(None),
+                   conn=Depends(require_admin)):
     c = get_company(conn, company_id)
+    speed = c["speed_limit"] if speed_limit is None else services.clean_speed(speed_limit)
+    if speed is None:
+        return redirect(f"/admin/companies/{c['id']}",
+                        f"Скорость — целое число Мбит/с от 0 до {services.SPEED_MAX} (0 — без ограничения)", err=True)
     with db.write_lock:
-        conn.execute("UPDATE companies SET name=?, max_devices=?, is_active=?, require_approval=? WHERE id=?",
-                     (name.strip()[:100], max(1, min(max_devices, 253)), 1 if is_active else 0,
-                      1 if require_approval else 0, c["id"]))
+        conn.execute("UPDATE companies SET name=?, max_devices=?, is_active=?, require_approval=?, speed_limit=? "
+                     "WHERE id=?", (name.strip()[:100], max(1, min(max_devices, 253)), 1 if is_active else 0,
+                                    1 if require_approval else 0, speed, c["id"]))
         services.audit(conn, c["id"], "company_update",
-                       f"active={bool(is_active)} max={max_devices} approval={bool(require_approval)}")
+                       f"active={bool(is_active)} max={max_devices} approval={bool(require_approval)} speed={speed}")
         conn.commit()
         services.reconcile(conn)
     return redirect(f"/admin/companies/{c['id']}", "Сохранено")
