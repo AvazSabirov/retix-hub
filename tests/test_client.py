@@ -105,6 +105,8 @@ class FakeTunnel:
         self.state = "missing"; self.hs = 0; self.installs = 0; self.starts = 0; self.conf = ""
         self.handshake_works = True; self.wg_installed = True; self.probe_ok = True
         self.lan, self.lan_ip, self.port, self.key = lan, lan_ip, 0, ""
+        self.server = ("", "")              # пир сервера из конфига: (ключ, AllowedIPs)
+        self.violations = []                # кто-то тронул пира сервера — так быть не должно
         self.peers = {}                    # прямые пиры: ключ -> {endpoint, allowed_ips, handshake, rx}
         self.sets = []                     # вызовы wg set (для проверок)
         self.ports = []                    # вызовы wg set listen-port
@@ -121,7 +123,17 @@ class FakeTunnel:
     build_conf = staticmethod(rc.Tunnel.build_conf)
     def service_state(self): return self.state
 
+    @staticmethod
+    def _conf_value(conf, name):
+        return next((line.split("=", 1)[1].strip() for line in conf.splitlines() if line.startswith(name)), "")
+
     def install(self, conf):
+        """Ключ интерфейса — из PrivateKey конфига (как у настоящего туннеля), пир сервера — из [Peer]."""
+        import base64
+        from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey as K
+        self.key = base64.b64encode(K.from_private_bytes(base64.b64decode(
+            self._conf_value(conf, "PrivateKey"))).public_key().public_bytes_raw()).decode()
+        self.server = (self._conf_value(conf, "PublicKey"), self._conf_value(conf, "AllowedIPs").replace(" ", ""))
         self.state = "running"; self.installs += 1; self.conf = conf; self.peers = {}
         self.hs = int(time.time()) if self.handshake_works else 0
         if self.port:
@@ -158,9 +170,17 @@ class FakeTunnel:
         if self.state != "running":
             return None
         self._exchange()
-        return {"listen_port": self.port, "peers": {k: dict(v) for k, v in self.peers.items()}}
+        peers = {k: dict(v) for k, v in self.peers.items()}
+        if self.server[0]:
+            peers[self.server[0]] = {"endpoint": "203.0.113.1:51820", "allowed_ips": self.server[1],
+                                     "handshake": self.hs, "rx": 1}
+        return {"listen_port": self.port, "peers": peers, "public_key": self.key}
+
+    def saved_conf(self): return self.conf
 
     def set_peer(self, key, endpoint="", allowed_ips=None, keepalive=None):
+        if key == self.server[0]:
+            self.violations.append(("set", key))
         self.sets.append((key, endpoint, allowed_ips, keepalive))
         p = self.peers.setdefault(key, {"endpoint": "", "allowed_ips": "", "handshake": 0, "rx": 0})
         if endpoint:
@@ -169,7 +189,10 @@ class FakeTunnel:
             p["allowed_ips"] = allowed_ips
         return True
 
-    def remove_peer(self, key): self.peers.pop(key, None)
+    def remove_peer(self, key):
+        if key == self.server[0]:
+            self.violations.append(("remove", key))
+        self.peers.pop(key, None)
     def set_listen_port(self, port): self.ports.append(port); self._listen(port); return True
 
 
@@ -195,7 +218,6 @@ class Client:
             LAN_NOW["addrs"] = self.lan_addrs
             self.w.lan_checked = 0          # адреса перечитываются на каждом шаге
             self.w.step()
-            self.tunnel.key = self.state.keypair()[1]
         return self.last()
 
     def last(self):
@@ -1166,11 +1188,9 @@ def test_tampered_cache_is_validated(make_client, company, server):
            {"id": 7, "public_key": srv_key, "ip": cache["neighbors"][0]["ip"], "endpoints": ["192.168.1.9:1"],
             "verified_at": int(time.time())}]
     a.state.set(direct_cache=dict(cache, neighbors=bad, cfg=dict(cache["cfg"], server_public_key="C" * 43 + "=")))
-    a.tunnel.peers[srv_key] = {"endpoint": "vpn.test.uz:51820", "allowed_ips": f"{a.w.cfg['subnet']},10.66.0.1/32",
-                               "handshake": 1, "rx": 1}
     with server_down(server):
         a.step(); a.step()
-    assert set(a.tunnel.peers) == {srv_key}
+    assert not a.tunnel.peers and not a.tunnel.violations and a.tunnel.server[0] == srv_key
 
 
 def test_port_kept_after_reinstall(make_client, company, server):
@@ -1180,3 +1200,149 @@ def test_port_kept_after_reinstall(make_client, company, server):
     assert a.tunnel.port != port
     a.step()
     assert a.tunnel.port == port and a.tunnel.ports[-1] == port
+
+
+# ------------------------------------------------------------------ обход всех состояний
+
+def db_exec(server, sql, args=()):
+    import sqlite3
+    conn = sqlite3.connect(Path(server.data) / "vpn.db", timeout=10)
+    conn.execute(sql, args); conn.commit(); conn.close()
+
+
+NO_DIRECT = {rc.Status.OFF, rc.Status.BLOCKED, rc.Status.NEED_LOGIN, rc.Status.PENDING}
+
+
+def check_invariants(c, st):
+    """Правила, которые держатся в любом состоянии."""
+    t = c.tunnel
+    assert not t.violations, f"тронули пира сервера: {t.violations}"
+    status = st and st["status"]
+    assert status in {getattr(rc.Status, k) for k in dir(rc.Status) if not k.startswith("_")}, st
+    if status in NO_DIRECT:
+        assert not any(p["allowed_ips"] for p in t.peers.values()), (status, t.peers)
+        assert not c.w.direct.active_ids(), status
+    if status == rc.Status.LAN_ONLY:
+        assert c.w.direct.active_ids()
+    cfg = c.w.cfg or (c.state.get("direct_cache") or {}).get("cfg") or {}
+    for key, p in t.peers.items():
+        if p["allowed_ips"]:
+            ip = p["allowed_ips"].removesuffix("/32")
+            assert p["allowed_ips"].endswith("/32") and ip != cfg.get("ip")
+            assert rc.peer_ip_ok(ip, cfg.get("subnet")), (ip, cfg.get("subnet"))
+            assert rc.lan_endpoint_ok(p["endpoint"]), p["endpoint"]
+
+
+def walk(c, n=1):
+    st = None
+    for _ in range(n):
+        st = c.step()
+        check_invariants(c, st)
+    return st
+
+
+def is_direct(c, other):
+    p = direct_peer(c, other)
+    return bool(p and p["allowed_ips"])
+
+
+def test_state_machine_walk(make_client, company, company2, server, monkeypatch):
+    """Два ПК одного офиса проходят через все состояния; после каждого шага — check_invariants."""
+    monkeypatch.setattr(rc, "DIRECT_RETRY_LOST", 0)
+    monkeypatch.setattr(rc, "DIRECT_RETRY_FAILED", 0)
+    lan, a, b = established(make_client, company, server)
+    def both(n=1):                       # шаги по очереди: A, B, A, B…
+        st = None
+        for _ in range(n):
+            st = walk(a); walk(b)
+        return st
+    S = rc.Status
+
+    # 1. в сети, напрямую
+    mark_online(server)
+    assert both()["status"] == S.ONLINE and is_direct(a, b) and is_direct(b, a)
+
+    # 2. сервер пропал → «Только локальная сеть»
+    server.stop()
+    try:
+        assert both()["status"] == S.LAN_ONLY
+
+        # 3. OFF без сервера: туннель снят, прямых путей нет
+        a.w.set_enabled(False)
+        assert walk(a)["status"] == S.OFF and a.tunnel.state == "missing"
+
+        # 4. ON без сервера: туннель из последнего конфига, прямой путь снова
+        a.w.set_enabled(True)
+        walk(a); walk(b)
+        st = both(2)
+        assert st["status"] == S.LAN_ONLY and is_direct(a, b) and is_direct(b, a)
+
+        # 5. служба остановлена (без сервера) — запускается, локальная сеть работает
+        a.tunnel.state = "stopped"
+        assert walk(a)["status"] == S.LAN_ONLY and a.tunnel.state == "running"
+    finally:
+        server.start()
+
+    # 6. сервер вернулся
+    mark_online(server)
+    st = both(3)
+    assert st["status"] == S.ONLINE and is_direct(a, b)
+
+    # 7. B снова ждёт одобрения → у B прямых путей нет, A его убирает
+    db_exec(server, "UPDATE devices SET is_approved=0 WHERE id=?", (b.w.cfg["device_id"],))
+    assert walk(b)["status"] == S.PENDING and not b.tunnel.peers
+    assert b.state.get("direct_cache") == {}
+    walk(a)
+    assert not direct_peer(a, b)
+
+    # 8. одобрен → снова напрямую
+    db_exec(server, "UPDATE devices SET is_approved=1 WHERE id=?", (b.w.cfg["device_id"],))
+    mark_online(server); walk(b, 2); mark_online(server)
+    both(3)
+    assert is_direct(a, b) and is_direct(b, a)
+
+    # 9. B заблокирован → туннель B снят, A его убирает; разблокирован → всё вернулось
+    company.cab.post(BASE + f"/cabinet/devices/{b.w.cfg['device_id']}/block")
+    assert walk(b)["status"] == S.BLOCKED and b.tunnel.state == "missing"
+    walk(a)
+    assert not direct_peer(a, b)
+    company.cab.post(BASE + f"/cabinet/devices/{b.w.cfg['device_id']}/unblock")
+    walk(b, 3); mark_online(server); both(3)
+    assert is_direct(a, b) and is_direct(b, a)
+
+    # 10. A входит во вторую компанию (без «любого трафика»): чужих соседей нет ни в туннеле, ни в списке
+    assert login(a, company2, name="Склад") is None
+    walk(a, 2)
+    assert not a.tunnel.peers and a.state.get("direct_cache") == {}
+    key1 = rc.State.profile_key(BASE, company.login)
+    key2 = rc.State.profile_key(BASE, company2.login)
+    assert a.state.profiles() and a.state.get("profiles")[key1]["direct_cache"]["neighbors"]
+
+    # 11. без сервера переключаемся обратно: туннель ещё второй компании — соседей первой в него не кладём
+    server.stop()
+    try:
+        assert a.w.switch_to(key1) is None
+        st = walk(a)
+        assert st["status"] == S.SERVER_DOWN and not a.tunnel.peers
+    finally:
+        server.start()
+    mark_online(server)
+    walk(a, 3); mark_online(server); both(3)
+    assert walk(a)["status"] == S.ONLINE and is_direct(a, b)
+
+    # 12. «любой трафик» выключен → прямых путей нет, список очищен
+    full_lan(company, on=False)
+    both()
+    assert not a.tunnel.peers and not b.tunnel.peers and a.state.get("direct_cache") == {}
+
+    # 13. выход из сети
+    full_lan(company); mark_online(server); both(3)
+    assert is_direct(a, b)
+    a.w.logout()
+    st = a.last()
+    check_invariants(a, st)
+    assert st["status"] == S.NEED_LOGIN and not a.tunnel.peers and a.state.get("direct_cache") == {}
+    assert a.state.get("fw_direct") == 0
+    walk(b)
+    assert not direct_peer(b, a)
+    assert key2 in a.state.get("profiles")
