@@ -2005,7 +2005,12 @@ def logo_letter(color: str, size: int = 16):
     crop = (cx - side // 2, cy - side // 2, cx - side // 2 + side, cy - side // 2 + side)
     out = Image.new("RGBA", mask.size, color)
     out.putalpha(mask)
-    return out.crop(crop).resize((size, size), Image.LANCZOS)
+    # высота — как у остальных значков списка (13 из 16 точек, поля по краям), а не во весь квадрат
+    inner = max(1, round(size * 13 / 16))
+    canvas = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    canvas.alpha_composite(out.crop(crop).resize((inner, inner), Image.LANCZOS),
+                           ((size - inner + 1) // 2, (size - inner + 1) // 2))
+    return canvas
 
 
 def render_link_icon(kind: str, size: int = 16):
