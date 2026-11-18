@@ -26,6 +26,10 @@ class RegisterIn(BaseModel):
     client_version: str = Field(default="", max_length=32)
 
 
+class RenameIn(BaseModel):
+    name: str = Field(min_length=1, max_length=64)
+
+
 class MessageIn(BaseModel):
     to: int
     text: str = Field(min_length=1, max_length=2000)
@@ -121,7 +125,9 @@ def register(data: RegisterIn, request: Request, conn=Depends(db.get_db)):
         raise HTTPException(403, "Компания отключена")
     limiter.reset(ip)
 
-    name = data.device_name.strip()[:64]
+    name = services.clean_device_name(data.device_name)
+    if not name:
+        raise HTTPException(400, "Пустое имя компьютера")
     hostname = services.clean_hostname(data.hostname)
     token, token_hash = new_token()
 
@@ -235,6 +241,23 @@ def get_messages(ctx=Depends(current_device)):
         conn.commit()
     return {"messages": [{"id": r["id"], "from_id": r["from_device_id"], "from_name": r["from_name"] or "—",
                           "from_ip": r["from_ip"] or "", "text": r["text"], "time": r["created_at"]} for r in rows]}
+
+
+@router.post("/rename")
+def rename(data: RenameIn, ctx=Depends(current_device)):
+    """Пользователь ПК меняет имя своего компьютера в сети компании (клиент 1.0.13+)."""
+    conn, dev, company = ctx
+    if dev["is_blocked"]:
+        raise HTTPException(403, "Устройство заблокировано администратором")
+    name = services.clean_device_name(data.name)
+    if not name:
+        raise HTTPException(400, "Пустое имя")
+    if name != dev["name"]:
+        with db.write_lock:
+            conn.execute("UPDATE devices SET name=? WHERE id=?", (name, dev["id"]))
+            services.audit(conn, company["id"], "device_rename_self", f"{dev['name']} → {name} {dev['ip']}")
+            conn.commit()
+    return {"ok": True, "device_name": name}
 
 
 @router.post("/logout")
