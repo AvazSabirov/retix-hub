@@ -1971,7 +1971,8 @@ def natural_key(text: str):
     return [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", (text or "").lower())]
 
 
-# как связан ПК из списка: значок вместо подписи «⇄ LAN / ⇄ WAN» рядом с IP
+# как связан ПК из списка: значок вместо подписи «⇄ LAN / ⇄ WAN» рядом с IP.
+# Через сервер — зелёная R с логотипа Retix Hub
 LINK_COLORS = {"server": C["green"], "lan": "#2dd4bf", "wan": "#60a5fa", "off": C["muted"]}
 LINK_HINTS = {"server": "В сети · связь через сервер Retix Hub", "lan": "В сети · напрямую по локальной сети",
               "wan": "В сети · напрямую через интернет", "off": "Не в сети"}
@@ -1986,10 +1987,36 @@ def peer_link(p: dict, online: bool) -> str:
     return "server"
 
 
+def logo_letter(color: str, size: int = 16):
+    """Буква R из значка Retix Hub (app_icon.ico) цветом color, без фона, по размеру значка."""
+    from PIL import Image, ImageChops
+    icon = Image.open(resource_dir() / "app_icon.ico")
+    icon.size = max(icon.info.get("sizes") or [icon.size])
+    r, g, b, a = icon.convert("RGBA").split()
+    # белая буква на зелёном фоне: светлое (min(r,g,b) > 90) — буква, остальное прозрачно
+    light = ImageChops.darker(ImageChops.darker(r, g), b).point(lambda v: max(0, min(255, (v - 90) * 255 // 150)))
+    mask = ImageChops.multiply(light, a)
+    box = mask.getbbox()
+    if not box:
+        raise ValueError("в значке нет буквы")
+    x0, y0, x1, y1 = box
+    side = max(x1 - x0, y1 - y0)
+    cx, cy = (x0 + x1) // 2, (y0 + y1) // 2
+    crop = (cx - side // 2, cy - side // 2, cx - side // 2 + side, cy - side // 2 + side)
+    out = Image.new("RGBA", mask.size, color)
+    out.putalpha(mask)
+    return out.crop(crop).resize((size, size), Image.LANCZOS)
+
+
 def render_link_icon(kind: str, size: int = 16):
     """Значок связи (Pillow, рисуется в 8 раз крупнее и уменьшается — со сглаживанием):
-    server — уровень сигнала, lan — гнездо сетевого кабеля, wan — глобус, off — крестик."""
+    server — зелёная R как на логотипе, lan — гнездо сетевого кабеля, wan — глобус, off — крестик."""
     from PIL import Image, ImageDraw
+    if kind == "server":
+        try:
+            return logo_letter(LINK_COLORS["server"], size)
+        except Exception:  # noqa: BLE001 — нет значка программы: полоски сигнала
+            log.debug("буква R из app_icon.ico не собрана", exc_info=True)
     S = size * 8
     u = S / 16                         # 1 точка значка 16×16
     img = Image.new("RGBA", (S, S), (0, 0, 0, 0))
