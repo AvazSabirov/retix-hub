@@ -110,6 +110,9 @@ class FakeTunnel:
         self.peers = {}                    # прямые пиры: ключ -> {endpoint, allowed_ips, handshake, rx}
         self.sets = []                     # вызовы wg set (для проверок)
         self.ports = []                    # вызовы wg set listen-port
+        # от этих соседей keepalive не приходит (WireGuard молчит, пока получает наши), только ответ на ping
+        self.quiet_keys = set()
+        self.nudges = []                   # кому слали ping через прямой путь (ответ — при следующем wg show)
         self._listen(port)
 
     def _listen(self, port):
@@ -162,7 +165,10 @@ class FakeTunnel:
             if (other and not self.lan.blocked and other.state == "running" and other.key == key
                     and self.key in other.peers):
                 p["handshake"] = other.peers[self.key]["handshake"] = now
-                p["rx"] += 32; other.peers[self.key]["rx"] += 32
+                if key not in self.quiet_keys or self.nudges:   # на ping сосед отвечает данными
+                    p["rx"] += 32
+                if self.key not in other.quiet_keys:
+                    other.peers[self.key]["rx"] += 32
                 # роуминг WireGuard: адрес, откуда пришло — внешний адрес роутера, если сосед из другого офиса
                 wan = rc.wan_endpoint_ok(p["endpoint"])
                 mine = next((ep for ep, t in self.lan.hosts.items() if t is self and rc.wan_endpoint_ok(ep) == wan), "")
@@ -172,6 +178,7 @@ class FakeTunnel:
         if self.state != "running":
             return None
         self._exchange()
+        self.nudges = []
         peers = {k: dict(v) for k, v in self.peers.items()}
         if self.server[0]:
             peers[self.server[0]] = {"endpoint": "203.0.113.1:51820", "allowed_ips": self.server[1],
@@ -179,6 +186,9 @@ class FakeTunnel:
         return {"listen_port": self.port, "peers": peers, "public_key": self.key}
 
     def saved_conf(self): return self.conf
+
+    def nudge(self, ip):
+        self.nudges.append(ip)
 
     def set_peer(self, key, endpoint="", allowed_ips=None, keepalive=None):
         if key == self.server[0]:
@@ -1051,6 +1061,26 @@ def test_direct_lan_retry_in_common_slot(make_client, company, server, monkeypat
         c.w.direct.backoff[k] = (time.time() - 1, c.w.direct.backoff[k][1])
     a.step(); b.step(); a.step(); b.step()
     assert direct_peer(a, b)["allowed_ips"] and direct_peer(b, a)["allowed_ips"]
+
+
+def test_direct_quiet_neighbor_kept_by_ping(make_client, company, server, monkeypatch):
+    """WireGuard соседа молчит (получает наши keepalive и потому своих не шлёт) — путь жив: программа шлёт
+    соседу ping через прямой путь, ответ приходит. Без ping такой путь закрывался через 35 с."""
+    lan, a, b = lan_pair(make_client, company, server)
+    a.step(); b.step(); a.step(); b.step()
+    assert direct_peer(a, b)["allowed_ips"]
+    a.tunnel.quiet_keys = {b.state.keypair()[1]}
+    monkeypatch.setattr(rc, "DIRECT_NUDGE_AFTER", 0.2)
+    monkeypatch.setattr(rc, "DIRECT_RX_TIMEOUT", 1.0)
+    for _ in range(4):
+        time.sleep(0.4); a.step()
+    assert direct_peer(a, b)["allowed_ips"] and a.w.direct.active_ids() == [b.w.cfg["device_id"]]
+    assert a.tunnel.nudges == [b.w.cfg["ip"]]                              # ping — соседу по адресу в сети компании
+    # без ping (как раньше) — молчание принимается за обрыв
+    monkeypatch.setattr(rc, "DIRECT_NUDGE_AFTER", 10 ** 6)
+    a.tunnel.nudges = []
+    time.sleep(1.2); a.step()
+    assert direct_peer(a, b) is None
 
 
 def test_direct_neighbor_blocked_is_removed(make_client, company, server):

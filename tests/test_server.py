@@ -187,6 +187,16 @@ class TestRegister:
         row = db.connect().execute("SELECT client_version, last_seen FROM devices").fetchone()
         assert row[0] == "1.2.3" and row[1]
 
+    def test_server_version_matches_client(self, ctx):
+        """Версия сервера поднимается вместе с клиентом и видна суперадмину."""
+        import re
+        from app.config import APP_VERSION
+        from conftest import ROOT
+        client = re.search(r'^VERSION = "([0-9.]+)"', (ROOT / "client" / "retixhub_client.py").read_text("utf-8"), re.M)
+        assert client and APP_VERSION == client.group(1)
+        assert ctx.api.get("/api").json()["version"] == APP_VERSION
+        assert f"сервер {APP_VERSION}" in ctx.admin.get("/admin").text
+
     def test_ping(self, ctx):
         assert ctx.api.get("/api/ping").json()["ok"] is True
 

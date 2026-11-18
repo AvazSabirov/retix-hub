@@ -9,6 +9,7 @@ from fastapi import HTTPException
 from fastapi.responses import RedirectResponse
 from fastapi.templating import Jinja2Templates
 
+from .config import APP_VERSION
 from .updates import dt_text
 
 templates = Jinja2Templates(directory=os.path.join(os.path.dirname(__file__), "templates"))
@@ -28,6 +29,7 @@ def _ago(ts: int) -> str:
 
 
 templates.env.filters["ago"] = _ago
+templates.env.globals["server_version"] = APP_VERSION   # в шапке суперадмина: какой сервер сейчас работает
 
 
 def redirect(url: str, msg: str = "", err: bool = False) -> RedirectResponse:

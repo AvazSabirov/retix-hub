@@ -96,7 +96,7 @@
 <body>
 <header>
   <a href="/"><b>Retix Hub</b></a><span class="sub">{{ title }}</span>
-  {% if admin_nav %}<nav class="adminnav"><a href="/admin" class="{{ 'on' if admin_nav == 'companies' }}">Компании</a><a href="/admin/updates" class="{{ 'on' if admin_nav == 'updates' }}">Обновления</a></nav>{% endif %}
+  {% if admin_nav %}<nav class="adminnav"><a href="/admin" class="{{ 'on' if admin_nav == 'companies' }}">Компании</a><a href="/admin/updates" class="{{ 'on' if admin_nav == 'updates' }}">Обновления</a><span class="muted small" title="Версия сервера Retix Hub">сервер {{ server_version }}</span></nav>{% endif %}
   {% if logout_url %}<form method="post" action="{{ logout_url }}"><button class="link">Выйти</button></form>{% endif %}
 </header>
 <main>

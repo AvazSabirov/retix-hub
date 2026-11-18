@@ -21,6 +21,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import types
 from pathlib import Path
@@ -215,6 +216,10 @@ class LinuxTunnel:
 
     def probe(self, ip):
         return any(nsx(self.ns, f"ping -c 1 -W 1 {ip}", check=False).returncode == 0 for _ in range(2))
+
+    def nudge(self, ip):
+        threading.Thread(target=nsx, args=(self.ns, f"ping -c 1 -W 1 {ip}"), kwargs={"check": False},
+                         daemon=True).start()
 
     def last_handshake(self, key=""):
         r = nsx(self.ns, f"wg show {self.iface} latest-handshakes", check=False)

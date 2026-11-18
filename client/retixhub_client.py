@@ -37,7 +37,7 @@ import requests
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
 
-VERSION = "1.0.14"
+VERSION = "1.0.15"
 APP_NAME = "RetixHub"          # служебное имя: папки, задачи, мьютекс
 APP_TITLE = "Retix Hub"        # то, что видит пользователь
 TUNNEL = "retixhub"
@@ -65,7 +65,13 @@ HEARTBEAT_EVERY = 60
 # Прямой путь по локальной сети (компания с «любым трафиком»): см. DirectPaths
 DIRECT_KEEPALIVE = 10      # сек — keepalive соседу по локальной сети (в локалке трафик бесплатный)
 DIRECT_PROBE_SECONDS = 20  # сек — столько ждём handshake по одному адресу соседа
-DIRECT_RX_TIMEOUT = 35     # сек — от прямого соседа нет пакетов (3 keepalive) — путь потерян
+DIRECT_RX_TIMEOUT = 35     # сек — от прямого соседа нет пакетов (и на ping нет ответа) — путь потерян
+# WireGuard шлёт keepalive, только если 10 с ничего не отправлял И НЕ ПОЛУЧАЛ. Когда keepalive у обоих ПК,
+# один всё время получает пакеты другого и сам молчит — по одним keepalive живой путь выглядел мёртвым
+# (то у одного ПК, то у другого: «нет пакетов» через 35 с). Сосед молчит дольше этого — шлём ему ping
+# через прямой путь: ответ — обычные данные, он приходит всегда, если путь работает в обе стороны.
+DIRECT_NUDGE_AFTER = 12    # сек — по локальной сети
+DIRECT_NUDGE_AFTER_WAN = 22  # сек — через интернет (keepalive там 20 с)
 # Повторы — в начале общего окна по часам сервера, как через интернет: у обоих ПК одновременно. Раньше каждый
 # ждал своё время от своего обрыва, проверка (20 с) попадала на паузу соседа — и так раз за разом.
 DIRECT_RETRY_FAILED = 300  # сек — ни один адрес не ответил: снова в начале следующего окна
@@ -613,6 +619,12 @@ class Tunnel:
         return False
 
     @staticmethod
+    def nudge(ip: str) -> None:
+        """Один ping соседу через прямой путь — в фоне, не задерживая цикл (см. DIRECT_NUDGE_AFTER)."""
+        threading.Thread(target=run, args=(["ping", "-n", "1", "-w", "1000", ip],), kwargs={"timeout": 5},
+                         daemon=True, name="nudge").start()
+
+    @staticmethod
     def last_handshake(key: str = "") -> int:
         """Последний handshake с пиром key (сервер). Без key — самый свежий из всех."""
         rc, out = run([str(WG_EXE), "show", TUNNEL, "latest-handshakes"], timeout=10)
@@ -708,6 +720,7 @@ class DirectPaths:
         self.wanted: dict[str, dict] = {}                  # ключ -> сосед от сервера
         self.probes: dict[str, dict] = {}                  # ключ -> {"started", "idx"}: идёт проверка
         self.rx: dict[str, tuple[int, float]] = {}         # ключ -> (принято байт, когда выросло)
+        self.nudged: dict[str, float] = {}                 # ключ -> когда последний раз слали ping соседу
         self.backoff: dict[str, tuple[float, tuple]] = {}  # ключ -> (до какого времени не пробовать, адреса)
         self.active: dict[str, int] = {}                   # ключ -> id соседа: связь напрямую
         self.listen_port = 0
@@ -734,6 +747,7 @@ class DirectPaths:
     def reset(self) -> None:
         """Туннель снят или переустановлен — прямых пиров в нём больше нет."""
         self.wanted.clear(); self.probes.clear(); self.rx.clear(); self.active.clear(); self.endpoints.clear()
+        self.nudged.clear()
         self.listen_port = self.own_port = 0
         self.port_done = False
 
@@ -787,7 +801,8 @@ class DirectPaths:
         if peer["allowed_ips"]:                               # уже напрямую
             if peer["allowed_ips"] != allowed:
                 self.tunnel.set_peer(key, allowed_ips=allowed)
-            if now - last[1] > (DIRECT_RX_TIMEOUT_WAN if wan else DIRECT_RX_TIMEOUT):
+            quiet = now - last[1]
+            if quiet > (DIRECT_RX_TIMEOUT_WAN if wan else DIRECT_RX_TIMEOUT):
                 hs = int(now - peer["handshake"]) if peer["handshake"] else -1
                 self._fail(key, endpoints, DIRECT_SLOT_WAN_LOST if wan else DIRECT_RETRY_LOST,
                            f"от {n['ip']} нет пакетов {int(now - last[1])} с (handshake {hs} с назад, "
@@ -796,6 +811,11 @@ class DirectPaths:
                 self.active[key] = n["id"]
                 if peer["endpoint"]:
                     self.endpoints[key] = peer["endpoint"]
+                after = DIRECT_NUDGE_AFTER_WAN if wan else DIRECT_NUDGE_AFTER
+                nudge = getattr(self.tunnel, "nudge", None)
+                if nudge and quiet > after and now - self.nudged.get(key, 0) >= min(after, 6):
+                    self.nudged[key] = now
+                    nudge(n["ip"])
             return
         probe = self.probes.setdefault(key, {"started": now, "idx": 0})
         if peer["handshake"] and now - peer["handshake"] < HANDSHAKE_OK:
@@ -818,7 +838,7 @@ class DirectPaths:
         if key in self.active:
             log.info("прямой путь закрыт: %s", why)
         self.tunnel.remove_peer(key)
-        for d in (self.active, self.probes, self.rx, self.endpoints):
+        for d in (self.active, self.probes, self.rx, self.endpoints, self.nudged):
             d.pop(key, None)
 
     def _fail(self, key: str, endpoints: tuple, delay: int, why: str, wan: bool = False) -> None:
