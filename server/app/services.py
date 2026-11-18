@@ -93,14 +93,15 @@ def list_devices(conn, company_id: int) -> list[dict]:
     rows = conn.execute("SELECT * FROM devices WHERE company_id=? ORDER BY is_share_host DESC, name",
                         (company_id,)).fetchall()
     names = {r["id"]: r["name"] for r in rows}
-    full_lan = bool((conn.execute("SELECT full_lan FROM companies WHERE id=?", (company_id,)).fetchone()
-                     or {"full_lan": 0})["full_lan"])
+    company = conn.execute("SELECT * FROM companies WHERE id=?", (company_id,)).fetchone()
+    full_lan = bool(company and company["full_lan"])
     out = []
     for r in rows:
         online = is_online(r)
         direct = [names[i] for i in _json_ints(r["direct_ids"]) if i in names] \
             if full_lan and online and time.time() - r["lan_at"] < LAN_FRESH_SECONDS else []
-        out.append(dict(r, online=online, status=device_status(r), direct_peers=direct))
+        out.append(dict(r, online=online, status=device_status(r), direct_peers=direct,
+                        remote_effective=effective_remote_mode(r, company) if company else "off"))
     return out
 
 
@@ -256,6 +257,13 @@ def wan_neighbors(conn, dev, company) -> list[dict]:
 #          Выданный пароль одноразовый: после сеанса ПК меняет его сам (rotate в /api/me).
 
 REMOTE_MODES = {"off": "выключено", "ask": "с согласием пользователя", "auto": "без согласия (по паролю)"}
+# Права по ПК (кабинет): кто может управлять другими (remote_control, по умолчанию — никто) и можно ли управлять
+# этим ПК (remote_access — только строже режима компании). Пользователь ПК в программе может сделать ещё
+# строже (remote_local): только с его согласием, только по его собственному паролю (его сервер не знает), запретить.
+REMOTE_ACCESS = {"company": "как в компании", "ask": "только с согласием", "off": "выключено"}
+REMOTE_LOCAL = {"": "как разрешил администратор", "ask": "только с моего согласия", "own": "по моему паролю",
+                "off": "запрещено пользователем"}
+EFFECTIVE_TITLES = {"off": "нельзя", "ask": "с согласием", "auto": "без согласия", "own": "по паролю пользователя"}
 REMOTE_ROTATE_AFTER = 120   # сек после выдачи пароля: подключиться успевают, дальше ПК меняет пароль (без сеанса)
 REMOTE_PW_RE = re.compile(r"^[A-Za-z0-9]{12,64}$")
 
@@ -290,13 +298,48 @@ def remote_mode(company) -> str:
     return clean_remote_mode(company["remote_mode"]) or "off"
 
 
-def remote_config(dev, company) -> dict:
-    """Что клиент делает с RustDesk: режим, порт и пора ли сменить пароль."""
+def admin_remote_mode(dev, company) -> str:
+    """Режим управления ЭТИМ ПК, который разрешил администратор: режим компании, для ПК — только строже."""
     mode = remote_mode(company)
+    access = dev["remote_access"] if dev["remote_access"] in REMOTE_ACCESS else "company"
+    if mode == "off" or access == "off":
+        return "off"
+    return "ask" if access == "ask" else mode
+
+
+def effective_remote_mode(dev, company) -> str:
+    """Как на самом деле можно управлять ПК: решение администратора и выбор пользователя ПК (только строже)."""
+    admin = admin_remote_mode(dev, company)
+    local = dev["remote_local"] if dev["remote_local"] in REMOTE_LOCAL else ""
+    if admin == "off" or local == "off":
+        return "off"
+    return local or admin
+
+
+def can_control(dev, company) -> bool:
+    return bool(dev["remote_control"]) and remote_mode(company) != "off" and device_status(dev) == "active"
+
+
+def remote_controllers(conn, company, exclude_id: int = 0) -> list[str]:
+    """IP компьютеров компании, которым администратор разрешил управлять другими ПК: только их пускает RustDesk."""
+    if remote_mode(company) == "off":
+        return []
+    rows = conn.execute("SELECT ip FROM devices WHERE company_id=? AND remote_control=1 AND is_blocked=0 "
+                        "AND is_approved=1 AND token_hash IS NOT NULL AND id<>? ORDER BY id",
+                        (company["id"], exclude_id)).fetchall()
+    return [r["ip"] for r in rows]
+
+
+def remote_config(conn, dev, company) -> dict:
+    """Что клиент делает с RustDesk. mode — что разрешил администратор (выбор пользователя ПК клиент
+    добавляет сам), allowed — с каких адресов пускать, rotate — пора сменить пароль, can_control —
+    может ли этот ПК управлять другими."""
+    mode = admin_remote_mode(dev, company)
     used = dev["remote_used_at"]
-    rotate = mode == "auto" and (not unseal(dev["remote_pw"])
-                                 or bool(used) and time.time() - used >= REMOTE_ROTATE_AFTER)
-    return {"mode": mode, "port": REMOTE_PORT, "rotate": rotate}
+    rotate = effective_remote_mode(dev, company) == "auto" and (
+        not unseal(dev["remote_pw"]) or bool(used) and time.time() - used >= REMOTE_ROTATE_AFTER)
+    return {"mode": mode, "port": REMOTE_PORT, "rotate": rotate, "can_control": can_control(dev, company),
+            "allowed": remote_controllers(conn, company, dev["id"]) if mode != "off" else []}
 
 
 def client_config(conn, dev, company) -> dict:
@@ -329,7 +372,7 @@ def client_config(conn, dev, company) -> dict:
         "direct": direct_neighbors(conn, dev, company),
         "direct_wan": wan_neighbors(conn, dev, company),   # ПК других офисов: прямой путь через интернет
         "time": int(time.time()),   # часы сервера: ПК пробуют прямой путь через интернет одновременно
-        "remote": remote_config(dev, company),   # удалённое управление (RustDesk), клиент 1.0.16+
+        "remote": remote_config(conn, dev, company),   # удалённое управление (RustDesk), клиент 1.0.16+
     }
 
 
@@ -349,8 +392,8 @@ def build_forward_rules(conn) -> list[str]:
         rules.append(f"-A RETIX_FWD -s {sub} -d {sub} -p tcp -m multiport --dports {ports} -j ACCEPT")
         # Radmin Viewer -> Radmin Server на кассах
         rules.append(f"-A RETIX_FWD -s {sub} -d {sub} -p tcp --dport {RADMIN_PORT} -j ACCEPT")
-        if remote_mode(c) != "off":   # RustDesk -> RustDesk (прямой доступ по IP)
-            rules.append(f"-A RETIX_FWD -s {sub} -d {sub} -p tcp --dport {REMOTE_PORT} -j ACCEPT")
+        for ip in remote_controllers(conn, c):   # RustDesk -> RustDesk: только с ПК, которым разрешено управлять
+            rules.append(f"-A RETIX_FWD -s {ip}/32 -d {sub} -p tcp --dport {REMOTE_PORT} -j ACCEPT")
     return rules
 
 
@@ -457,6 +500,15 @@ def device_action(conn, company_id: int, device_id: int, action: str, value: str
                 raise ValueError(f"Скорость — целое число Мбит/с от 0 до {SPEED_MAX} (0 — без ограничения)")
             conn.execute("UPDATE devices SET speed_limit=? WHERE id=?", (mbit, device_id))
             msg = f"{dev['name']}: скорость через сервер " + (f"до {mbit} Мбит/с" if mbit else "без ограничения")
+        elif action in ("control_on", "control_off"):
+            conn.execute("UPDATE devices SET remote_control=? WHERE id=?", (1 if action == "control_on" else 0, device_id))
+            msg = (f"{dev['name']} может управлять другими компьютерами" if action == "control_on" else
+                   f"{dev['name']} больше не может управлять другими компьютерами")
+        elif action == "remote_access":
+            if value not in REMOTE_ACCESS:
+                raise ValueError("Неизвестный режим управления компьютером")
+            conn.execute("UPDATE devices SET remote_access=? WHERE id=?", (value, device_id))
+            msg = f"Управление {dev['name']}: {REMOTE_ACCESS[value]}"
         elif action == "rename":
             name = clean_device_name(value)
             if not name:

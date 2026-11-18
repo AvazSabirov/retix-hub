@@ -1465,6 +1465,8 @@ class TestRemoteControl:
         cab = ctx.cabinet("firma")
         r = cab.post("/cabinet/settings", data={"share_name": "share", "share_ports": "445", "remote_mode": mode})
         assert "Настройки сохранены" in r.text
+        r = cab.post(f"/cabinet/devices/{a['device_id']}/control_on")   # A может управлять другими
+        assert "может управлять" in r.text
         return a, b, cab
 
     def _me(self, ctx, pc):
@@ -1473,7 +1475,8 @@ class TestRemoteControl:
     def test_off_by_default(self, ctx, net):
         ctx.company("firma")
         a, b = ctx.register("firma", name="A"), ctx.register("firma", name="B")
-        assert self._me(ctx, a)["remote"] == {"mode": "off", "port": 21118, "rotate": False}
+        assert self._me(ctx, a)["remote"] == {"mode": "off", "port": 21118, "rotate": False, "can_control": False,
+                                              "allowed": []}
         r = ctx.api.post("/api/remote/connect", headers=ctx.h(a["token"]), json={"to": b["device_id"]})
         assert r.status_code == 403 and "выключено" in r.json()["detail"]
         assert not any("21118" in rule for rule in net["rules"])
@@ -1483,7 +1486,12 @@ class TestRemoteControl:
 
     def test_auto_password_flow(self, ctx, net):
         a, b, cab = self._setup(ctx)
-        assert any("--dport 21118" in rule for rule in net["rules"])      # порт RustDesk открыт внутри компании
+        # порт RustDesk открыт только с ПК, которому разрешено управлять
+        assert [r for r in net["rules"] if "21118" in r] == \
+            [f"-A RETIX_FWD -s {a['ip']}/32 -d 10.66.1.0/24 -p tcp --dport 21118 -j ACCEPT"]
+        assert self._me(ctx, b)["remote"]["allowed"] == [a["ip"]]            # RustDesk на B пускает только A
+        assert self._me(ctx, a)["remote"]["can_control"] is True
+        assert self._me(ctx, b)["remote"]["can_control"] is False
         assert self._me(ctx, b)["remote"]["rotate"] is True                # пароля ещё нет — ПК его придумает
         r = ctx.api.post("/api/remote/connect", headers=ctx.h(a["token"]), json={"to": b["device_id"]})
         assert r.status_code == 409 and "не готово" in r.json()["detail"]
@@ -1522,7 +1530,7 @@ class TestRemoteControl:
         a, b, _ = self._setup(ctx, mode="ask")
         ctx.api.post("/api/heartbeat", headers=ctx.h(b["token"]), json={"remote_ok": True})
         self._online(b)
-        assert self._me(ctx, b)["remote"] == {"mode": "ask", "port": 21118, "rotate": False}
+        assert self._me(ctx, b)["remote"]["mode"] == "ask" and self._me(ctx, b)["remote"]["rotate"] is False
         r = ctx.api.post("/api/remote/connect", headers=ctx.h(a["token"]), json={"to": b["device_id"], "kind": "files"})
         assert r.status_code == 200 and r.json()["mode"] == "ask" and r.json()["password"] == ""
 
@@ -1535,6 +1543,9 @@ class TestRemoteControl:
         x = ctx.register("other", name="X")
         cab2 = ctx.cabinet("other")
         cab2.post("/cabinet/settings", data={"share_name": "share", "share_ports": "445", "remote_mode": "auto"})
+        r = ctx.api.post("/api/remote/connect", headers=ctx.h(x["token"]), json={"to": b["device_id"]})
+        assert r.status_code == 403 and "не разрешил" in r.json()["detail"]   # без права «управляет» — нет
+        cab2.post(f"/cabinet/devices/{x['device_id']}/control_on")
         r = ctx.api.post("/api/remote/connect", headers=ctx.h(x["token"]), json={"to": b["device_id"]})
         assert r.status_code == 404                                   # ПК чужой компании — как будто его нет
         r = ctx.api.post("/api/remote/connect", headers=ctx.h(a["token"]), json={"to": a["device_id"]})
@@ -1583,3 +1594,77 @@ class TestRemoteControl:
         from app import services
         monkeypatch.setattr(services, "SECRET_KEY", "другой ключ")
         assert self._me(ctx, b)["remote"]["rotate"] is True            # старый не расшифровать — ПК придумает новый
+
+
+class TestRemoteRights:
+    """Права на удалённое управление: кто управляет (кабинет), можно ли управлять ПК (кабинет, только строже),
+    выбор пользователя ПК (ещё строже, свой пароль)."""
+
+    def _setup(self, ctx, mode="auto"):
+        ctx.company("firma")
+        a, b = ctx.register("firma", name="A"), ctx.register("firma", name="B")
+        cab = ctx.cabinet("firma")
+        cab.post("/cabinet/settings", data={"share_name": "share", "share_ports": "445", "remote_mode": mode})
+        for pc in (a, b):
+            ctx.api.post("/api/heartbeat", headers=ctx.h(pc["token"]), json={"remote_ok": True})
+        ctx.api.post("/api/remote/password", headers=ctx.h(b["token"]), json={"password": "Secret1234567890"})
+        TestRemoteControl._online(a, b)
+        return a, b, cab
+
+    def connect(self, ctx, frm, to):
+        return ctx.api.post("/api/remote/connect", headers=ctx.h(frm["token"]), json={"to": to["device_id"]})
+
+    def peers(self, ctx, pc):
+        return {p["name"]: p for p in ctx.api.get("/api/peers", headers=ctx.h(pc["token"])).json()["peers"]}
+
+    def test_nobody_controls_by_default(self, ctx, net):
+        a, b, cab = self._setup(ctx)
+        assert self.connect(ctx, a, b).status_code == 403
+        assert self.peers(ctx, a)["B"]["remote"] is False                 # меню RustDesk нет
+        assert ctx.api.get("/api/me", headers=ctx.h(b["token"])).json()["remote"]["allowed"] == []
+        assert not any("21118" in r for r in net["rules"])
+        assert "управляет: нет" in cab.get("/cabinet").text
+
+    def test_admin_restricts_target(self, ctx):
+        a, b, cab = self._setup(ctx)
+        cab.post(f"/cabinet/devices/{a['device_id']}/control_on")
+        assert self.connect(ctx, a, b).json()["password"] == "Secret1234567890"
+        cab.post(f"/cabinet/devices/{b['device_id']}/remote_access", data={"value": "ask"})
+        r = self.connect(ctx, a, b).json()
+        assert r["mode"] == "ask" and r["password"] == ""                 # только с согласием — пароля не даём
+        assert ctx.api.get("/api/me", headers=ctx.h(b["token"])).json()["remote"]["mode"] == "ask"
+        cab.post(f"/cabinet/devices/{b['device_id']}/remote_access", data={"value": "off"})
+        assert self.connect(ctx, a, b).status_code == 403
+        assert self.peers(ctx, a)["B"]["remote"] is False
+        r = cab.post(f"/cabinet/devices/{b['device_id']}/remote_access", data={"value": "auto"})
+        assert "Неизвестный режим" in r.text                              # «без согласия» для ПК не выдать
+        cab.post(f"/cabinet/devices/{a['device_id']}/control_off")
+        cab.post(f"/cabinet/devices/{b['device_id']}/remote_access", data={"value": "company"})
+        assert self.connect(ctx, a, b).status_code == 403
+
+    def test_user_choice_on_target(self, ctx):
+        a, b, cab = self._setup(ctx)
+        cab.post(f"/cabinet/devices/{a['device_id']}/control_on")
+        hb = lambda local: ctx.api.post("/api/heartbeat", headers=ctx.h(b["token"]), json={"remote_local": local})
+        hb("own")                                                            # по своему паролю
+        r = self.connect(ctx, a, b).json()
+        assert r["mode"] == "own" and r["password"] == ""                  # сервер пароль пользователя не знает
+        assert self.peers(ctx, a)["B"]["remote_mode"] == "own"
+        hb("off")
+        r = self.connect(ctx, a, b)
+        assert r.status_code == 403 and "пользователь" in r.json()["detail"]
+        hb("")                                                               # снова как администратор
+        me = ctx.api.get("/api/me", headers=ctx.h(b["token"])).json()["remote"]
+        assert me["rotate"] is True              # прежний пароль сервера стёрт — ПК придумает новый
+        assert self.connect(ctx, a, b).status_code == 409
+        hb("ask")
+        assert "сейчас: с согласием (выбор пользователя)" in cab.get("/cabinet").text
+        assert ctx.api.post("/api/heartbeat", headers=ctx.h(b["token"]), json={"remote_local": "evil"}).status_code == 422
+
+    def test_user_cannot_loosen_admin(self, ctx):
+        a, b, cab = self._setup(ctx, mode="ask")
+        cab.post(f"/cabinet/devices/{a['device_id']}/control_on")
+        ctx.api.post("/api/heartbeat", headers=ctx.h(b["token"]), json={"remote_local": "own"})
+        assert self.connect(ctx, a, b).json()["mode"] == "own"           # свой пароль — его собственное согласие
+        cab.post(f"/cabinet/devices/{b['device_id']}/remote_access", data={"value": "off"})
+        assert self.connect(ctx, a, b).status_code == 403               # администратор выключил — и свой пароль не поможет

@@ -15,7 +15,7 @@
 </div>
 <div class="card">
   <h2>Компьютеры</h2>
-  {{ devices_table(devices, action_prefix) }}
+  {{ devices_table(devices, action_prefix, remote_mode != 'off', remote_access) }}
 </div>
 <div class="grid">
   <div class="card">

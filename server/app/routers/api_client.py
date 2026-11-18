@@ -52,6 +52,8 @@ class HeartbeatIn(BaseModel):
     radmin_server: bool | None = None
     # клиент 1.0.16+: RustDesk на ПК установлен и настроен (удалённое управление). Нет поля — прежнее значение
     remote_ok: bool | None = None
+    # клиент 1.0.18+: как пользователь ПК разрешил управлять своим компьютером ('' — как администратор)
+    remote_local: str | None = Field(default=None, pattern="^(|ask|own|off)$")
 
 
 class RemotePasswordIn(BaseModel):
@@ -193,7 +195,7 @@ def peers(ctx=Depends(current_device)):
     if services.device_status(dev) != "active":
         raise HTTPException(403, "Устройство не активно")
     hidden = not dev["show_peers"]   # нет доступа — в программе только сам ПК (сеть при этом та же)
-    remote_on = services.remote_mode(company) != "off"
+    me_controls = services.can_control(dev, company)   # меню RustDesk — только у ПК, которому разрешено управлять
     result = []
     for d in services.list_devices(conn, company["id"]):
         if d["status"] != "active" or (hidden and d["id"] != dev["id"]):
@@ -208,7 +210,9 @@ def peers(ctx=Depends(current_device)):
             "client_version": d["client_version"],
             "is_share_host": bool(d["is_share_host"]),
             "radmin_server": bool(d["radmin_server"]),
-            "remote": remote_on and bool(d["remote_ok"]),   # к нему можно подключиться через RustDesk
+            # к нему можно подключиться через RustDesk (и этому ПК разрешено управлять)
+            "remote": me_controls and bool(d["remote_ok"]) and d["remote_effective"] != "off",
+            "remote_mode": d["remote_effective"] if me_controls else "off",
             "is_me": d["id"] == dev["id"],
         })
     return {"company": company["name"] or company["login"], "peers": result, "peers_hidden": hidden}
@@ -302,6 +306,12 @@ def heartbeat(data: HeartbeatIn, ctx=Depends(current_device)):
         conn.execute("UPDATE devices SET radmin_server=? WHERE id=?", (1 if data.radmin_server else 0, dev["id"]))
     if data.remote_ok is not None:
         conn.execute("UPDATE devices SET remote_ok=? WHERE id=?", (1 if data.remote_ok else 0, dev["id"]))
+    if data.remote_local is not None and data.remote_local != dev["remote_local"]:
+        conn.execute("UPDATE devices SET remote_local=? WHERE id=?", (data.remote_local, dev["id"]))
+        if data.remote_local:   # не «как администратор» — пароль сервера больше не действует
+            conn.execute("UPDATE devices SET remote_pw='', remote_used_at=0 WHERE id=?", (dev["id"],))
+        services.audit(conn, dev["company_id"], "remote_local",
+                       f"{dev['name']} {dev['ip']}: {services.REMOTE_LOCAL[data.remote_local]}")
     conn.commit()
     return {"ok": True}
 
@@ -332,11 +342,19 @@ def remote_connect(data: RemoteConnectIn, ctx=Depends(current_device)):
         raise HTTPException(403, "Удалённое управление выключено в кабинете компании")
     if not dev["show_peers"]:
         raise HTTPException(403, "Администратор компании не дал этому компьютеру доступ к другим компьютерам")
+    if not services.can_control(dev, company):
+        raise HTTPException(403, "Администратор компании не разрешил этому компьютеру управлять другими "
+                                 "(кабинет → список компьютеров → «Управляет»)")
+    remote_limiter.check(str(dev["id"]))   # до поиска ПК: перебором номеров ничего не узнать
+    remote_limiter.fail(str(dev["id"]))
     target = conn.execute("SELECT * FROM devices WHERE id=? AND company_id=?", (data.to, company["id"])).fetchone()
     if not target or target["id"] == dev["id"] or services.device_status(target) != "active":
         raise HTTPException(404, "Компьютер не найден")
-    remote_limiter.check(str(dev["id"]))
-    remote_limiter.fail(str(dev["id"]))
+    mode = services.effective_remote_mode(target, company)
+    if mode == "off":
+        raise HTTPException(403, f"Управлять компьютером {target['name']} нельзя: "
+                                 + ("так решил его пользователь" if target["remote_local"] == "off"
+                                    else "выключено администратором"))
     if not target["remote_ok"]:
         raise HTTPException(409, f"На {target['name']} удалённое управление ещё не готово: нужна Retix Hub 1.0.16 "
                                  "или новее, и программа должна успеть поставить RustDesk (несколько минут)")
