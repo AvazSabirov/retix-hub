@@ -1154,6 +1154,38 @@ def remove_rustdesk_msi(product: str) -> bool:
     return True
 
 
+STOP_SERVICE_RE = re.compile(r"^\s*stop-service\s*=", re.I)
+
+
+def rustdesk_config_files() -> list[Path]:
+    """Настройки RustDesk (RustDesk2.toml): этого пользователя (установщик берёт их, запущенный от него) и службы."""
+    roots = [os.environ.get("APPDATA") or "",
+             str(Path(os.environ.get("SystemRoot", r"C:\Windows")) / "ServiceProfiles" / "LocalService" / "AppData"
+                 / "Roaming")]
+    return [Path(r) / "RustDesk" / "config" / "RustDesk2.toml" for r in roots if r]
+
+
+def clear_rustdesk_stop_service() -> bool:
+    """Снять отметку stop-service из настроек RustDesk. С ней установщик RustDesk службу НЕ создаёт (так он
+    понимает «служба остановлена пользователем»), а RustDesk ставит её себе сам — при удалении или неудачной
+    установке. Осталась от прежнего RustDesk — каждая новая установка выходила без службы."""
+    changed = False
+    for path in rustdesk_config_files():
+        try:
+            lines = path.read_text("utf-8").splitlines(keepends=True)
+        except OSError:
+            continue
+        keep = [ln for ln in lines if not STOP_SERVICE_RE.match(ln)]
+        if len(keep) != len(lines):
+            try:
+                path.write_text("".join(keep), "utf-8")
+                log.warning("RustDesk: снята отметка stop-service в %s — иначе служба не создаётся", path)
+                changed = True
+            except OSError as e:
+                log.error("RustDesk: не удалось исправить %s: %s", path, e)
+    return changed
+
+
 def rustdesk_installer() -> Path | None:
     """Официальный установщик RustDesk, вложенный в установщик Retix Hub (rustdesk-<версия>-x86_64.exe)."""
     found = sorted(app_dir().glob("rustdesk-*.exe"), key=lambda p: vkey(p.name.split("-")[1]) or (0,))
@@ -1167,6 +1199,7 @@ def install_rustdesk() -> bool:
         log.warning("RustDesk: установщик rustdesk-*.exe рядом с программой не найден")
         return False
     log.info("ставлю %s", setup.name)
+    clear_rustdesk_stop_service()
     code, out = run_rd([str(setup), "--silent-install"], timeout=900)   # в своём потоке: сеть не ждёт
     if out.strip():
         log.info("RustDesk --silent-install (код %s): %s", code, " ".join(out.split())[:500])

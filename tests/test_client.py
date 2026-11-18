@@ -1979,3 +1979,25 @@ def test_msi_guid_parse_and_remove(monkeypatch):
     assert calls[-1] == ["msiexec", "/x", "{CD24A421-5DFB-4EC7-9E1A-7930D58ADA49}", "/qn", "/norestart"]
     monkeypatch.setattr(rc, "run_rd", lambda args, timeout=30: (1603, "ошибка"))
     assert rc.remove_rustdesk_msi("{CD24A421-5DFB-4EC7-9E1A-7930D58ADA49}") is False
+
+
+def test_stop_service_mark_cleared_before_install(tmp_path, monkeypatch):
+    """1.0.19: с stop-service = 'Y' в настройках RustDesk его установщик не создаёт службу (оставалось от
+    прежнего RustDesk). Перед установкой отметка снимается, остальные настройки не трогаются."""
+    cfg = tmp_path / "RustDesk" / "config" / "RustDesk2.toml"
+    cfg.parent.mkdir(parents=True)
+    cfg.write_text("rendezvous_server = ''\n\n[options]\nstop-service = 'Y'\nwhitelist = '10.66.1.5'\n", "utf-8")
+    monkeypatch.setenv("APPDATA", str(tmp_path))
+    monkeypatch.setenv("SystemRoot", str(tmp_path / "nowin"))
+    assert rc.clear_rustdesk_stop_service() is True
+    assert cfg.read_text("utf-8") == "rendezvous_server = ''\n\n[options]\nwhitelist = '10.66.1.5'\n"
+    assert rc.clear_rustdesk_stop_service() is False                      # уже чисто — файл не трогаем
+    calls = []
+    cfg.write_text("[options]\nstop-service = 'Y'\n", "utf-8")
+    setup = tmp_path / "rustdesk-1.5.3-x86_64.exe"; setup.write_bytes(b"MZ")
+    monkeypatch.setattr(rc, "app_dir", lambda: tmp_path)
+    monkeypatch.setattr(rc, "run_rd", lambda args, timeout=30: (calls.append(cfg.read_text("utf-8")), (0, ""))[1])
+    monkeypatch.setattr(rc, "rustdesk_exe", lambda: None)
+    monkeypatch.setattr(rc.time, "sleep", lambda s: None)
+    rc.install_rustdesk()
+    assert calls and "stop-service" not in calls[0]                        # к началу установки отметки уже нет
