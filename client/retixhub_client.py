@@ -37,7 +37,7 @@ import requests
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
 
-VERSION = "1.0.18"
+VERSION = "1.0.19"
 APP_NAME = "RetixHub"          # служебное имя: папки, задачи, мьютекс
 APP_TITLE = "Retix Hub"        # то, что видит пользователь
 TUNNEL = "retixhub"
@@ -1118,6 +1118,74 @@ def start_rustdesk() -> bool:
     return rustdesk_ready()
 
 
+MSI_GUID_RE = re.compile(r"\{[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}\}")
+
+
+def rustdesk_msi_product() -> str | None:
+    """RustDesk, поставленный MSI-пакетом (раньше, не Retix Hub): код продукта {…} для msiexec /x.
+    Установщик RustDesk в виде exe поверх MSI не ставит: «Cannot install the EXE package over an existing MSI»."""
+    if not WINDOWS:
+        return None
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                            r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\RustDesk") as k:
+            values = {}
+            for name in ("WindowsInstaller", "UninstallString", "QuietUninstallString"):
+                try:
+                    values[name] = winreg.QueryValueEx(k, name)[0]
+                except OSError:
+                    pass
+    except OSError:
+        return None
+    if values.get("WindowsInstaller") != 1:
+        return None
+    m = MSI_GUID_RE.search(str(values.get("QuietUninstallString") or values.get("UninstallString") or ""))
+    return m.group(0) if m else None
+
+
+def remove_rustdesk_msi(product: str) -> bool:
+    """Тихо удалить сломанный RustDesk из MSI (файлы есть, службы нет), чтобы поставить его заново."""
+    log.warning("RustDesk: стоит MSI-пакет %s без службы — удаляю его, чтобы поставить заново", product)
+    code, out = run_rd(["msiexec", "/x", product, "/qn", "/norestart"], timeout=600)
+    if code not in (0, 1605, 3010):   # 1605 — уже не установлен, 3010 — нужна перезагрузка
+        log.error("RustDesk: MSI не удалился (код %s) %s", code, " ".join(out.split())[:300])
+        return False
+    return True
+
+
+STOP_SERVICE_RE = re.compile(r"^\s*stop-service\s*=", re.I)
+
+
+def rustdesk_config_files() -> list[Path]:
+    """Настройки RustDesk (RustDesk2.toml): этого пользователя (установщик берёт их, запущенный от него) и службы."""
+    roots = [os.environ.get("APPDATA") or "",
+             str(Path(os.environ.get("SystemRoot", r"C:\Windows")) / "ServiceProfiles" / "LocalService" / "AppData"
+                 / "Roaming")]
+    return [Path(r) / "RustDesk" / "config" / "RustDesk2.toml" for r in roots if r]
+
+
+def clear_rustdesk_stop_service() -> bool:
+    """Снять отметку stop-service из настроек RustDesk. С ней установщик RustDesk службу НЕ создаёт (так он
+    понимает «служба остановлена пользователем»), а RustDesk ставит её себе сам — при удалении или неудачной
+    установке. Осталась от прежнего RustDesk — каждая новая установка выходила без службы."""
+    changed = False
+    for path in rustdesk_config_files():
+        try:
+            lines = path.read_text("utf-8").splitlines(keepends=True)
+        except OSError:
+            continue
+        keep = [ln for ln in lines if not STOP_SERVICE_RE.match(ln)]
+        if len(keep) != len(lines):
+            try:
+                path.write_text("".join(keep), "utf-8")
+                log.warning("RustDesk: снята отметка stop-service в %s — иначе служба не создаётся", path)
+                changed = True
+            except OSError as e:
+                log.error("RustDesk: не удалось исправить %s: %s", path, e)
+    return changed
+
+
 def rustdesk_installer() -> Path | None:
     """Официальный установщик RustDesk, вложенный в установщик Retix Hub (rustdesk-<версия>-x86_64.exe)."""
     found = sorted(app_dir().glob("rustdesk-*.exe"), key=lambda p: vkey(p.name.split("-")[1]) or (0,))
@@ -1131,7 +1199,10 @@ def install_rustdesk() -> bool:
         log.warning("RustDesk: установщик rustdesk-*.exe рядом с программой не найден")
         return False
     log.info("ставлю %s", setup.name)
-    run_rd([str(setup), "--silent-install"], timeout=900)   # в своём потоке: сеть не ждёт
+    clear_rustdesk_stop_service()
+    code, out = run_rd([str(setup), "--silent-install"], timeout=900)   # в своём потоке: сеть не ждёт
+    if out.strip():
+        log.info("RustDesk --silent-install (код %s): %s", code, " ".join(out.split())[:500])
     for _ in range(30):
         if rustdesk_exe() and rustdesk_service_state() != "missing":
             return True
@@ -1587,6 +1658,7 @@ class Worker(threading.Thread):
         self.remote_pw_force = False             # RustDesk только что настроен — нужен свой пароль
         self.remote_session_checked = 0.0        # когда последний раз смотрели, идёт ли сеанс RustDesk
         self.remote_job: threading.Thread | None = None   # установка и настройка RustDesk — в своём потоке
+        self.remote_lock = threading.Lock()      # работа с RustDesk (фон и меню «Управление») — по одной
         self.last_peers: list[dict] = []         # список компьютеров с последнего ответа сервера
         # шаг цикла и смена компании (вход, переключение, выход) не идут одновременно
         self.op_lock = threading.RLock()
@@ -1774,7 +1846,8 @@ class Worker(threading.Thread):
 
     def _remote_job(self, now: float, cfg: dict):
         try:
-            self._remote_work(now, cfg)
+            with self.remote_lock:
+                self._remote_work(now, cfg)
         except Exception:  # noqa: BLE001
             log.exception("удалённое управление")
 
@@ -1806,6 +1879,9 @@ class Worker(threading.Thread):
             self.remote_install_at = now
             if exe:
                 log.warning("RustDesk: rustdesk.exe есть, а службы нет — ставлю заново")
+                product = rustdesk_msi_product()
+                if product:
+                    remove_rustdesk_msi(product)
             if install_rustdesk():
                 self.state.set(rustdesk_by_retix=True, remote_applied="")
                 installed = True
@@ -1848,6 +1924,59 @@ class Worker(threading.Thread):
         self.remote_ok = True
         if mode == "auto":
             self._remote_password(exe, bool(remote.get("rotate")), port, now)
+
+    def rustdesk_status(self) -> str:
+        """Текст для окна «Управление → Состояние RustDesk»."""
+        exe = rustdesk_exe()
+        service = rustdesk_service_state()
+        remote = (self.cfg or {}).get("remote") if isinstance((self.cfg or {}).get("remote"), dict) else {}
+        admin = remote.get("mode") if remote.get("mode") in REMOTE_MODES else "off"
+        mode = combine_remote_mode(admin, self.state.get("remote_local") or "",
+                                   bool(self.state.get("remote_own_pw")))
+        titles = {"off": "нельзя", "ask": "только с согласием", "auto": "без согласия (пароль от сервера)",
+                  "own": "по вашему паролю"}
+        lines = [f"RustDesk:  {'установлен' if exe else 'не установлен'}",
+                 "Служба RustDesk:  " + {"running": "работает", "stopped": "остановлена"}.get(service, "нет"),
+                 f"Связь со службой:  {'есть' if rustdesk_ready() else 'нет'}",
+                 f"Управлять этим ПК:  {titles[mode]}",
+                 f"Этот ПК управляет другими:  {'да' if remote.get('can_control') is True else 'нет'}",
+                 f"Готов к подключению:  {'да' if self.remote_ok else 'нет'}"]
+        if self.state.get("rustdesk_by_retix"):
+            lines.append("RustDesk поставлен программой Retix Hub (удалится вместе с ней)")
+        return "\n".join(lines)
+
+    def repair_rustdesk(self, reinstall: bool = False) -> tuple[bool, str]:
+        """Меню «Управление»: поставить/запустить службу RustDesk или переставить RustDesk целиком.
+        (True/False, текст для пользователя). Вызывается из потока окна, ждёт фоновую работу с RustDesk."""
+        with self.remote_lock:
+            exe = rustdesk_exe()
+            service = rustdesk_service_state() if exe else "missing"
+            if not reinstall and exe and service == "running" and start_rustdesk():
+                ok, text = True, "RustDesk работает, служба запущена."
+            elif not reinstall and exe and service == "stopped":
+                ok = start_rustdesk()
+                text = "Служба RustDesk запущена." if ok else "Служба RustDesk не запустилась — попробуйте «Переустановить RustDesk»."
+            else:
+                if not rustdesk_installer():
+                    return False, ("Установщика RustDesk нет рядом с программой.\n"
+                                   "Переустановите Retix Hub последней версией — RustDesk внутри неё.")
+                product = rustdesk_msi_product()
+                if product:
+                    remove_rustdesk_msi(product)
+                log.info("RustDesk: %s по команде пользователя", "переустановка" if reinstall else "установка службы")
+                ok = install_rustdesk() and start_rustdesk()
+                if ok:
+                    self.state.set(rustdesk_by_retix=True)
+                text = ("RustDesk установлен, служба работает." if ok else
+                        "RustDesk не установился. Подробности — в журнале (Система → Открыть журнал).")
+            exe = rustdesk_exe()
+            if exe:   # что бы ни было в настройках RustDesk — в интернет и из интернета он не ходит
+                ensure_remote_firewall(None, REMOTE_PORT, exe)
+            self.state.set(remote_applied="", remote_pw_pending="")   # настроить заново в следующем шаге
+            self.remote_applied_at = 0
+            self.remote_install_at = 0
+        self.wake.set()
+        return ok, text
 
     def set_remote_access(self, local: str, password: str = "") -> str | None:
         """Пользователь выбрал, как можно управлять его ПК (из окна). None — сохранено, иначе текст ошибки."""
@@ -3046,7 +3175,6 @@ class App(tk.Tk):
         m.add_command(label="Переподключить", command=self.worker.force_reconnect)
         m.add_separator()
         m.add_command(label="Имя компьютера…", command=self.rename)
-        m.add_command(label="Доступ к этому компьютеру…", command=self.access)
         m.add_command(label="Добавить компанию…", command=lambda: self.show_login(add=True))
         m.add_command(label="Выйти из сети компании", command=self.logout)
         m.add_separator()
@@ -3054,6 +3182,12 @@ class App(tk.Tk):
         m.add_command(label="Папка журнала", command=lambda: self.open_path(log_dir()))
         m.add_separator()
         m.add_command(label="Выход (VPN продолжит работать)", command=self.ask_quit)
+        r = dark_menu(self)
+        r.add_command(label="Доступ к этому компьютеру…", command=self.access)
+        r.add_separator()
+        r.add_command(label="Состояние RustDesk", command=self.rustdesk_status)
+        r.add_command(label="Установить / запустить службу RustDesk", command=lambda: self.rustdesk_repair(False))
+        r.add_command(label="Переустановить RustDesk", command=lambda: self.rustdesk_repair(True))
         h = dark_menu(self)
         h.add_command(label="Как открыть доступ к папке…", command=self.help_share)
         h.add_command(label="О программе", command=self.about)
@@ -3061,7 +3195,7 @@ class App(tk.Tk):
         self.company_menu.configure(postcommand=self._fill_company_menu)   # список — при каждом открытии
         self._company_var = tk.StringVar(self, "")
         self._forget_menu = None
-        for title, menu in (("Система", m), ("Компания", self.company_menu), ("Справка", h)):
+        for title, menu in (("Система", m), ("Компания", self.company_menu), ("Управление", r), ("Справка", h)):
             b = tk.Label(bar, text=title, bg=C["bg"], fg=C["text"], padx=8, pady=3, font=("Segoe UI", 9),
                          cursor="hand2")
             b.pack(side="left")
@@ -3740,6 +3874,24 @@ class App(tk.Tk):
             else:
                 self.ui_q.put(("error", out.strip() or "Ошибка net use"))
         threading.Thread(target=work, daemon=True, name="net-use").start()
+
+    def rustdesk_status(self):
+        def work():
+            self.ui_q.put(("info", self.worker.rustdesk_status()))
+        threading.Thread(target=work, daemon=True, name="rd-status").start()
+
+    def rustdesk_repair(self, reinstall: bool):
+        what = "Переустановить RustDesk" if reinstall else "Установить / запустить службу RustDesk"
+        if reinstall and not messagebox.askyesno(APP_TITLE, "Переустановить RustDesk?\n\nОн будет удалён и поставлен "
+                                                            "заново (около минуты), идущий сеанс управления прервётся.",
+                                                 parent=self):
+            return
+        self.tray.notify(APP_TITLE, f"{what}…")
+
+        def work():
+            ok, text = self.worker.repair_rustdesk(reinstall)
+            self.ui_q.put(("info" if ok else "error", text))
+        threading.Thread(target=work, daemon=True, name="rd-repair").start()
 
     def access(self):
         if self.access_dialog and self.access_dialog.winfo_exists():
