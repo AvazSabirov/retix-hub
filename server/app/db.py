@@ -20,6 +20,7 @@ CREATE TABLE IF NOT EXISTS companies (
     share_name        TEXT NOT NULL DEFAULT 'share',
     share_ports       TEXT NOT NULL DEFAULT '445',
     speed_limit       INTEGER NOT NULL DEFAULT 0,  -- Мбит/с через сервер на всю компанию, 0 — без ограничения
+    remote_mode       TEXT NOT NULL DEFAULT 'off', -- удалённое управление (RustDesk): off, ask — с согласием, auto — без
     is_active         INTEGER NOT NULL DEFAULT 1,
     created_at        TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
@@ -51,6 +52,9 @@ CREATE TABLE IF NOT EXISTS devices (
     wan_ok          INTEGER NOT NULL DEFAULT 0, -- клиент умеет прямой путь через интернет (1.0.12+)
     speed_limit     INTEGER NOT NULL DEFAULT 0, -- Мбит/с через сервер для этого ПК (приём и отправка), 0 — без
     radmin_server   INTEGER NOT NULL DEFAULT 0, -- на ПК стоит Radmin Server (сообщает клиент 1.0.12+)
+    remote_ok       INTEGER NOT NULL DEFAULT 0, -- RustDesk на ПК установлен и настроен Retix Hub (клиент 1.0.16+)
+    remote_pw       TEXT NOT NULL DEFAULT '',   -- пароль RustDesk этого ПК, зашифрован (services.seal)
+    remote_used_at  INTEGER NOT NULL DEFAULT 0, -- когда пароль выдан другому ПК: после сеанса ПК сменит его сам
     last_seen       TEXT,
     update_state    TEXT NOT NULL DEFAULT '',   -- что ПК сообщает об обновлении: downloading:1.0.6 …
     update_state_at TEXT,
@@ -133,7 +137,11 @@ MIGRATIONS = [
     ("devices", "wan_ok", "INTEGER NOT NULL DEFAULT 0"),
     ("devices", "speed_limit", "INTEGER NOT NULL DEFAULT 0"),
     ("devices", "radmin_server", "INTEGER NOT NULL DEFAULT 0"),
+    ("devices", "remote_ok", "INTEGER NOT NULL DEFAULT 0"),
+    ("devices", "remote_pw", "TEXT NOT NULL DEFAULT ''"),
+    ("devices", "remote_used_at", "INTEGER NOT NULL DEFAULT 0"),
     ("companies", "speed_limit", "INTEGER NOT NULL DEFAULT 0"),
+    ("companies", "remote_mode", "TEXT NOT NULL DEFAULT 'off'"),
 ]
 
 

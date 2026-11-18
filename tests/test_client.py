@@ -1638,3 +1638,155 @@ def test_radmin_server_reported_to_other_pcs(make_client, company, monkeypatch):
     b.w.radmin_checked = 0                 # следующая проверка — сразу (обычно раз в 5 минут)
     b.step(); a.step()
     assert {p["name"]: p["radmin_server"] for p in a.peers}["Офис"] is False
+
+
+# ================================================================== 1.0.16: удалённое управление (RustDesk)
+
+FAKE_RUSTDESK = Path("C:/Program Files/RustDesk/rustdesk.exe")
+
+
+class FakeRustDesk:
+    """RustDesk одного ПК: настройки (--option), постоянный пароль (--password), идёт ли сеанс."""
+
+    def __init__(self, installed=True):
+        self.options, self.password, self.calls = {}, "", []
+        self.installed, self.sessions = installed, False
+
+
+RD_NOW = {"rd": None}   # RustDesk того ПК, чей шаг идёт
+
+
+@pytest.fixture()
+def fake_rustdesk(monkeypatch, patch_windows):
+    def run(args, timeout=60):
+        patch_windows.append(args)
+        rd = RD_NOW["rd"]
+        if rd and args and args[0] == str(FAKE_RUSTDESK):
+            rd.calls.append(list(args[1:]))
+            if args[1] == "--option" and len(args) == 4:
+                rd.options[args[2]] = args[3]
+            elif args[1] == "--option" and len(args) == 3:
+                return 0, rd.options.get(args[2], "") + "\n"
+            elif args[1] == "--password":
+                rd.password = args[2]
+                return 0, "Done!\n"
+        return 0, ""
+    monkeypatch.setattr(rc, "run", run)
+    monkeypatch.setattr(rc, "rustdesk_exe", lambda: FAKE_RUSTDESK if RD_NOW["rd"] and RD_NOW["rd"].installed else None)
+    monkeypatch.setattr(rc, "rustdesk_session_active", lambda port=rc.REMOTE_PORT: RD_NOW["rd"].sessions)
+    yield patch_windows
+    RD_NOW["rd"] = None
+
+
+def step_as(c, rd, n=1):
+    RD_NOW["rd"] = rd
+    return c.step(n)
+
+
+def _set_online(server, *names, used_ago=None):
+    import sqlite3
+    conn = sqlite3.connect(Path(server.data) / "vpn.db", timeout=10)
+    now = int(time.time())
+    for name in names:
+        conn.execute("UPDATE devices SET last_handshake=?, last_rx_at=? WHERE name=?", (now, now, name))
+        if used_ago is not None:
+            conn.execute("UPDATE devices SET remote_used_at=? WHERE name=?", (now - used_ago, name))
+    conn.commit(); conn.close()
+
+
+def test_remote_control_end_to_end(make_client, company, server, fake_rustdesk):
+    calls = fake_rustdesk
+    a, rda = make_client("PC1"), FakeRustDesk()
+    login(a, company, name="Склад"); step_as(a, rda, 2)
+    b, rdb = make_client("PC2"), FakeRustDesk()
+    login(b, company, name="Касса"); step_as(b, rdb, 2)
+    assert rda.calls == [] and rdb.calls == []                  # выключено в кабинете — RustDesk не трогаем
+    assert a.w.remote_connect(b.w.cfg["device_id"])[1] == "Удалённое управление выключено в кабинете компании"
+
+    company.cab.post(BASE + "/cabinet/settings", data={"share_name": "share", "share_ports": "445",
+                                                       "remote_mode": "auto"})
+    step_as(b, rdb, 2); step_as(a, rda, 2)
+    assert rdb.options["direct-server"] == "Y" and rdb.options["whitelist"] == b.w.cfg["subnet"]
+    assert rdb.options["approve-mode"] == "password"
+    # серверы RustDesk не участвуют: вместо них — сервер Retix Hub внутри VPN
+    assert rdb.options["custom-rendezvous-server"] == rdb.options["relay-server"] == "10.66.0.1"
+    assert len(rdb.password) >= 12 and b.state.get("remote_pw_pending") == ""
+    rules = [" ".join(c) for c in calls if c[:1] == ["netsh"] and "add" in c]
+    assert any("RetixHub RustDesk only VPN (out)" in r and "action=block" in r and "10.67.0.0" in r for r in rules)
+    assert any(f"name=RetixHub RustDesk " in r and f"remoteip={b.w.cfg['subnet']}" in r and "localport=21118" in r
+               for r in rules)
+
+    _set_online(server, "Склад", "Касса")
+    step_as(a, rda)
+    peer_b = next(p for p in a.peers if p["name"] == "Касса")
+    RD_NOW["rd"] = rda
+    assert peer_b["remote"] is True and rc.remote_menu_allowed(peer_b, a.w.cfg)
+    assert not rc.remote_menu_allowed(next(p for p in a.peers if p["is_me"]), a.w.cfg)
+    res, err = a.w.remote_connect(peer_b["id"])
+    assert err is None and res["ip"] == b.w.cfg["ip"] and res["password"] == rdb.password
+    assert rc.rustdesk_args(FAKE_RUSTDESK, res["ip"], res["port"], "control", res["password"]) == \
+        [str(FAKE_RUSTDESK), "--connect", b.w.cfg["ip"], "--password", rdb.password]
+
+    # пароль выдан: пока идёт сеанс — не меняется, после — новый, и сервер выдаёт уже его
+    first = rdb.password
+    _set_online(server, "Касса", used_ago=300)
+    rdb.sessions = True
+    step_as(b, rdb)
+    assert rdb.password == first
+    rdb.sessions = False
+    step_as(b, rdb)
+    assert rdb.password == first                     # сеанс проверяется не чаще раза в 30 с
+    b.w.remote_session_checked = 0
+    step_as(b, rdb)
+    assert rdb.password != first
+    RD_NOW["rd"] = rda
+    assert a.w.remote_connect(peer_b["id"])[0]["password"] == rdb.password
+
+    # выключили в кабинете — RustDesk больше не принимает подключения
+    company.cab.post(BASE + "/cabinet/settings", data={"share_name": "share", "share_ports": "445",
+                                                       "remote_mode": "off"})
+    step_as(b, rdb)
+    assert rdb.options["direct-server"] == "N" and b.state.get("remote_applied") == ""
+    step_as(a, rda)
+    assert all(p["remote"] is False for p in a.peers)
+
+
+def test_remote_ask_mode_and_install(make_client, company, server, fake_rustdesk, monkeypatch):
+    rd = FakeRustDesk(installed=False)
+    installs = []
+    monkeypatch.setattr(rc, "install_rustdesk", lambda: (installs.append(1), setattr(rd, "installed", True))[0] or True)
+    company.cab.post(BASE + "/cabinet/settings", data={"share_name": "share", "share_ports": "445",
+                                                       "remote_mode": "ask"})
+    c = make_client("PC1"); login(c, company, name="Касса"); step_as(c, rd, 2)
+    assert installs == [1] and c.state.get("rustdesk_by_retix") is True     # поставлен этой программой
+    assert rd.options["approve-mode"] == "click" and rd.password == ""       # с согласием — пароль не нужен
+    assert c.w.remote_ok is True
+    rc.uninstall_remote(c.state)
+    assert rd.calls[-1] == ["--uninstall"] and c.state.get("rustdesk_by_retix") is False
+
+
+def test_remote_not_configured_not_ready(make_client, company, fake_rustdesk, monkeypatch):
+    """Служба RustDesk не ответила — ПК не говорит серверу «готов», и настройки повторяются."""
+    rd = FakeRustDesk()
+    monkeypatch.setattr(rc, "configure_rustdesk", lambda exe, opts: False)
+    company.cab.post(BASE + "/cabinet/settings", data={"share_name": "share", "share_ports": "445",
+                                                       "remote_mode": "auto"})
+    c = make_client("PC1"); login(c, company, name="Касса"); step_as(c, rd, 2)
+    assert c.w.remote_ok is False and c.state.get("remote_applied") == "" and rd.password == ""
+
+
+def test_rustdesk_helpers(tmp_path, monkeypatch):
+    opts = rc.rustdesk_options("auto", "10.66.3.0/24", "10.66.0.1")
+    assert opts["whitelist"] == "10.66.3.0/24" and opts["direct-access-port"] == "21118"
+    assert rc.rustdesk_options("ask", "10.66.3.0/24", "10.66.0.1")["approve-mode"] == "click"
+    exe = Path("C:/RD/rustdesk.exe")
+    assert rc.rustdesk_args(exe, "10.66.3.5", 21118, "files") == [str(exe), "--file-transfer", "10.66.3.5"]
+    assert rc.rustdesk_args(exe, "10.66.3.5", 21200, "control")[2] == "10.66.3.5:21200"
+    pw = rc.new_remote_password()
+    assert rc.REMOTE_PW_RE.match(pw) and pw != rc.new_remote_password()
+    for name in ("rustdesk-1.4.2-x86_64.exe", "rustdesk-1.10.0-x86_64.exe", "rustdesk-1.9.9-x86_64.exe"):
+        (tmp_path / name).write_bytes(b"MZ")
+    monkeypatch.setattr(rc, "app_dir", lambda: tmp_path)
+    assert rc.rustdesk_installer().name == "rustdesk-1.10.0-x86_64.exe"       # самая новая версия
+    assert not rc.remote_menu_allowed({"remote": True}, {"remote": {"mode": "off"}})
+    assert not rc.remote_menu_allowed({"remote": True}, {})                    # старый сервер

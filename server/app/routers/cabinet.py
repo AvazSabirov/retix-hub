@@ -50,9 +50,12 @@ def logout(request: Request):
 def index(request: Request, ctx=Depends(current_company), msg: str = "", err: int = 0):
     conn, company = ctx
     devices = services.list_devices(conn, company["id"])
+    remote_log = conn.execute("SELECT * FROM audit_log WHERE company_id=? AND action='remote_connect' "
+                              "ORDER BY id DESC LIMIT 30", (company["id"],)).fetchall()
     return templates.TemplateResponse(request, "cabinet.html", {
         "title": company["name"] or company["login"], "company": company,
         "subnet": services.subnet(company), "devices": devices,
+        "remote_modes": services.REMOTE_MODES, "remote_mode": services.remote_mode(company), "remote_log": remote_log,
         "online": sum(d["online"] for d in devices),
         "action_prefix": "/cabinet/devices/", "logout_url": "/cabinet/logout",
         "msg": msg, "err": err})
@@ -71,8 +74,11 @@ def device_action(device_id: int, action: str, value: str = Form(""), ctx=Depend
 @router.post("/settings")
 def settings(require_approval: str = Form(""), full_lan: str = Form(""),
              share_name: str = Form("share"), share_ports: str = Form("445"),
-             ctx=Depends(current_company)):
+             remote_mode: str | None = Form(None), ctx=Depends(current_company)):
     conn, company = ctx
+    remote = services.remote_mode(company) if remote_mode is None else services.clean_remote_mode(remote_mode)
+    if remote is None:
+        return redirect("/cabinet", "Неизвестный режим удалённого управления", err=True)
     ports = services.clean_ports(share_ports)
     if not ports:
         return redirect("/cabinet", "Порты: числа через запятую, например 445", err=True)
@@ -80,9 +86,11 @@ def settings(require_approval: str = Form(""), full_lan: str = Form(""),
     if not services.SHARE_RE.match(share_name):
         return redirect("/cabinet", "Недопустимое имя общей папки", err=True)
     with db.write_lock:
-        conn.execute("UPDATE companies SET require_approval=?, full_lan=?, share_name=?, share_ports=? WHERE id=?",
-                     (1 if require_approval else 0, 1 if full_lan else 0, share_name, ports, company["id"]))
-        services.audit(conn, company["id"], "settings", f"approval={bool(require_approval)} full_lan={bool(full_lan)} ports={ports}")
+        conn.execute("UPDATE companies SET require_approval=?, full_lan=?, share_name=?, share_ports=?, remote_mode=? "
+                     "WHERE id=?", (1 if require_approval else 0, 1 if full_lan else 0, share_name, ports, remote,
+                                    company["id"]))
+        services.audit(conn, company["id"], "settings", f"approval={bool(require_approval)} full_lan={bool(full_lan)} "
+                                                        f"ports={ports} remote={remote}")
         conn.commit()
         services.reconcile(conn)
     return redirect("/cabinet", "Настройки сохранены")

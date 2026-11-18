@@ -2,7 +2,7 @@ import os
 import secrets
 
 APP_NAME = "Retix Hub"
-APP_VERSION = "1.0.15"   # версия сервера — та же, что у клиента (client VERSION), поднимается вместе с ней
+APP_VERSION = "1.0.16"   # версия сервера — та же, что у клиента (client VERSION), поднимается вместе с ней
 PUBLIC_URL = os.getenv("PUBLIC_URL", "https://hub.retix.uz")
 
 DATA_DIR = os.getenv("DATA_DIR", "/data")
@@ -31,6 +31,8 @@ ONLINE_SECONDS = int(os.getenv("ONLINE_SECONDS", "180"))
 OFFLINE_AFTER_SECONDS = int(os.getenv("OFFLINE_AFTER_SECONDS", "45"))
 # Radmin Server: Radmin Viewer подключается к нему по TCP 4899 — открыт между ПК компании всегда
 RADMIN_PORT = int(os.getenv("RADMIN_PORT", "4899"))
+# Удалённое управление (RustDesk, прямой доступ по IP внутри VPN): порт службы RustDesk на ПК
+REMOTE_PORT = int(os.getenv("REMOTE_PORT", "21118"))
 
 # Токен устройства меняется не реже, чем раз в столько секунд. Старый токен, пришедший снова
 # (его скопировали на другой ПК), отключает устройство до одобрения администратором.

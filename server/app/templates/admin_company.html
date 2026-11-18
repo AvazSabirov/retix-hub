@@ -10,6 +10,7 @@
     <div><span class="muted">Одобрение</span><b>{{ 'да' if company.require_approval else 'нет' }}</b></div>
     <div><span class="muted">Весь трафик внутри</span><b>{{ 'да, ПК связываются напрямую' if company.full_lan else 'ping, папки, Radmin' }}</b></div>
     <div><span class="muted">Скорость через сервер</span><b>{{ (company.speed_limit ~ ' Мбит/с') if company.speed_limit else 'без ограничения' }}</b></div>
+    <div><span class="muted">Удалённое управление</span><b>{{ remote_modes[remote_mode] }}</b></div>
   </div>
 </div>
 <div class="card">
@@ -25,6 +26,11 @@
       <label><span>Скорость через сервер на всю компанию, Мбит/с (0 — без ограничения)</span><input type="number" name="speed_limit" value="{{ company.speed_limit }}" min="0" max="10000"></label>
       <label class="check"><input type="checkbox" name="is_active" value="1" {{ 'checked' if company.is_active }}> Компания активна</label>
       <label class="check"><input type="checkbox" name="require_approval" value="1" {{ 'checked' if company.require_approval }}> Новые ПК ждут одобрения</label>
+      <label><span>Удалённое управление (RustDesk, только внутри компании)</span>
+        <select name="remote_mode">
+          {% for key, title in remote_modes.items() %}<option value="{{ key }}" {{ 'selected' if key == remote_mode }}>{{ title }}</option>{% endfor %}
+        </select>
+      </label>
       <p class="muted">Скорость ограничивает только трафик между ПК через сервер — сумму по всем ПК компании.
         Прямой путь (по локальной сети или через интернет) не ограничивается: он сервер не нагружает.
         Отдельному ПК скорость задаётся в списке компьютеров.</p>

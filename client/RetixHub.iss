@@ -12,6 +12,8 @@
 ;     связь при обновлении не рвётся;
 ;   - старые файлы программы (_internal) удаляются, копируется новая сборка;
 ;   - WireGuard ставится из вложенного MSI, если его ещё нет;
+;   - официальный RustDesk (rustdesk-<версия>-x86_64.exe) кладётся рядом с программой — его ставит
+;     и настраивает клиент, когда в кабинете компании включено удалённое управление;
 ;   - ярлыки: рабочий стол и меню «Пуск»;
 ;   - автозапуск сразу при установке: задача Планировщика «RetixHub» с правами
 ;     администратора (без UAC при каждом входе в Windows), окно — в трее;
@@ -22,7 +24,8 @@
 ;   - данные в %ProgramData%\RetixHub (ключ, вход) и журнал {app}\logs установщик
 ;     при обновлении не трогает (журнал удаляется вместе с программой);
 ;   - при удалении: туннель, правила firewall и автозапуск
-;     снимаются (RetixHub.exe --uninstall). WireGuard остаётся;
+;     снимаются (RetixHub.exe --uninstall). WireGuard остаётся; RustDesk удаляется,
+;     если его поставил Retix Hub;
 ;   - установка более старой версии поверх новой запрещена.
 ;
 ;  Тихая установка на много ПК:  RetixHub_Setup_<версия>.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART
@@ -86,12 +89,16 @@ Name: "ru"; MessagesFile: "compiler:Languages\Russian.isl"
 [InstallDelete]
 ; библиотеки прошлой версии — чтобы не смешались с новыми
 Type: filesandordirs; Name: "{app}\_internal"
+; прежняя версия RustDesk — клиент берёт самую новую, но старые файлы ни к чему
+Type: files; Name: "{app}\rustdesk-*.exe"
 
 [Files]
 Source: "{#DistDir}\*"; DestDir: "{app}"; Excludes: "retixhub_selftest.txt"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "client_config.json"; DestDir: "{app}"; Flags: ignoreversion
 ; клиент сам поставит WireGuard из MSI рядом с exe, если его удалят
 Source: "wireguard\wireguard-amd64-*.msi"; DestDir: "{app}"; Flags: ignoreversion
+; удалённое управление: официальный RustDesk, ставит клиент (rustdesk.exe --silent-install), когда его включат
+Source: "rustdesk\rustdesk-*-x86_64.exe"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExe}"; WorkingDir: "{app}"

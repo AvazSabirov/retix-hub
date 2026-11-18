@@ -102,6 +102,7 @@ def company_page(request: Request, company_id: int, conn=Depends(require_admin),
     log = conn.execute("SELECT * FROM audit_log WHERE company_id=? ORDER BY id DESC LIMIT 30", (c["id"],)).fetchall()
     return templates.TemplateResponse(request, "admin_company.html", {
         "title": c["login"], "company": c, "subnet": services.subnet(c), "devices": devices,
+        "remote_modes": services.REMOTE_MODES, "remote_mode": services.remote_mode(c),
         "online": sum(d["online"] for d in devices), "log": log,
         "action_prefix": f"/admin/companies/{c['id']}/devices/", "logout_url": "/admin/logout", "admin_nav": "companies",
         "msg": msg, "err": err})
@@ -110,18 +111,23 @@ def company_page(request: Request, company_id: int, conn=Depends(require_admin),
 @router.post("/companies/{company_id}/update")
 def update_company(company_id: int, name: str = Form(""), max_devices: int = Form(20),
                    is_active: str = Form(""), require_approval: str = Form(""), speed_limit: str | None = Form(None),
-                   conn=Depends(require_admin)):
+                   remote_mode: str | None = Form(None), conn=Depends(require_admin)):
     c = get_company(conn, company_id)
+    remote = services.remote_mode(c) if remote_mode is None else services.clean_remote_mode(remote_mode)
+    if remote is None:
+        return redirect(f"/admin/companies/{c['id']}", "Неизвестный режим удалённого управления", err=True)
     speed = c["speed_limit"] if speed_limit is None else services.clean_speed(speed_limit)
     if speed is None:
         return redirect(f"/admin/companies/{c['id']}",
                         f"Скорость — целое число Мбит/с от 0 до {services.SPEED_MAX} (0 — без ограничения)", err=True)
     with db.write_lock:
-        conn.execute("UPDATE companies SET name=?, max_devices=?, is_active=?, require_approval=?, speed_limit=? "
-                     "WHERE id=?", (name.strip()[:100], max(1, min(max_devices, 253)), 1 if is_active else 0,
-                                    1 if require_approval else 0, speed, c["id"]))
+        conn.execute("UPDATE companies SET name=?, max_devices=?, is_active=?, require_approval=?, speed_limit=?, "
+                     "remote_mode=? WHERE id=?", (name.strip()[:100], max(1, min(max_devices, 253)),
+                                                  1 if is_active else 0, 1 if require_approval else 0, speed, remote,
+                                                  c["id"]))
         services.audit(conn, c["id"], "company_update",
-                       f"active={bool(is_active)} max={max_devices} approval={bool(require_approval)} speed={speed}")
+                       f"active={bool(is_active)} max={max_devices} approval={bool(require_approval)} speed={speed} "
+                       f"remote={remote}")
         conn.commit()
         services.reconcile(conn)
     return redirect(f"/admin/companies/{c['id']}", "Сохранено")

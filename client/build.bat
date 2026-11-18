@@ -6,6 +6,7 @@ REM Сборка Retix Hub (Windows 10/11 x64, Python 3.10+ 64-бит, Inno Setu
 REM   1. dist\RetixHub\RetixHub.exe        - программа (onedir, PyInstaller)
 REM   2. самопроверка собранного exe       - модули, Tcl/Tk, SSL, иконка
 REM   3. client\wireguard\*.msi            - официальный WireGuard (скачивается один раз)
+REM      client\rustdesk\rustdesk-*.exe     - официальный RustDesk для удалённого управления (тоже один раз)
 REM   4. dist\RetixHub_Setup_<версия>.exe  - установщик: раздаётся пользователям и
 REM                                          кладётся на сервер в /root/hub/data/downloads/
 REM Версия берётся из VERSION в retixhub_client.py.
@@ -44,6 +45,10 @@ del dist\RetixHub\retixhub_selftest.txt >nul 2>&1
 
 REM WireGuard для установщика
 powershell -NoProfile -ExecutionPolicy Bypass -File get_wireguard.ps1
+if errorlevel 1 goto :fail
+
+REM RustDesk для удалённого управления (официальный, без изменений)
+powershell -NoProfile -ExecutionPolicy Bypass -File get_rustdesk.ps1
 if errorlevel 1 goto :fail
 
 REM Inno Setup: из PATH или из стандартных папок
