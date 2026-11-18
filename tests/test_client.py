@@ -1651,6 +1651,7 @@ class FakeRustDesk:
     def __init__(self, installed=True):
         self.options, self.password, self.calls = {}, "", []
         self.installed, self.sessions = installed, False
+        self.service = "running" if installed else "missing"   # служба RustDesk: running / stopped / missing
 
 
 RD_NOW = {"rd": None}   # RustDesk того ПК, чей шаг идёт
@@ -1676,6 +1677,16 @@ def fake_rustdesk(monkeypatch, patch_windows):
     monkeypatch.setattr(rc.Worker, "REMOTE_ASYNC", False)   # в тестах — сразу, без своего потока
     monkeypatch.setattr(rc, "rustdesk_exe", lambda: FAKE_RUSTDESK if RD_NOW["rd"] and RD_NOW["rd"].installed else None)
     monkeypatch.setattr(rc, "rustdesk_session_active", lambda port=rc.REMOTE_PORT: RD_NOW["rd"].sessions)
+    monkeypatch.setattr(rc, "rustdesk_service_state", lambda: RD_NOW["rd"].service)
+    monkeypatch.setattr(rc, "rustdesk_ready", lambda: RD_NOW["rd"].service == "running")
+    monkeypatch.setattr(rc, "RUSTDESK_START_WAIT", 0)
+
+    def sc(args, timeout=60):
+        if args[:2] == ["sc", "start"] and RD_NOW["rd"].start_works:
+            RD_NOW["rd"].service = "running"
+        return run(args, timeout)
+    monkeypatch.setattr(FakeRustDesk, "start_works", True, raising=False)
+    monkeypatch.setattr(rc, "run", sc)
     yield patch_windows
     RD_NOW["rd"] = None
 
@@ -1756,7 +1767,9 @@ def test_remote_control_end_to_end(make_client, company, server, fake_rustdesk):
 def test_remote_ask_mode_and_install(make_client, company, server, fake_rustdesk, monkeypatch):
     rd = FakeRustDesk(installed=False)
     installs = []
-    monkeypatch.setattr(rc, "install_rustdesk", lambda: (installs.append(1), setattr(rd, "installed", True))[0] or True)
+    monkeypatch.setattr(rc, "install_rustdesk",
+                        lambda: (installs.append(1), setattr(rd, "installed", True), setattr(rd, "service", "running"))[0]
+                        or True)
     company.cab.post(BASE + "/cabinet/settings", data={"share_name": "share", "share_ports": "445",
                                                        "remote_mode": "ask"})
     c = make_client("PC1"); login(c, company, name="Касса"); step_as(c, rd, 2)
@@ -1823,3 +1836,32 @@ def test_remote_work_never_blocks_main_loop(make_client, company, monkeypatch):
     c.step()
     assert len(started) == 2
     release.set()
+
+
+def test_remote_half_installed_rustdesk_is_repaired(make_client, company, fake_rustdesk, monkeypatch):
+    """1.0.18: после оборванной установки (1.0.16) rustdesk.exe есть, а службы RustDesk нет. Такой RustDesk
+    не настраивается (--option пишет только себе, --password — os error 2): ставим его заново."""
+    rd = FakeRustDesk()
+    rd.service = "missing"
+    installs = []
+    monkeypatch.setattr(rc, "install_rustdesk", lambda: (installs.append(1), setattr(rd, "service", "running"))[0] or True)
+    company.cab.post(BASE + "/cabinet/settings", data={"share_name": "share", "share_ports": "445",
+                                                       "remote_mode": "auto"})
+    c = make_client("PC1"); login(c, company, name="N11"); step_as(c, rd, 2)
+    assert installs == [1] and c.w.remote_ok is True and rd.password
+    assert c.state.get("rustdesk_by_retix") is True
+
+
+def test_remote_stopped_service_started_or_not_configured(make_client, company, fake_rustdesk, patch_windows):
+    """Служба RustDesk остановлена — запускаем; не поднялась — ничего не настраиваем и не говорим «готов»."""
+    rd = FakeRustDesk()
+    rd.service = "stopped"
+    rd.start_works = False
+    company.cab.post(BASE + "/cabinet/settings", data={"share_name": "share", "share_ports": "445",
+                                                       "remote_mode": "auto"})
+    c = make_client("PC1"); login(c, company, name="N11"); step_as(c, rd, 2)
+    assert ["sc", "start", "RustDesk"] in patch_windows
+    assert c.w.remote_ok is False and rd.options == {} and rd.password == ""
+    rd.start_works = True
+    step_as(c, rd)
+    assert rd.service == "running" and c.w.remote_ok is True and rd.options["direct-server"] == "Y" and rd.password

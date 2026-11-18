@@ -37,7 +37,7 @@ import requests
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
 
-VERSION = "1.0.17"
+VERSION = "1.0.18"
 APP_NAME = "RetixHub"          # служебное имя: папки, задачи, мьютекс
 APP_TITLE = "Retix Hub"        # то, что видит пользователь
 TUNNEL = "retixhub"
@@ -1023,6 +1023,9 @@ FW_RULE_REMOTE_IN = "RetixHub RustDesk only VPN (in)"    # …и никто, к�
 # всё, кроме 10.66.0.0/16 и 127.0.0.0/8 (IPv4), и все обычные IPv6 — для правил «блокировать» firewall
 OUTSIDE_VPN = ("0.0.0.0-10.65.255.255,10.67.0.0-126.255.255.255,128.0.0.0-255.255.255.255,"
                "2000::/3,fc00::/7,fe80::/10")
+RUSTDESK_SERVICE = "RustDesk"             # служба Windows, которую создаёт установщик RustDesk
+RUSTDESK_PIPE = "RustDesk\\query"           # канал, через который rustdesk.exe --option/--password говорит со службой
+RUSTDESK_START_WAIT = 30                  # сек — ждём, пока служба RustDesk поднимется и откроет канал
 REMOTE_INSTALL_RETRY = 600   # сек — RustDesk не поставился: следующая попытка
 REMOTE_SESSION_CHECK = 30    # сек — пока идёт сеанс, проверять его чаще незачем (пароль сменится после)
 REMOTE_REAPPLY = 1800        # сек — настройки RustDesk повторяются (пользователь мог их поменять в окне RustDesk)
@@ -1062,6 +1065,41 @@ def rustdesk_exe() -> Path | None:
     return RUSTDESK_EXE if RUSTDESK_EXE.is_file() else None
 
 
+def rustdesk_service_state() -> str:
+    """Служба RustDesk: running, stopped или missing (её нет — RustDesk поставлен не до конца)."""
+    if not WINDOWS:
+        return "missing"
+    code, out = run(["sc", "query", RUSTDESK_SERVICE], timeout=15)
+    if code != 0 or "1060" in out:
+        return "missing"
+    return "running" if "RUNNING" in out else "stopped"
+
+
+def rustdesk_ready() -> bool:
+    """Служба RustDesk отвечает: открыт её канал. Без него rustdesk.exe --option молча пишет настройки только
+    себе (текущему пользователю), а служба их не получает; --password падает с «os error 2»."""
+    if not WINDOWS:
+        return False
+    try:
+        return any(name.lower() == RUSTDESK_PIPE.lower() for name in os.listdir("\\\\.\\pipe\\"))
+    except OSError:
+        return False
+
+
+def start_rustdesk() -> bool:
+    """Запустить службу RustDesk, если она остановлена, и дождаться её канала."""
+    if rustdesk_ready():
+        return True
+    if rustdesk_service_state() == "stopped":
+        log.info("RustDesk: запускаю службу")
+        run(["sc", "start", RUSTDESK_SERVICE], timeout=30)
+    for _ in range(RUSTDESK_START_WAIT):
+        if rustdesk_ready():
+            return True
+        time.sleep(1)
+    return rustdesk_ready()
+
+
 def rustdesk_installer() -> Path | None:
     """Официальный установщик RustDesk, вложенный в установщик Retix Hub (rustdesk-<версия>-x86_64.exe)."""
     found = sorted(app_dir().glob("rustdesk-*.exe"), key=lambda p: vkey(p.name.split("-")[1]) or (0,))
@@ -1077,10 +1115,10 @@ def install_rustdesk() -> bool:
     log.info("ставлю %s", setup.name)
     run_rd([str(setup), "--silent-install"], timeout=900)   # в своём потоке: сеть не ждёт
     for _ in range(30):
-        if rustdesk_exe():
+        if rustdesk_exe() and rustdesk_service_state() != "missing":
             return True
         time.sleep(1)
-    log.error("RustDesk не установился")
+    log.error("RustDesk не установился: нет %s", "службы RustDesk" if rustdesk_exe() else "rustdesk.exe")
     return False
 
 
@@ -1725,12 +1763,22 @@ class Worker(threading.Thread):
         port = remote.get("port") if isinstance(remote.get("port"), int) and 0 < remote["port"] < 65536 \
             else REMOTE_PORT
         exe = rustdesk_exe()
-        if not exe and now - self.remote_install_at > REMOTE_INSTALL_RETRY:
+        # «установлен» — это и файлы, и служба: после оборванной установки (1.0.16) файлы есть, службы нет
+        installed = bool(exe) and rustdesk_service_state() != "missing"
+        if not installed and now - self.remote_install_at > REMOTE_INSTALL_RETRY:
             self.remote_install_at = now
+            if exe:
+                log.warning("RustDesk: rustdesk.exe есть, а службы нет — ставлю заново")
             if install_rustdesk():
                 self.state.set(rustdesk_by_retix=True, remote_applied="")
+                installed = True
             exe = rustdesk_exe()
-        if not exe:
+        if not exe or not installed:
+            self.remote_ok = False
+            return
+        if not start_rustdesk():
+            log.warning("RustDesk: служба не отвечает — настройки не применить, повторю позже")
+            self.state.set(remote_applied="")
             self.remote_ok = False
             return
         want = f"{mode}|{cfg['subnet']}|{cfg['server_ip']}|{port}"
