@@ -55,6 +55,9 @@ CREATE TABLE IF NOT EXISTS devices (
     remote_ok       INTEGER NOT NULL DEFAULT 0, -- RustDesk на ПК установлен и настроен Retix Hub (клиент 1.0.16+)
     remote_pw       TEXT NOT NULL DEFAULT '',   -- пароль RustDesk этого ПК, зашифрован (services.seal)
     remote_used_at  INTEGER NOT NULL DEFAULT 0, -- когда пароль выдан другому ПК: после сеанса ПК сменит его сам
+    remote_control  INTEGER NOT NULL DEFAULT 0, -- может управлять другими ПК компании (решает администратор)
+    remote_access   TEXT NOT NULL DEFAULT 'company', -- управление ЭТИМ ПК: company (как в компании), off, ask
+    remote_local    TEXT NOT NULL DEFAULT '',   -- что выбрал пользователь ПК в программе: '', ask, own, off
     last_seen       TEXT,
     update_state    TEXT NOT NULL DEFAULT '',   -- что ПК сообщает об обновлении: downloading:1.0.6 …
     update_state_at TEXT,
@@ -140,6 +143,9 @@ MIGRATIONS = [
     ("devices", "remote_ok", "INTEGER NOT NULL DEFAULT 0"),
     ("devices", "remote_pw", "TEXT NOT NULL DEFAULT ''"),
     ("devices", "remote_used_at", "INTEGER NOT NULL DEFAULT 0"),
+    ("devices", "remote_control", "INTEGER NOT NULL DEFAULT 0"),
+    ("devices", "remote_access", "TEXT NOT NULL DEFAULT 'company'"),
+    ("devices", "remote_local", "TEXT NOT NULL DEFAULT ''"),
     ("companies", "speed_limit", "INTEGER NOT NULL DEFAULT 0"),
     ("companies", "remote_mode", "TEXT NOT NULL DEFAULT 'off'"),
 ]

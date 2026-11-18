@@ -1651,6 +1651,7 @@ class FakeRustDesk:
     def __init__(self, installed=True):
         self.options, self.password, self.calls = {}, "", []
         self.installed, self.sessions = installed, False
+        self.service = "running" if installed else "missing"   # служба RustDesk: running / stopped / missing
 
 
 RD_NOW = {"rd": None}   # RustDesk того ПК, чей шаг идёт
@@ -1676,8 +1677,31 @@ def fake_rustdesk(monkeypatch, patch_windows):
     monkeypatch.setattr(rc.Worker, "REMOTE_ASYNC", False)   # в тестах — сразу, без своего потока
     monkeypatch.setattr(rc, "rustdesk_exe", lambda: FAKE_RUSTDESK if RD_NOW["rd"] and RD_NOW["rd"].installed else None)
     monkeypatch.setattr(rc, "rustdesk_session_active", lambda port=rc.REMOTE_PORT: RD_NOW["rd"].sessions)
+    monkeypatch.setattr(rc, "rustdesk_service_state", lambda: RD_NOW["rd"].service)
+    monkeypatch.setattr(rc, "rustdesk_ready", lambda: RD_NOW["rd"].service == "running")
+    monkeypatch.setattr(rc, "RUSTDESK_START_WAIT", 0)
+
+    def sc(args, timeout=60):
+        if args[:2] == ["sc", "start"] and RD_NOW["rd"].start_works:
+            RD_NOW["rd"].service = "running"
+        return run(args, timeout)
+    monkeypatch.setattr(FakeRustDesk, "start_works", True, raising=False)
+    monkeypatch.setattr(rc, "run", sc)
     yield patch_windows
     RD_NOW["rd"] = None
+
+
+def allow_control(company, name):
+    """Кабинет: этому ПК можно управлять другими."""
+    r = company.cab.post(BASE + f"/cabinet/devices/{device_id(company, name)}/control_on")
+    assert "может управлять" in r.text
+
+
+def controller(make_client, company, name="Админ"):
+    """ПК, которому администратор разрешил управлять другими (без своего RustDesk — только для списка)."""
+    c = make_client("ADMIN-PC"); login(c, company, name=name)
+    allow_control(company, name)
+    return c
 
 
 def step_as(c, rd, n=1):
@@ -1707,16 +1731,24 @@ def test_remote_control_end_to_end(make_client, company, server, fake_rustdesk):
 
     company.cab.post(BASE + "/cabinet/settings", data={"share_name": "share", "share_ports": "445",
                                                        "remote_mode": "auto"})
+    step_as(b, rdb, 2)
+    assert rdb.options == {} and b.w.remote_ok is False         # управлять некому — RustDesk на B не открыт
+    RD_NOW["rd"] = rda
+    assert a.w.remote_connect(b.w.cfg["device_id"])[1].startswith("Администратор компании не разрешил")
+    allow_control(company, "Склад")
     step_as(b, rdb, 2); step_as(a, rda, 2)
-    assert rdb.options["direct-server"] == "Y" and rdb.options["whitelist"] == b.w.cfg["subnet"]
+    # RustDesk на B пускает только A — единственный ПК, которому разрешено управлять
+    assert rdb.options["direct-server"] == "Y" and rdb.options["whitelist"] == a.w.cfg["ip"]
     assert rdb.options["approve-mode"] == "password"
     # серверы RustDesk не участвуют: вместо них — сервер Retix Hub внутри VPN
     assert rdb.options["custom-rendezvous-server"] == rdb.options["relay-server"] == "10.66.0.1"
     assert len(rdb.password) >= 12 and b.state.get("remote_pw_pending") == ""
     rules = [" ".join(c) for c in calls if c[:1] == ["netsh"] and "add" in c]
     assert any("RetixHub RustDesk only VPN (out)" in r and "action=block" in r and "10.67.0.0" in r for r in rules)
-    assert any(f"name=RetixHub RustDesk " in r and f"remoteip={b.w.cfg['subnet']}" in r and "localport=21118" in r
+    assert any(f"name=RetixHub RustDesk " in r and f"remoteip={a.w.cfg['ip']}" in r and "localport=21118" in r
                for r in rules)
+    # A управляет, но им самим управлять некому: его RustDesk подключений не принимает
+    assert rda.options.get("direct-server") in (None, "N") and a.w.remote_ok is False
 
     _set_online(server, "Склад", "Касса")
     step_as(a, rda)
@@ -1756,9 +1788,12 @@ def test_remote_control_end_to_end(make_client, company, server, fake_rustdesk):
 def test_remote_ask_mode_and_install(make_client, company, server, fake_rustdesk, monkeypatch):
     rd = FakeRustDesk(installed=False)
     installs = []
-    monkeypatch.setattr(rc, "install_rustdesk", lambda: (installs.append(1), setattr(rd, "installed", True))[0] or True)
+    monkeypatch.setattr(rc, "install_rustdesk",
+                        lambda: (installs.append(1), setattr(rd, "installed", True), setattr(rd, "service", "running"))[0]
+                        or True)
     company.cab.post(BASE + "/cabinet/settings", data={"share_name": "share", "share_ports": "445",
                                                        "remote_mode": "ask"})
+    controller(make_client, company)
     c = make_client("PC1"); login(c, company, name="Касса"); step_as(c, rd, 2)
     assert installs == [1] and c.state.get("rustdesk_by_retix") is True     # поставлен этой программой
     assert rd.options["approve-mode"] == "click" and rd.password == ""       # с согласием — пароль не нужен
@@ -1773,6 +1808,7 @@ def test_remote_not_configured_not_ready(make_client, company, fake_rustdesk, mo
     monkeypatch.setattr(rc, "configure_rustdesk", lambda exe, opts: False)
     company.cab.post(BASE + "/cabinet/settings", data={"share_name": "share", "share_ports": "445",
                                                        "remote_mode": "auto"})
+    controller(make_client, company)
     c = make_client("PC1"); login(c, company, name="Касса"); step_as(c, rd, 2)
     assert c.w.remote_ok is False and c.state.get("remote_applied") == "" and rd.password == ""
 
@@ -1781,6 +1817,7 @@ def test_rustdesk_helpers(tmp_path, monkeypatch):
     opts = rc.rustdesk_options("auto", "10.66.3.0/24", "10.66.0.1")
     assert opts["whitelist"] == "10.66.3.0/24" and opts["direct-access-port"] == "21118"
     assert rc.rustdesk_options("ask", "10.66.3.0/24", "10.66.0.1")["approve-mode"] == "click"
+    assert opts["enable-tunnel"] == opts["enable-terminal"] == "N" and opts["access-mode"] == "custom"
     exe = Path("C:/RD/rustdesk.exe")
     assert rc.rustdesk_args(exe, "10.66.3.5", 21118, "files") == [str(exe), "--file-transfer", "10.66.3.5"]
     assert rc.rustdesk_args(exe, "10.66.3.5", 21200, "control")[2] == "10.66.3.5:21200"
@@ -1823,3 +1860,92 @@ def test_remote_work_never_blocks_main_loop(make_client, company, monkeypatch):
     c.step()
     assert len(started) == 2
     release.set()
+
+
+def test_remote_half_installed_rustdesk_is_repaired(make_client, company, fake_rustdesk, monkeypatch):
+    """1.0.18: после оборванной установки (1.0.16) rustdesk.exe есть, а службы RustDesk нет. Такой RustDesk
+    не настраивается (--option пишет только себе, --password — os error 2): ставим его заново."""
+    rd = FakeRustDesk()
+    rd.service = "missing"
+    installs = []
+    monkeypatch.setattr(rc, "install_rustdesk", lambda: (installs.append(1), setattr(rd, "service", "running"))[0] or True)
+    company.cab.post(BASE + "/cabinet/settings", data={"share_name": "share", "share_ports": "445",
+                                                       "remote_mode": "auto"})
+    controller(make_client, company)
+    c = make_client("PC1"); login(c, company, name="N11"); step_as(c, rd, 2)
+    assert installs == [1] and c.w.remote_ok is True and rd.password
+    assert c.state.get("rustdesk_by_retix") is True
+
+
+def test_remote_stopped_service_started_or_not_configured(make_client, company, fake_rustdesk, patch_windows):
+    """Служба RustDesk остановлена — запускаем; не поднялась — ничего не настраиваем и не говорим «готов»."""
+    rd = FakeRustDesk()
+    rd.service = "stopped"
+    rd.start_works = False
+    company.cab.post(BASE + "/cabinet/settings", data={"share_name": "share", "share_ports": "445",
+                                                       "remote_mode": "auto"})
+    controller(make_client, company)
+    c = make_client("PC1"); login(c, company, name="N11"); step_as(c, rd, 2)
+    assert ["sc", "start", "RustDesk"] in patch_windows
+    assert c.w.remote_ok is False and rd.options == {} and rd.password == ""
+    rd.start_works = True
+    step_as(c, rd)
+    assert rd.service == "running" and c.w.remote_ok is True and rd.options["direct-server"] == "Y" and rd.password
+
+
+def test_peers_sorted_by_name_offline_stays_in_place():
+    peers = [{"name": "Касса 10", "online": True}, {"name": "склад", "online": False},
+             {"name": "Касса 2", "online": False}, {"name": "Бухгалтерия", "online": True}]
+    assert [p["name"] for p in rc.sort_peers(peers)] == ["Бухгалтерия", "Касса 2", "Касса 10", "склад"]
+
+
+def test_remote_user_choice_own_password_and_off(make_client, company, server, fake_rustdesk):
+    """Пользователь ПК сам решает, как им управлять (только строже администратора): свой пароль сервер
+    не узнаёт и не выдаёт; «запретить» — RustDesk подключений не принимает."""
+    import sqlite3
+    company.cab.post(BASE + "/cabinet/settings", data={"share_name": "share", "share_ports": "445",
+                                                       "remote_mode": "auto"})
+    a, rda = controller(make_client, company, "Склад"), FakeRustDesk()
+    step_as(a, rda)
+    b, rdb = make_client("PC2"), FakeRustDesk()
+    login(b, company, name="Касса"); step_as(b, rdb, 2)
+    server_pw = rdb.password
+    assert server_pw and rdb.options["approve-mode"] == "password"
+
+    assert b.w.set_remote_access("own", "short") .startswith("Пароль")
+    assert b.w.set_remote_access("own", "") == "Придумайте пароль."
+    assert b.w.set_remote_access("own", "My-Secret#2026") is None
+    stored = b.state.get("remote_own_pw")      # через protect(): на Windows — DPAPI, не открытым текстом
+    assert stored.startswith("dpapi:" if rc.WINDOWS else "plain:") and rc.unprotect(stored) == "My-Secret#2026"
+    step_as(b, rdb, 2)
+    assert rdb.password == "My-Secret#2026" and rdb.options["approve-mode"] == "password"
+    conn = sqlite3.connect(Path(server.data) / "vpn.db", timeout=10)
+    row = conn.execute("SELECT remote_pw, remote_local FROM devices WHERE ip=?", (b.w.cfg["ip"],)).fetchone()
+    conn.close()
+    assert row == ("", "own")                       # сервер не знает ни свой пароль, ни прежний
+    _set_online(server, "Склад", "Касса")
+    RD_NOW["rd"] = rda
+    res, err = a.w.remote_connect(b.w.cfg["device_id"])
+    assert err is None and res["mode"] == "own" and res["password"] == ""
+
+    assert b.w.set_remote_access("off") is None
+    step_as(b, rdb)
+    assert rdb.options["direct-server"] == "N" and b.w.remote_ok is False
+    RD_NOW["rd"] = rda
+    assert "так решил его пользователь" in a.w.remote_connect(b.w.cfg["device_id"])[1]
+
+    assert b.w.set_remote_access("") is None       # снова как администратор — новый пароль от программы
+    step_as(b, rdb, 2)
+    assert rdb.options["direct-server"] == "Y" and rdb.password not in ("My-Secret#2026", server_pw)
+    RD_NOW["rd"] = rda
+    assert a.w.remote_connect(b.w.cfg["device_id"])[0]["password"] == rdb.password
+
+
+def test_combine_remote_mode():
+    c = rc.combine_remote_mode
+    assert c("auto", "", False) == "auto" and c("ask", "", False) == "ask" and c("off", "", True) == "off"
+    assert c("auto", "ask", False) == "ask" and c("auto", "off", True) == "off"
+    assert c("ask", "own", True) == "own" and c("auto", "own", False) == "ask"   # без пароля — только согласие
+    assert c("off", "own", True) == "off"                                        # администратор выключил
+    with pytest.raises(ValueError):
+        rc.rustdesk_options("auto", "", "10.66.0.1")                             # пустой whitelist пустил бы всех

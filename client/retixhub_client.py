@@ -37,7 +37,7 @@ import requests
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
 
-VERSION = "1.0.17"
+VERSION = "1.0.18"
 APP_NAME = "RetixHub"          # служебное имя: папки, задачи, мьютекс
 APP_TITLE = "Retix Hub"        # то, что видит пользователь
 TUNNEL = "retixhub"
@@ -187,7 +187,10 @@ class State:
               "update_state": "none", "update_pubkey": "", "update_pins": {}, "profiles": {},
               # удалённое управление: какие настройки RustDesk применены, пароль, ещё не принятый сервером
               # (зашифрован DPAPI), и поставила ли RustDesk эта программа (тогда удаляет его вместе с собой)
-              "remote_applied": "", "remote_pw_pending": "", "rustdesk_by_retix": False}
+              "remote_applied": "", "remote_pw_pending": "", "rustdesk_by_retix": False,
+              # доступ к ЭТОМУ ПК, который выбрал его пользователь ('' — как разрешил администратор, ask, own, off)
+              # и его собственный пароль для режима own (DPAPI; сервер его не знает)
+              "remote_local": "", "remote_own_pw": ""}
     PROFILE_FIELDS = ("server_url", "company_login", "company_name", "device_name", "token", "private_key",
                       "join_password", "direct_cache")
 
@@ -387,7 +390,8 @@ class Api:
         return self._req("GET", "/api/peers")
 
     def heartbeat(self, lan: list | None = None, wg_port: int = 0, direct: list | None = None,
-                  radmin_server: bool | None = None, remote_ok: bool | None = None):
+                  radmin_server: bool | None = None, remote_ok: bool | None = None,
+                  remote_local: str | None = None):
         # wan: этот клиент умеет прямой путь через интернет — сервер может свести его с ПК других офисов
         body = {"client_version": VERSION, "lan": list(lan or []), "wg_port": int(wg_port or 0),
                 "direct": list(direct or []), "wan": True}
@@ -395,6 +399,8 @@ class Api:
             body["radmin_server"] = bool(radmin_server)
         if remote_ok is not None:
             body["remote_ok"] = bool(remote_ok)
+        if remote_local is not None:
+            body["remote_local"] = remote_local
         return self._req("POST", "/api/heartbeat", json=body)
 
     def remote_password(self, password: str):
@@ -922,9 +928,9 @@ def radmin_menu_allowed(peer: dict | None, viewer: Path | None) -> bool:
 def remote_menu_allowed(peer: dict | None, cfg: dict | None) -> bool:
     """Пункты RustDesk в меню: удалённое управление включено в компании, RustDesk готов на том ПК
     (он сам сообщил серверу) и стоит на этом."""
-    mode = ((cfg or {}).get("remote") or {}).get("mode") if isinstance((cfg or {}).get("remote"), dict) else None
-    return bool(peer) and peer.get("remote") is True and not peer.get("is_me") and mode in REMOTE_MODES \
-        and rustdesk_exe() is not None
+    remote = (cfg or {}).get("remote") if isinstance((cfg or {}).get("remote"), dict) else {}
+    return bool(peer) and peer.get("remote") is True and not peer.get("is_me") and remote.get("mode") in REMOTE_MODES \
+        and remote.get("can_control", True) is not False and rustdesk_exe() is not None
 
 
 def lan_ports(cfg: dict) -> str:
@@ -1023,11 +1029,26 @@ FW_RULE_REMOTE_IN = "RetixHub RustDesk only VPN (in)"    # …и никто, к�
 # всё, кроме 10.66.0.0/16 и 127.0.0.0/8 (IPv4), и все обычные IPv6 — для правил «блокировать» firewall
 OUTSIDE_VPN = ("0.0.0.0-10.65.255.255,10.67.0.0-126.255.255.255,128.0.0.0-255.255.255.255,"
                "2000::/3,fc00::/7,fe80::/10")
+RUSTDESK_SERVICE = "RustDesk"             # служба Windows, которую создаёт установщик RustDesk
+RUSTDESK_PIPE = "RustDesk\\query"           # канал, через который rustdesk.exe --option/--password говорит со службой
+RUSTDESK_START_WAIT = 30                  # сек — ждём, пока служба RustDesk поднимется и откроет канал
 REMOTE_INSTALL_RETRY = 600   # сек — RustDesk не поставился: следующая попытка
 REMOTE_SESSION_CHECK = 30    # сек — пока идёт сеанс, проверять его чаще незачем (пароль сменится после)
 REMOTE_REAPPLY = 1800        # сек — настройки RustDesk повторяются (пользователь мог их поменять в окне RustDesk)
 REMOTE_MODES = ("ask", "auto")
 REMOTE_PW_RE = re.compile(r"^[A-Za-z0-9]{12,64}$")
+OWN_PW_RE = re.compile(r"^[\x21-\x7e]{8,64}$")   # свой пароль пользователя: 8–64 латинских символа без пробелов
+REMOTE_LOCAL_CHOICES = {"": "Как разрешил администратор компании", "ask": "Только с моего согласия (нажать «Принять»)",
+                        "own": "По моему паролю (его знаю только я)", "off": "Запретить управление этим компьютером"}
+
+
+def combine_remote_mode(admin: str, local: str, own_password: bool) -> str:
+    """Как можно управлять этим ПК: что разрешил администратор и что выбрал пользователь — только строже."""
+    if admin not in REMOTE_MODES or local == "off":
+        return "off"
+    if local == "ask" or (local == "own" and not own_password):
+        return "ask"
+    return "own" if local == "own" else admin
 
 
 def run_rd(args: list, timeout: int = 30) -> tuple[int, str]:
@@ -1062,6 +1083,41 @@ def rustdesk_exe() -> Path | None:
     return RUSTDESK_EXE if RUSTDESK_EXE.is_file() else None
 
 
+def rustdesk_service_state() -> str:
+    """Служба RustDesk: running, stopped или missing (её нет — RustDesk поставлен не до конца)."""
+    if not WINDOWS:
+        return "missing"
+    code, out = run(["sc", "query", RUSTDESK_SERVICE], timeout=15)
+    if code != 0 or "1060" in out:
+        return "missing"
+    return "running" if "RUNNING" in out else "stopped"
+
+
+def rustdesk_ready() -> bool:
+    """Служба RustDesk отвечает: открыт её канал. Без него rustdesk.exe --option молча пишет настройки только
+    себе (текущему пользователю), а служба их не получает; --password падает с «os error 2»."""
+    if not WINDOWS:
+        return False
+    try:
+        return any(name.lower() == RUSTDESK_PIPE.lower() for name in os.listdir("\\\\.\\pipe\\"))
+    except OSError:
+        return False
+
+
+def start_rustdesk() -> bool:
+    """Запустить службу RustDesk, если она остановлена, и дождаться её канала."""
+    if rustdesk_ready():
+        return True
+    if rustdesk_service_state() == "stopped":
+        log.info("RustDesk: запускаю службу")
+        run(["sc", "start", RUSTDESK_SERVICE], timeout=30)
+    for _ in range(RUSTDESK_START_WAIT):
+        if rustdesk_ready():
+            return True
+        time.sleep(1)
+    return rustdesk_ready()
+
+
 def rustdesk_installer() -> Path | None:
     """Официальный установщик RustDesk, вложенный в установщик Retix Hub (rustdesk-<версия>-x86_64.exe)."""
     found = sorted(app_dir().glob("rustdesk-*.exe"), key=lambda p: vkey(p.name.split("-")[1]) or (0,))
@@ -1077,20 +1133,23 @@ def install_rustdesk() -> bool:
     log.info("ставлю %s", setup.name)
     run_rd([str(setup), "--silent-install"], timeout=900)   # в своём потоке: сеть не ждёт
     for _ in range(30):
-        if rustdesk_exe():
+        if rustdesk_exe() and rustdesk_service_state() != "missing":
             return True
         time.sleep(1)
-    log.error("RustDesk не установился")
+    log.error("RustDesk не установился: нет %s", "службы RustDesk" if rustdesk_exe() else "rustdesk.exe")
     return False
 
 
-def rustdesk_options(mode: str, subnet: str, server_ip: str, port: int = REMOTE_PORT) -> dict[str, str]:
-    """Настройки RustDesk (rustdesk.exe --option ключ значение) для сети компании."""
+def rustdesk_options(mode: str, whitelist: str, server_ip: str, port: int = REMOTE_PORT) -> dict[str, str]:
+    """Настройки RustDesk (rustdesk.exe --option ключ значение) для сети компании. whitelist — адреса через
+    запятую: только ПК, которым администратор разрешил управлять (у старого сервера — подсеть компании)."""
+    if not whitelist:
+        raise ValueError("пустой whitelist у RustDesk пускает всех")
     return {
         "direct-server": "Y",                      # прямой доступ по IP
         "direct-access-port": str(port),
-        "whitelist": subnet,                       # подключаться можно только из подсети компании
-        "approve-mode": "password" if mode == "auto" else "click",
+        "whitelist": whitelist,
+        "approve-mode": "password" if mode in ("auto", "own") else "click",
         "verification-method": "use-permanent-password",   # без одноразовых цифровых паролей в окне RustDesk
         # серверы RustDesk не нужны: вместо rs-ny.rustdesk.com — сервер Retix Hub внутри VPN (порт закрыт)
         "custom-rendezvous-server": server_ip,
@@ -1098,6 +1157,11 @@ def rustdesk_options(mode: str, subnet: str, server_ip: str, port: int = REMOTE_
         "api-server": f"http://{server_ip}",
         "enable-lan-discovery": "N",
         "allow-auto-update": "N",                  # версию RustDesk обновляет установщик Retix Hub
+        # тот, кто подключился, получает экран, мышь, клавиатуру, буфер и файлы — и не больше:
+        "access-mode": "custom",                   # не «полный доступ» (он включил бы всё ниже)
+        "enable-tunnel": "N",                      # без проброса портов через этот ПК в его локальную сеть
+        "enable-terminal": "N",                    # без командной строки (в RustDesk она бывает от SYSTEM)
+        "allow-remote-config-modification": "N",   # настройки RustDesk этого ПК удалённо не меняются
     }
 
 
@@ -1140,7 +1204,7 @@ def rustdesk_session_active(port: int = REMOTE_PORT) -> bool:
 
 
 def ensure_remote_firewall(subnet: str | None, port: int = REMOTE_PORT, exe: Path | None = None) -> None:
-    """Входящие к RustDesk — из подсети компании. RustDesk вне сети Retix Hub — ни туда, ни оттуда
+    """Входящие к RustDesk — только с адресов subnet (ПК, которым разрешено управлять; через запятую). RustDesk вне сети Retix Hub — ни туда, ни оттуда
     («блокировать» в firewall Windows сильнее любого «разрешить», в том числе правил самого RustDesk)."""
     run(["netsh", "advfirewall", "firewall", "delete", "rule", f"name={FW_RULE_REMOTE}"])
     if subnet:
@@ -1695,8 +1759,9 @@ class Worker(threading.Thread):
         """Удалённое управление (RustDesk). Установка и команды rustdesk.exe идут в отдельном потоке: основной
         цикл (туннель, прямые пути, список ПК) никогда их не ждёт, что бы ни случилось с RustDesk."""
         remote = self.cfg.get("remote") if isinstance(self.cfg.get("remote"), dict) else {}
-        if remote.get("mode") not in REMOTE_MODES and not self.state.get("remote_applied"):
-            self.remote_ok = False   # выключено и ничего не настроено — делать нечего
+        if remote.get("mode") not in REMOTE_MODES and remote.get("can_control") is not True \
+                and not self.state.get("remote_applied"):
+            self.remote_ok = False   # выключено, управлять другими нельзя, ничего не настроено — делать нечего
             return
         if not self.REMOTE_ASYNC:
             self._remote_work(now, self.cfg)
@@ -1715,8 +1780,18 @@ class Worker(threading.Thread):
 
     def _remote_work(self, now: float, cfg: dict):
         remote = cfg.get("remote") if isinstance(cfg.get("remote"), dict) else {}
-        mode = remote.get("mode") if remote.get("mode") in REMOTE_MODES else "off"
-        if mode == "off":
+        admin = remote.get("mode") if remote.get("mode") in REMOTE_MODES else "off"
+        own_pw = unprotect(self.state.get("remote_own_pw") or "")
+        mode = combine_remote_mode(admin, self.state.get("remote_local") or "", bool(own_pw))
+        can_ctrl = remote.get("can_control", admin != "off") is True   # старый сервер поля не шлёт
+        if isinstance(remote.get("allowed"), list):
+            # пускаем только ПК, которым администратор разрешил управлять (и только адреса своей подсети)
+            allowed = [ip for ip in remote["allowed"] if peer_ip_ok(ip, cfg["subnet"])][:254]
+        else:
+            allowed = [cfg["subnet"]] if admin != "off" else []   # сервер до 1.0.18: вся подсеть компании
+        if not allowed:
+            mode = "off"   # управлять некому — RustDesk никого не пускает (пустой whitelist пустил бы всех)
+        if mode == "off" and not can_ctrl:
             if self.state.get("remote_applied"):
                 disable_remote()
                 self.state.set(remote_applied="", remote_pw_pending="")
@@ -1725,30 +1800,72 @@ class Worker(threading.Thread):
         port = remote.get("port") if isinstance(remote.get("port"), int) and 0 < remote["port"] < 65536 \
             else REMOTE_PORT
         exe = rustdesk_exe()
-        if not exe and now - self.remote_install_at > REMOTE_INSTALL_RETRY:
+        # «установлен» — это и файлы, и служба: после оборванной установки (1.0.16) файлы есть, службы нет
+        installed = bool(exe) and rustdesk_service_state() != "missing"
+        if not installed and now - self.remote_install_at > REMOTE_INSTALL_RETRY:
             self.remote_install_at = now
+            if exe:
+                log.warning("RustDesk: rustdesk.exe есть, а службы нет — ставлю заново")
             if install_rustdesk():
                 self.state.set(rustdesk_by_retix=True, remote_applied="")
+                installed = True
             exe = rustdesk_exe()
-        if not exe:
+        if not exe or not installed:
             self.remote_ok = False
             return
-        want = f"{mode}|{cfg['subnet']}|{cfg['server_ip']}|{port}"
+        if not start_rustdesk():
+            log.warning("RustDesk: служба не отвечает — настройки не применить, повторю позже")
+            self.state.set(remote_applied="")
+            self.remote_ok = False
+            return
+        if mode == "off":
+            # этот ПК только управляет другими: его RustDesk подключений не принимает
+            if self.state.get("remote_applied") != "off":
+                disable_remote()
+                ensure_remote_firewall(None, port, exe)
+                self.state.set(remote_applied="off", remote_pw_pending="")
+                log.info("удалённое управление: этим ПК управлять нельзя, он может управлять другими")
+            self.remote_ok = False
+            return
+        whitelist = ",".join(allowed)
+        own_tag = hashlib.sha256(own_pw.encode()).hexdigest()[:12] if mode == "own" else ""
+        want = f"{mode}|{whitelist}|{cfg['server_ip']}|{port}|{own_tag}"
         if want != self.state.get("remote_applied") or now - self.remote_applied_at > REMOTE_REAPPLY:
-            ensure_remote_firewall(cfg["subnet"], port, exe)
-            ok = configure_rustdesk(exe, rustdesk_options(mode, cfg["subnet"], cfg["server_ip"], port))
+            ensure_remote_firewall(whitelist, port, exe)
+            ok = configure_rustdesk(exe, rustdesk_options(mode, whitelist, cfg["server_ip"], port))
             self.remote_applied_at = now
+            if ok and mode == "own" and want != self.state.get("remote_applied"):
+                ok = set_rustdesk_password(exe, own_pw)   # пароль пользователя — только в RustDesk, не на сервер
             if not ok:
                 self.state.set(remote_applied="")
                 self.remote_ok = False
                 return
             if want != self.state.get("remote_applied"):
-                log.info("удалённое управление: %s, RustDesk настроен", mode)
-                self.remote_pw_force = True   # новые настройки (или RustDesk поставлен заново) — свой пароль
+                log.info("удалённое управление: %s, пускаем %s, RustDesk настроен", mode, whitelist)
+                # новые настройки (RustDesk поставлен заново, был свой пароль) — пароль для сервера тоже новый
+                self.remote_pw_force = mode == "auto"
                 self.state.set(remote_applied=want)
         self.remote_ok = True
         if mode == "auto":
             self._remote_password(exe, bool(remote.get("rotate")), port, now)
+
+    def set_remote_access(self, local: str, password: str = "") -> str | None:
+        """Пользователь выбрал, как можно управлять его ПК (из окна). None — сохранено, иначе текст ошибки."""
+        if local not in REMOTE_LOCAL_CHOICES:
+            return "Неизвестный режим"
+        if local == "own":
+            if password:
+                if not OWN_PW_RE.match(password):
+                    return "Пароль: от 8 до 64 латинских букв, цифр и знаков, без пробелов."
+                self.state.set(remote_own_pw=protect(password))
+            elif not self.state.get("remote_own_pw"):
+                return "Придумайте пароль."
+        self.state.set(remote_local=local)
+        self.remote_applied_at = 0   # RustDesk перенастроится в следующем шаге (или будет выключен)
+        log.info("доступ к этому компьютеру: %s", REMOTE_LOCAL_CHOICES[local])
+        self.reported = None    # сразу сообщить серверу
+        self.wake.set()
+        return None
 
     def _remote_password(self, exe: Path, rotate: bool, port: int, now: float):
         """Свой пароль RustDesk: ставится в RustDesk и сообщается серверу. Сервер просит сменить (rotate) —
@@ -2164,10 +2281,12 @@ class Worker(threading.Thread):
                 log.exception("проверка Radmin Server")
             self.radmin_checked = now
         port = self.direct.listen_port if self.lan else 0
-        report = (tuple(self.lan), port, tuple(self.direct.active_ids()), self.radmin_server, self.remote_ok)
+        local = self.state.get("remote_local") or ""
+        report = (tuple(self.lan), port, tuple(self.direct.active_ids()), self.radmin_server, self.remote_ok, local)
         if now - self.last_heartbeat > HEARTBEAT_EVERY or report != self.reported:
             try:
-                self.api.heartbeat(self.lan, port, self.direct.active_ids(), self.radmin_server, self.remote_ok)
+                self.api.heartbeat(self.lan, port, self.direct.active_ids(), self.radmin_server, self.remote_ok,
+                                   local)
                 self.last_heartbeat, self.reported = now, report
             except (ApiError, ServerUnreachable):
                 pass
@@ -2305,6 +2424,12 @@ STATUS_VIEW = {
     Status.ERROR: ("Ошибка", C["red"]),
     Status.OFF: ("Отключено", C["off"]),
 }
+
+
+def sort_peers(peers) -> list[dict]:
+    """Список компьютеров — по имени (Касса 2 раньше Касса 10). ПК, который выключился, остаётся на своём
+    месте: список не прыгает, и нужный компьютер легко найти."""
+    return sorted(peers, key=lambda p: natural_key(p["name"]))
 
 
 def natural_key(text: str):
@@ -2461,6 +2586,8 @@ def setup_style(root: tk.Tk) -> None:
     st.configure("Err.TLabel", foreground=C["red"])
     st.configure("TCheckbutton", background=C["bg"], foreground=C["text"])
     st.map("TCheckbutton", background=[("active", C["bg"])])
+    st.configure("TRadiobutton", background=C["bg"], foreground=C["text"], indicatorbackground=C["entry"])
+    st.map("TRadiobutton", background=[("active", C["bg"])], indicatorbackground=[("selected", C["on"])])
     st.configure("TEntry", fieldbackground=C["entry"], foreground=C["text"], insertcolor=C["text"],
                  bordercolor=C["line"], lightcolor=C["line"], darkcolor=C["line"])
     st.map("TEntry", bordercolor=[("focus", C["on"])], lightcolor=[("focus", C["on"])])   # рамка в фокусе — зелёная
@@ -2606,6 +2733,84 @@ class RenameDialog(tk.Toplevel):
             self.btn.config(state="normal", text="Сохранить")
         else:
             self.close()
+
+
+class AccessDialog(tk.Toplevel):
+    """Доступ к этому компьютеру: как другие ПК компании могут им управлять (RustDesk). Только строже того,
+    что разрешил администратор компании; свой пароль хранится только здесь и в RustDesk."""
+
+    def __init__(self, app: "App"):
+        super().__init__(app)
+        self.app = app
+        self.title("Доступ к этому компьютеру")
+        self.configure(bg=C["bg"])
+        self.resizable(False, False)
+        self.transient(app)
+        try:
+            self.iconbitmap(str(resource_dir() / "app_icon.ico"))
+        except Exception:  # noqa: BLE001
+            pass
+        frm = ttk.Frame(self, padding=16)
+        frm.pack(fill="both")
+        remote = (app.cfg or {}).get("remote") if isinstance((app.cfg or {}).get("remote"), dict) else {}
+        admin = remote.get("mode") if remote.get("mode") in REMOTE_MODES else "off"
+        admin_text = {"off": "Администратор компании не разрешил управлять этим компьютером — к нему никто "
+                             "не подключится, что бы вы ни выбрали.",
+                      "ask": "Администратор компании разрешил управление этим компьютером только с вашего согласия.",
+                      "auto": "Администратор компании разрешил подключаться к этому компьютеру без вашего согласия "
+                              "(по одноразовому паролю от сервера Retix Hub)."}[admin]
+        ttk.Label(frm, text="Кто и как может управлять этим компьютером").grid(row=0, column=0, sticky="w")
+        ttk.Label(frm, text=admin_text, style="Muted.TLabel", wraplength=330, justify="left")\
+            .grid(row=1, column=0, sticky="w", pady=(2, 8))
+        self.var = tk.StringVar(value=app.state_.get("remote_local") or "")
+        for i, (key, title) in enumerate(REMOTE_LOCAL_CHOICES.items()):
+            ttk.Radiobutton(frm, text=title, value=key, variable=self.var, command=self._toggle)\
+                .grid(row=2 + i, column=0, sticky="w", pady=1)
+        row = 2 + len(REMOTE_LOCAL_CHOICES)
+        has_pw = bool(app.state_.get("remote_own_pw"))
+        ttk.Label(frm, text="Новый пароль" + (" (пусто — оставить прежний)" if has_pw else ""),
+                  style="Muted.TLabel").grid(row=row, column=0, sticky="w", pady=(8, 0))
+        self.pw1, self.pw2 = tk.StringVar(), tk.StringVar()
+        self.e1 = ttk.Entry(frm, textvariable=self.pw1, show="•", width=36)
+        self.e1.grid(row=row + 1, column=0, sticky="ew")
+        ttk.Label(frm, text="Повторите пароль", style="Muted.TLabel").grid(row=row + 2, column=0, sticky="w")
+        self.e2 = ttk.Entry(frm, textvariable=self.pw2, show="•", width=36)
+        self.e2.grid(row=row + 3, column=0, sticky="ew")
+        ttk.Label(frm, text="Свой пароль знаете только вы: сервер Retix Hub его не хранит. Сообщите его тому, "
+                            "кто будет подключаться.", style="Muted.TLabel", wraplength=330, justify="left")\
+            .grid(row=row + 4, column=0, sticky="w", pady=(2, 0))
+        self.err = ttk.Label(frm, text="", style="Err.TLabel", wraplength=330)
+        self.err.grid(row=row + 5, column=0, sticky="w", pady=(4, 0))
+        self.btn = ttk.Button(frm, text="Сохранить", command=self.submit)
+        self.btn.grid(row=row + 6, column=0, pady=(8, 0), sticky="ew")
+        self._toggle()
+        self.bind("<Escape>", lambda _e: self.close())
+        self.protocol("WM_DELETE_WINDOW", self.close)
+        self.update_idletasks()
+        ax, ay, aw, _ = app.frame_box()
+        self.geometry(f"+{max(0, ax + (aw - self.winfo_reqwidth()) // 2)}+{max(0, ay + 40)}")
+        dark_titlebar(self)
+        self.grab_set()
+
+    def _toggle(self):
+        state = "normal" if self.var.get() == "own" else "disabled"
+        self.e1.config(state=state)
+        self.e2.config(state=state)
+
+    def close(self):
+        self.app.access_dialog = None
+        self.destroy()
+
+    def submit(self):
+        local, pw1, pw2 = self.var.get(), self.pw1.get(), self.pw2.get()
+        if local == "own" and pw1 != pw2:
+            self.err.config(text="Пароли не совпадают")
+            return
+        err = self.app.worker.set_remote_access(local, pw1 if local == "own" else "")
+        if err:
+            self.err.config(text=err)
+            return
+        self.close()
 
 
 class MessageWindow(tk.Toplevel):
@@ -2794,6 +2999,7 @@ class App(tk.Tk):
         self.peers: list[dict] = []
         self.login_dialog: LoginDialog | None = None
         self.rename_dialog: RenameDialog | None = None
+        self.access_dialog: AccessDialog | None = None
         self.last_status = None
         self.status_now = None
         self.collapsed = False
@@ -2840,6 +3046,7 @@ class App(tk.Tk):
         m.add_command(label="Переподключить", command=self.worker.force_reconnect)
         m.add_separator()
         m.add_command(label="Имя компьютера…", command=self.rename)
+        m.add_command(label="Доступ к этому компьютеру…", command=self.access)
         m.add_command(label="Добавить компанию…", command=lambda: self.show_login(add=True))
         m.add_command(label="Выйти из сети компании", command=self.logout)
         m.add_separator()
@@ -3096,8 +3303,7 @@ class App(tk.Tk):
         self.peers = peers
         sel = self.tree.selection()
         self.tree.delete(*self.tree.get_children())
-        others = [p for p in peers if not p.get("is_me")]
-        others.sort(key=lambda p: (not p["online"], natural_key(p["name"])))
+        others = sort_peers(p for p in peers if not p.get("is_me"))
         for p in others:
             online = p["online"] and self.status_now not in (Status.SERVER_DOWN, Status.BLOCKED, Status.OFF)
             self.tree.insert("", "end", iid=str(p["id"]), text=" " + p["name"],
@@ -3459,6 +3665,9 @@ class App(tk.Tk):
             if res.get("mode") == "ask":
                 self.ui_q.put(("info", f"Запрос отправлен на {p['name']}.\n"
                                        "Подключение начнётся, когда пользователь того ПК нажмёт «Принять»."))
+            elif res.get("mode") == "own":
+                self.ui_q.put(("info", f"Пользователь {p['name']} защитил компьютер своим паролем.\n"
+                                       "Введите в окне RustDesk пароль, который он вам сообщил."))
         threading.Thread(target=work, daemon=True, name="remote").start()
 
     def remote_desktop(self):
@@ -3531,6 +3740,13 @@ class App(tk.Tk):
             else:
                 self.ui_q.put(("error", out.strip() or "Ошибка net use"))
         threading.Thread(target=work, daemon=True, name="net-use").start()
+
+    def access(self):
+        if self.access_dialog and self.access_dialog.winfo_exists():
+            self.access_dialog.lift()
+            return
+        self.show()
+        self.access_dialog = AccessDialog(self)
 
     def rename(self):
         if self.rename_dialog and self.rename_dialog.winfo_exists():

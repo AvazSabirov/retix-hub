@@ -55,7 +55,8 @@ def index(request: Request, ctx=Depends(current_company), msg: str = "", err: in
     return templates.TemplateResponse(request, "cabinet.html", {
         "title": company["name"] or company["login"], "company": company,
         "subnet": services.subnet(company), "devices": devices,
-        "remote_modes": services.REMOTE_MODES, "remote_mode": services.remote_mode(company), "remote_log": remote_log,
+        "remote_modes": services.REMOTE_MODES, "remote_access": services.REMOTE_ACCESS,
+        "remote_mode": services.remote_mode(company), "remote_log": remote_log,
         "online": sum(d["online"] for d in devices),
         "action_prefix": "/cabinet/devices/", "logout_url": "/cabinet/logout",
         "msg": msg, "err": err})

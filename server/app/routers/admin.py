@@ -102,7 +102,8 @@ def company_page(request: Request, company_id: int, conn=Depends(require_admin),
     log = conn.execute("SELECT * FROM audit_log WHERE company_id=? ORDER BY id DESC LIMIT 30", (c["id"],)).fetchall()
     return templates.TemplateResponse(request, "admin_company.html", {
         "title": c["login"], "company": c, "subnet": services.subnet(c), "devices": devices,
-        "remote_modes": services.REMOTE_MODES, "remote_mode": services.remote_mode(c),
+        "remote_modes": services.REMOTE_MODES, "remote_access": services.REMOTE_ACCESS,
+        "remote_mode": services.remote_mode(c),
         "online": sum(d["online"] for d in devices), "log": log,
         "action_prefix": f"/admin/companies/{c['id']}/devices/", "logout_url": "/admin/logout", "admin_nav": "companies",
         "msg": msg, "err": err})

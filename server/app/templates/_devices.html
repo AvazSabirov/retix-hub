@@ -1,6 +1,6 @@
-{% macro devices_table(devices, prefix) %}
+{% macro devices_table(devices, prefix, remote_on=False, remote_access={}) %}
 <table class="cards">
-  <thead><tr><th>Статус</th><th>Имя</th><th>Компьютер</th><th>IP</th><th>Последняя связь</th><th>Клиент</th><th title="Скорость через сервер для этого ПК, Мбит/с: и приём, и отправка. Пусто или 0 — без ограничения. Прямой путь мимо сервера не ограничивается">Скорость</th><th title="Видит ли этот ПК в программе другие компьютеры и может ли им писать. Сеть (папки, Radmin, ping) от этого не меняется">Видит ПК</th><th>Действия</th></tr></thead>
+  <thead><tr><th>Статус</th><th>Имя</th><th>Компьютер</th><th>IP</th><th>Последняя связь</th><th>Клиент</th><th title="Скорость через сервер для этого ПК, Мбит/с: и приём, и отправка. Пусто или 0 — без ограничения. Прямой путь мимо сервера не ограничивается">Скорость</th><th title="Видит ли этот ПК в программе другие компьютеры и может ли им писать. Сеть (папки, Radmin, ping) от этого не меняется">Видит ПК</th>{% if remote_on %}<th title="Удалённое управление (RustDesk). «Управляет» — может ли этот ПК подключаться к другим (по умолчанию нет). «Им» — можно ли управлять этим ПК: только строже режима компании; пользователь ПК в программе может сделать ещё строже">Управление</th>{% endif %}<th>Действия</th></tr></thead>
   <tbody>
   {% for d in devices %}
   <tr>
@@ -28,6 +28,19 @@
         <button class="small" title="{{ 'Скрыть другие компьютеры в программе этого ПК (сеть останется)' if d.show_peers else 'Показать этому ПК другие компьютеры в программе' }}">{{ 'да' if d.show_peers else 'нет' }}</button>
       </form>
     </td>
+    {% if remote_on %}
+    <td data-label="Управление">
+      <form method="post" action="{{ prefix }}{{ d.id }}/{{ 'control_off' if d.remote_control else 'control_on' }}">
+        <button class="small {{ 'primary' if d.remote_control }}" title="{{ 'Запретить этому ПК управлять другими' if d.remote_control else 'Разрешить этому ПК управлять другими компьютерами компании' }}">управляет: {{ 'да' if d.remote_control else 'нет' }}</button>
+      </form>
+      <form class="rename" method="post" action="{{ prefix }}{{ d.id }}/remote_access">
+        <select name="value" title="Можно ли управлять этим ПК">
+          {% for key, title in remote_access.items() %}<option value="{{ key }}" {{ 'selected' if key == d.remote_access }}>им: {{ title }}</option>{% endfor %}
+        </select><button class="small" title="Сохранить">✓</button>
+      </form>
+      <small class="muted" title="Как на самом деле можно управлять этим ПК: режим компании, настройка выше и выбор пользователя ПК">сейчас: {{ {'off': 'нельзя', 'ask': 'с согласием', 'auto': 'без согласия', 'own': 'по паролю пользователя'}[d.remote_effective] }}{% if d.remote_local %} (выбор пользователя){% endif %}</small>
+    </td>
+    {% endif %}
     <td class="actions">
       {% if d.status == 'pending' %}
         <form method="post" action="{{ prefix }}{{ d.id }}/approve"><button class="small primary">Одобрить</button></form>
@@ -41,7 +54,7 @@
     </td>
   </tr>
   {% else %}
-  <tr class="empty-row"><td colspan="9" class="muted empty">Устройств пока нет. Установите клиент на компьютер и войдите логином компании.</td></tr>
+  <tr class="empty-row"><td colspan="{{ 10 if remote_on else 9 }}" class="muted empty">Устройств пока нет. Установите клиент на компьютер и войдите логином компании.</td></tr>
   {% endfor %}
   </tbody>
 </table>
