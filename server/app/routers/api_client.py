@@ -6,8 +6,8 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel, Field
 
 from .. import db, services, updates, wg
-from ..auth import check_pw, client_ip, limiter, new_token, sha256
-from ..config import TOKEN_ROTATE_SECONDS
+from ..auth import RateLimiter, check_pw, client_ip, limiter, new_token, sha256
+from ..config import REMOTE_PORT, TOKEN_ROTATE_SECONDS
 
 # Новый токен сервер отдаёт в этом заголовке. Клиент переходит на него сразу; старый действует,
 # пока клиент не пришёл с новым. После этого старый токен — только у копии: она отключает ПК.
@@ -50,6 +50,21 @@ class HeartbeatIn(BaseModel):
     wan: bool = False
     # клиент 1.0.12+: стоит ли на ПК Radmin Server. Нет поля (старый клиент) — прежнее значение
     radmin_server: bool | None = None
+    # клиент 1.0.16+: RustDesk на ПК установлен и настроен (удалённое управление). Нет поля — прежнее значение
+    remote_ok: bool | None = None
+
+
+class RemotePasswordIn(BaseModel):
+    password: str = Field(min_length=12, max_length=64)
+
+
+class RemoteConnectIn(BaseModel):
+    to: int
+    kind: str = Field(default="control", pattern="^(control|files)$")
+
+
+# не больше стольких запросов на подключение с одного ПК в минуту
+remote_limiter = RateLimiter(limit=20, window=60)
 
 
 def _token_reused(conn, device_id: int, now: int) -> None:
@@ -178,6 +193,7 @@ def peers(ctx=Depends(current_device)):
     if services.device_status(dev) != "active":
         raise HTTPException(403, "Устройство не активно")
     hidden = not dev["show_peers"]   # нет доступа — в программе только сам ПК (сеть при этом та же)
+    remote_on = services.remote_mode(company) != "off"
     result = []
     for d in services.list_devices(conn, company["id"]):
         if d["status"] != "active" or (hidden and d["id"] != dev["id"]):
@@ -192,6 +208,7 @@ def peers(ctx=Depends(current_device)):
             "client_version": d["client_version"],
             "is_share_host": bool(d["is_share_host"]),
             "radmin_server": bool(d["radmin_server"]),
+            "remote": remote_on and bool(d["remote_ok"]),   # к нему можно подключиться через RustDesk
             "is_me": d["id"] == dev["id"],
         })
     return {"company": company["name"] or company["login"], "peers": result, "peers_hidden": hidden}
@@ -283,5 +300,58 @@ def heartbeat(data: HeartbeatIn, ctx=Depends(current_device)):
                       json.dumps(sorted(set(data.direct))), 1 if data.wan else 0, dev["id"]))
     if data.radmin_server is not None:
         conn.execute("UPDATE devices SET radmin_server=? WHERE id=?", (1 if data.radmin_server else 0, dev["id"]))
+    if data.remote_ok is not None:
+        conn.execute("UPDATE devices SET remote_ok=? WHERE id=?", (1 if data.remote_ok else 0, dev["id"]))
     conn.commit()
     return {"ok": True}
+
+
+# ---------- удалённое управление (RustDesk) ----------
+
+@router.post("/remote/password")
+def remote_password(data: RemotePasswordIn, ctx=Depends(current_device)):
+    """ПК поставил новый пароль своему RustDesk и сообщает его: сервер выдаст его только тому ПК своей компании,
+    которому разрешит подключиться (/api/remote/connect). Прежний пароль больше не действует."""
+    conn, dev, company = ctx
+    _require_active(dev)
+    if not services.REMOTE_PW_RE.match(data.password):
+        raise HTTPException(400, "Пароль: 12–64 латинских букв и цифр")
+    conn.execute("UPDATE devices SET remote_pw=?, remote_used_at=0 WHERE id=?", (services.seal(data.password), dev["id"]))
+    conn.commit()
+    return {"ok": True}
+
+
+@router.post("/remote/connect")
+def remote_connect(data: RemoteConnectIn, ctx=Depends(current_device)):
+    """Разрешение подключиться к ПК своей компании через RustDesk: адрес и, если управление без согласия,
+    пароль. Каждое подключение — в журнале компании."""
+    conn, dev, company = ctx
+    _require_active(dev)
+    mode = services.remote_mode(company)
+    if mode == "off":
+        raise HTTPException(403, "Удалённое управление выключено в кабинете компании")
+    if not dev["show_peers"]:
+        raise HTTPException(403, "Администратор компании не дал этому компьютеру доступ к другим компьютерам")
+    target = conn.execute("SELECT * FROM devices WHERE id=? AND company_id=?", (data.to, company["id"])).fetchone()
+    if not target or target["id"] == dev["id"] or services.device_status(target) != "active":
+        raise HTTPException(404, "Компьютер не найден")
+    remote_limiter.check(str(dev["id"]))
+    remote_limiter.fail(str(dev["id"]))
+    if not target["remote_ok"]:
+        raise HTTPException(409, f"На {target['name']} удалённое управление ещё не готово: нужна Retix Hub 1.0.16 "
+                                 "или новее, и программа должна успеть поставить RustDesk (несколько минут)")
+    if not services.is_online(target):
+        raise HTTPException(409, f"{target['name']} сейчас не в сети")
+    password = ""
+    if mode == "auto":
+        password = services.unseal(target["remote_pw"])
+        if not password:
+            raise HTTPException(409, f"{target['name']} ещё готовит удалённое управление, попробуйте через минуту")
+    with db.write_lock:
+        if mode == "auto":   # пароль выдан — после сеанса ПК сменит его сам
+            conn.execute("UPDATE devices SET remote_used_at=? WHERE id=?", (int(time.time()), target["id"]))
+        services.audit(conn, company["id"], "remote_connect",
+                       f"{dev['name']} {dev['ip']} → {target['name']} {target['ip']}"
+                       f"{' (файлы)' if data.kind == 'files' else ''}")
+        conn.commit()
+    return {"ip": target["ip"], "port": REMOTE_PORT, "mode": mode, "password": password, "name": target["name"]}

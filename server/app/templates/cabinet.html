@@ -27,6 +27,12 @@
       <label><span>Порты между ПК, если «любой трафик» выключен (общие папки Windows — 445)</span><input type="text" name="share_ports" value="{{ company.share_ports }}"></label>
       <p class="muted">По умолчанию ПК компании видят друг друга (ping), общие папки — те, к которым пользователь ПК сам открыл доступ, — и Radmin Server (порт 4899, подключение из Radmin Viewer).</p>
       <p class="muted">С «любым трафиком» ПК связываются напрямую, мимо сервера — быстрее: в одном офисе — по локальной сети, в разных офисах — через интернет, если это позволяют роутеры. Если прямой путь не работает, трафик сам идёт через сервер.</p>
+      <label><span>Удалённое управление (RustDesk)</span>
+        <select name="remote_mode">
+          {% for key, title in remote_modes.items() %}<option value="{{ key }}" {{ 'selected' if key == remote_mode }}>{{ title }}</option>{% endfor %}
+        </select>
+      </label>
+      <p class="muted">Программа сама ставит на ПК RustDesk и настраивает его только для сети компании: подключиться можно лишь с других ПК компании, серверы RustDesk в интернете не участвуют. «С согласием» — пользователь ПК нажимает «Принять». «Без согласия» — подключение сразу, по одноразовому паролю, который выдаёт сервер Retix Hub. Каждое подключение — в журнале ниже.</p>
       <button class="primary">Сохранить</button>
     </form>
   </div>
@@ -48,4 +54,13 @@
     </form>
   </div>
 </div>
+{% if remote_mode != 'off' or remote_log %}
+<div class="card">
+  <h2>Журнал удалённого управления</h2>
+  <table class="log">
+    {% for l in remote_log %}<tr><td class="muted log-time">{{ l.created_at }}</td><td>{{ l.details }}</td></tr>
+    {% else %}<tr><td class="muted">Подключений ещё не было</td></tr>{% endfor %}
+  </table>
+</div>
+{% endif %}
 {% endblock %}

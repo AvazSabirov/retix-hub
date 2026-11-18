@@ -98,6 +98,8 @@ def api_info():
             "GET /api/peers": "пользователи сети своей компании (Bearer-токен)",
             "POST /api/heartbeat": "отметка клиента (Bearer-токен)",
             "POST /api/logout": "выход ПК из сети компании (Bearer-токен)",
+            "POST /api/remote/connect": "удалённое управление (RustDesk): разрешение подключиться к ПК своей компании",
+            "POST /api/remote/password": "удалённое управление: ПК сообщает новый пароль своего RustDesk",
             "GET /api/update": "обновление клиента: версия и подписанный манифест (Bearer-токен)",
         },
     }

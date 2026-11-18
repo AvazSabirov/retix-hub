@@ -1,4 +1,6 @@
 """Бизнес-логика, общая для API клиента, кабинета компании и суперадмина."""
+import base64
+import hashlib
 import ipaddress
 import json
 import logging
@@ -7,8 +9,8 @@ import sqlite3
 import time
 
 from . import db, wg
-from .config import (NET_PREFIX, OFFLINE_AFTER_SECONDS, ONLINE_SECONDS, RADMIN_PORT, SERVER_IP,
-                     WG_ENDPOINT, WG_KEEPALIVE)
+from .config import (NET_PREFIX, OFFLINE_AFTER_SECONDS, ONLINE_SECONDS, RADMIN_PORT, REMOTE_PORT, SECRET_KEY,
+                     SERVER_IP, WG_ENDPOINT, WG_KEEPALIVE)
 
 log = logging.getLogger("services")
 
@@ -244,6 +246,59 @@ def wan_neighbors(conn, dev, company) -> list[dict]:
     return result
 
 
+# ---------- удалённое управление (RustDesk) ----------
+# На каждом ПК стоит официальный RustDesk без изменений. Клиент Retix Hub настраивает его: прямой доступ по IP
+# (порт REMOTE_PORT) только из подсети компании, серверы RustDesk не используются. Кто к кому подключился —
+# решает и записывает в журнал этот сервер (/api/remote/connect).
+#   ask  — пароля нет, пользователь ПК сам нажимает «Принять» (approve-mode click);
+#   auto — без участия пользователя, по паролю (approve-mode password). Пароль придумывает сам ПК и сообщает
+#          серверу (/api/remote/password), сервер отдаёт его только тому, кому разрешил подключиться.
+#          Выданный пароль одноразовый: после сеанса ПК меняет его сам (rotate в /api/me).
+
+REMOTE_MODES = {"off": "выключено", "ask": "с согласием пользователя", "auto": "без согласия (по паролю)"}
+REMOTE_ROTATE_AFTER = 120   # сек после выдачи пароля: подключиться успевают, дальше ПК меняет пароль (без сеанса)
+REMOTE_PW_RE = re.compile(r"^[A-Za-z0-9]{12,64}$")
+
+
+def clean_remote_mode(value) -> str | None:
+    value = str(value or "").strip()
+    return value if value in REMOTE_MODES else None
+
+
+def _fernet():
+    from cryptography.fernet import Fernet
+    key = hashlib.sha256(("retixhub-remote:" + SECRET_KEY).encode()).digest()
+    return Fernet(base64.urlsafe_b64encode(key))
+
+
+def seal(text: str) -> str:
+    """Пароль RustDesk в базе — зашифрованным (ключ из SECRET_KEY): копия базы без ключа его не раскрывает."""
+    return _fernet().encrypt(text.encode()).decode() if text else ""
+
+
+def unseal(value: str) -> str:
+    """'' — пароля нет или его не расшифровать (сменился SECRET_KEY): ПК придумает новый."""
+    if not value:
+        return ""
+    try:
+        return _fernet().decrypt(value.encode()).decode()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def remote_mode(company) -> str:
+    return clean_remote_mode(company["remote_mode"]) or "off"
+
+
+def remote_config(dev, company) -> dict:
+    """Что клиент делает с RustDesk: режим, порт и пора ли сменить пароль."""
+    mode = remote_mode(company)
+    used = dev["remote_used_at"]
+    rotate = mode == "auto" and (not unseal(dev["remote_pw"])
+                                 or bool(used) and time.time() - used >= REMOTE_ROTATE_AFTER)
+    return {"mode": mode, "port": REMOTE_PORT, "rotate": rotate}
+
+
 def client_config(conn, dev, company) -> dict:
     """Всё, что нужно клиенту, чтобы собрать .conf WireGuard."""
     share = share_host(conn, company["id"])
@@ -274,6 +329,7 @@ def client_config(conn, dev, company) -> dict:
         "direct": direct_neighbors(conn, dev, company),
         "direct_wan": wan_neighbors(conn, dev, company),   # ПК других офисов: прямой путь через интернет
         "time": int(time.time()),   # часы сервера: ПК пробуют прямой путь через интернет одновременно
+        "remote": remote_config(dev, company),   # удалённое управление (RustDesk), клиент 1.0.16+
     }
 
 
@@ -293,6 +349,8 @@ def build_forward_rules(conn) -> list[str]:
         rules.append(f"-A RETIX_FWD -s {sub} -d {sub} -p tcp -m multiport --dports {ports} -j ACCEPT")
         # Radmin Viewer -> Radmin Server на кассах
         rules.append(f"-A RETIX_FWD -s {sub} -d {sub} -p tcp --dport {RADMIN_PORT} -j ACCEPT")
+        if remote_mode(c) != "off":   # RustDesk -> RustDesk (прямой доступ по IP)
+            rules.append(f"-A RETIX_FWD -s {sub} -d {sub} -p tcp --dport {REMOTE_PORT} -j ACCEPT")
     return rules
 
 

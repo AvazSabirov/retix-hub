@@ -103,6 +103,8 @@ jobs:
 
       - name: Сборка (build.bat)
         shell: cmd
+        env:
+          GITHUB_TOKEN: ${{ github.token }}   # get_rustdesk.ps1: релиз RustDesk через API GitHub без лимита
         run: client\build.bat
 
       - uses: actions/upload-artifact@v4

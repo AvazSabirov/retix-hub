@@ -78,6 +78,8 @@ def clean(app, net):
     conn.commit()
     conn.close()
     limiter._fails.clear()
+    from app.routers.api_client import remote_limiter
+    remote_limiter._fails.clear()
     yield
 
 
