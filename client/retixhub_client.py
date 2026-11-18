@@ -37,7 +37,7 @@ import requests
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
 
-VERSION = "1.0.13"
+VERSION = "1.0.14"
 APP_NAME = "RetixHub"          # служебное имя: папки, задачи, мьютекс
 APP_TITLE = "Retix Hub"        # то, что видит пользователь
 TUNNEL = "retixhub"
@@ -64,10 +64,12 @@ HEARTBEAT_EVERY = 60
 
 # Прямой путь по локальной сети (компания с «любым трафиком»): см. DirectPaths
 DIRECT_KEEPALIVE = 10      # сек — keepalive соседу по локальной сети (в локалке трафик бесплатный)
-DIRECT_PROBE_SECONDS = 15  # сек — столько ждём handshake по одному адресу соседа
+DIRECT_PROBE_SECONDS = 20  # сек — столько ждём handshake по одному адресу соседа
 DIRECT_RX_TIMEOUT = 35     # сек — от прямого соседа нет пакетов (3 keepalive) — путь потерян
-DIRECT_RETRY_FAILED = 300  # сек — ни один адрес не ответил: снова пробуем не раньше
-DIRECT_RETRY_LOST = 60     # сек — прямой путь пропал: снова пробуем не раньше
+# Повторы — в начале общего окна по часам сервера, как через интернет: у обоих ПК одновременно. Раньше каждый
+# ждал своё время от своего обрыва, проверка (20 с) попадала на паузу соседа — и так раз за разом.
+DIRECT_RETRY_FAILED = 300  # сек — ни один адрес не ответил: снова в начале следующего окна
+DIRECT_RETRY_LOST = 60     # сек — прямой путь пропал: снова в начале следующего окна
 DIRECT_TICK = 1            # сек — пока идёт проверка пути, handshake смотрим чаще основного цикла
 LAN_CHECK_EVERY = 60       # сек — как часто перечитывать адреса своей локальной сети
 DIRECT_CACHE_DAYS = 3      # сохранённые соседи действуют без сервера столько дней после его последнего ответа
@@ -753,7 +755,7 @@ class DirectPaths:
         protected = state["peers"].keys() - live.keys()     # пир сервера (по ключу или по его AllowedIPs)
         now = time.time()
         for key in live.keys() - self.wanted.keys():
-            self._drop(key, "больше не сосед по локальной сети")
+            self._drop(key, f"сервер больше не называет соседом ПК id {self.active.get(key, '?')}")
         for key, n in self.wanted.items():
             if key in protected:
                 log.warning("сосед %s с ключом пира сервера — пропускаем", n["ip"])
@@ -771,6 +773,8 @@ class DirectPaths:
             return
         allowed = f"{n['ip']}/32"
         if peer is None:
+            if key in self.active:   # сами не удаляли — значит, туннель перенастроил кто-то ещё (служба WireGuard)
+                log.warning("прямой путь к %s: пир соседа пропал из туннеля", n["ip"])
             log.info("прямой путь к %s %s: проверяем %s", n["ip"], where, endpoints[0])
             self.active.pop(key, None)
             self.rx.pop(key, None)
@@ -784,8 +788,10 @@ class DirectPaths:
             if peer["allowed_ips"] != allowed:
                 self.tunnel.set_peer(key, allowed_ips=allowed)
             if now - last[1] > (DIRECT_RX_TIMEOUT_WAN if wan else DIRECT_RX_TIMEOUT):
+                hs = int(now - peer["handshake"]) if peer["handshake"] else -1
                 self._fail(key, endpoints, DIRECT_SLOT_WAN_LOST if wan else DIRECT_RETRY_LOST,
-                           f"от {n['ip']} нет пакетов — снова через сервер", wan)
+                           f"от {n['ip']} нет пакетов {int(now - last[1])} с (handshake {hs} с назад, "
+                           f"адрес {peer['endpoint'] or '—'}) — снова через сервер", wan)
             else:
                 self.active[key] = n["id"]
                 if peer["endpoint"]:
@@ -819,8 +825,8 @@ class DirectPaths:
         log.info("прямой путь: %s", why)
         self._drop(key, why)
         now = time.time()
-        # через интернет — в начале общего окна: сосед тоже не дождался и попробует в то же время
-        self.backoff[key] = (self.next_slot(now, delay) if wan else now + delay, endpoints)
+        # в начале общего окна по часам сервера: сосед тоже не дождался и попробует в то же время
+        self.backoff[key] = (self.next_slot(now, delay) if delay > 0 else now, endpoints)
 
 
 def install_wireguard_if_needed() -> bool:
