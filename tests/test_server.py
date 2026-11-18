@@ -1,5 +1,6 @@
 """Сервер: суперадмин, регистрация, изоляция компаний, кабинет, сеть, безопасность."""
 import concurrent.futures
+import os
 import re
 
 import pytest
@@ -1668,3 +1669,46 @@ class TestRemoteRights:
         assert self.connect(ctx, a, b).json()["mode"] == "own"           # свой пароль — его собственное согласие
         cab.post(f"/cabinet/devices/{b['device_id']}/remote_access", data={"value": "off"})
         assert self.connect(ctx, a, b).status_code == 403               # администратор выключил — и свой пароль не поможет
+
+
+class TestPublishCli:
+    """./publish.sh (python -m app.publish): версия клиента публикуется прямо на сервере."""
+
+    def test_publish_local_file_now_and_draft(self, ctx, tmp_path):
+        from app import publish
+        from conftest import fake_setup
+        f = tmp_path / "RetixHub_Setup_1.0.40.exe"; f.write_bytes(fake_setup("1.0.40"))
+        assert publish.main(["--file", str(f), "--notes", "Новое меню"]) == 0
+        from app import db
+        conn = db.connect()
+        rel = conn.execute("SELECT version, published, notes, created_by FROM app_releases").fetchone()
+        conn.close()
+        assert tuple(rel) == ("1.0.40", 1, "Новое меню", "publish.sh")
+        assert publish.main(["--file", str(f)]) == 1                        # та же версия второй раз — нет
+        d = tmp_path / "RetixHub_Setup_1.0.41.exe"; d.write_bytes(fake_setup("1.0.41"))
+        assert publish.main(["--file", str(d), "--draft"]) == 0
+        page = ctx.admin.get("/admin/updates").text
+        assert "1.0.41" in page and "черновик" in page
+        bad = tmp_path / "other.exe"; bad.write_bytes(fake_setup("1.0.42", product="Чужая программа"))
+        assert publish.main(["--file", str(bad)]) == 1                      # чужой exe не примется
+
+    def test_publish_from_github_release(self, ctx, monkeypatch):
+        from app import publish
+        from conftest import fake_setup
+        body = "## Что нового\n\n- Меню «Управление»\n- Ремонт RustDesk\n\n---\n\nУстановщик клиента Retix Hub…"
+        monkeypatch.setattr(publish, "release_info", lambda version, token: {
+            "version": version or "1.0.43", "asset_id": 7, "name": "RetixHub_Setup_1.0.43.exe", "size": 1,
+            "notes": publish.release_notes(body)})
+        monkeypatch.setattr(publish, "download", lambda asset_id, dest, token: open(dest, "wb").write(fake_setup("1.0.43")))
+        assert publish.main([]) == 0
+        from app import db
+        conn = db.connect()
+        rel = conn.execute("SELECT version, published, notes FROM app_releases").fetchone()
+        conn.close()
+        assert tuple(rel) == ("1.0.43", 1, "- Меню «Управление»\n- Ремонт RustDesk")
+        assert not [n for n in os.listdir(os.path.join(os.environ["DATA_DIR"], "updates")) if n.startswith("publish_")]
+
+    def test_bad_version_argument(self, ctx):
+        from app import publish
+        with pytest.raises(SystemExit):
+            publish.main(["1.x"])
