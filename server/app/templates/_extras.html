@@ -9,7 +9,7 @@
       <form method="post" action="{{ prefix }}unlink" data-confirm="Отключить группу {{ tg.chat }}? Запросы на подключение туда больше не придут."><button class="small danger">Отключить группу</button></form>
     </div>
   {% elif not tg.enabled %}
-    <p class="muted">Telegram-бот не настроен на сервере Retix Hub{% if admin %} (TELEGRAM_BOT_TOKEN в .env){% endif %}.</p>
+    <p class="muted">Telegram-бот не настроен на сервере Retix Hub{% if admin %} — укажите токен бота в <a href="/admin/settings">«Настройках»</a>{% endif %}.</p>
   {% elif admin %}
     <p class="muted">Группа не подключена. Подключает её администратор компании в своём кабинете.</p>
   {% elif tg.code %}

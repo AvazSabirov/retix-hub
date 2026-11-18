@@ -9,6 +9,9 @@
 
 Бот сам спрашивает Telegram о новых сообщениях (getUpdates, long polling): входящих адресов и вебхуков не нужно.
 Отправка — через очередь в своём потоке: запросы ПК не ждут Telegram.
+
+Токен бота задаёт суперадмин («Настройки»): хранится в базе зашифрованным (services.seal), бот перезапускается
+сразу, без перезапуска сервера. TELEGRAM_BOT_TOKEN в .env — только если в суперадмине токен не задан.
 """
 import html
 import json
@@ -26,7 +29,9 @@ from .config import TELEGRAM_API, TELEGRAM_BOT_TOKEN
 
 log = logging.getLogger("telegram")
 
-TOKEN = TELEGRAM_BOT_TOKEN
+TOKEN = ""              # действующий токен (apply): из суперадмина или из .env
+TOKEN_KEY = "telegram_token"
+TOKEN_RE = re.compile(r"^\d{5,15}:[A-Za-z0-9_-]{30,64}$")
 LINK_TTL = 900          # сек — код из кабинета действует 15 минут
 POLL_TIMEOUT = 25       # сек — long polling getUpdates
 ALLOWED_UPDATES = ["message", "callback_query", "my_chat_member"]
@@ -34,6 +39,9 @@ CALLBACK_RE = re.compile(r"^(ap|bl):(\d{1,10})$")
 CODE_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
 
 bot_username = ""       # из getMe: для ссылки и команд в кабинете
+last_error = ""         # что мешает боту работать (видно суперадмину в «Настройках»)
+_stop: threading.Event | None = None
+_apply_lock = threading.Lock()
 _outbox: "queue.Queue[tuple[str, dict]]" = queue.Queue(maxsize=1000)
 
 
@@ -47,9 +55,9 @@ def enabled() -> bool:
     return bool(TOKEN)
 
 
-def _api(method: str, params: dict | None = None, timeout: float = 15):
+def _api(method: str, params: dict | None = None, timeout: float = 15, token: str | None = None):
     """Вызов Bot API; result ответа или TelegramError. Токен — только в адресе запроса, в журнал не попадает."""
-    req = urllib.request.Request(f"{TELEGRAM_API}/bot{TOKEN}/{method}", data=json.dumps(params or {}).encode(),
+    req = urllib.request.Request(f"{TELEGRAM_API}/bot{token or TOKEN}/{method}", data=json.dumps(params or {}).encode(),
                                  headers={"Content-Type": "application/json"})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:  # noqa: S310 — адрес из настроек сервера
@@ -384,26 +392,42 @@ def handle_update(conn, upd: dict) -> None:
         _reply(chat.get("id"), _help_text())
 
 
-def _poller(stop: threading.Event) -> None:
+def _set_error(token: str, text: str) -> None:
+    global last_error
+    if token == TOKEN:   # ошибка прежнего бота (токен уже сменили) — не показываем
+        last_error = text
+
+
+def _poller(stop: threading.Event, token: str) -> None:
     global bot_username
     offset, backoff = 0, 5
     while not stop.is_set():
         try:
             if not bot_username:
-                bot_username = str((_api("getMe") or {}).get("username") or "")
-                log.warning("Telegram-бот @%s запущен", bot_username)
+                name = str((_api("getMe", token=token) or {}).get("username") or "")
+                if token == TOKEN:
+                    bot_username = name
+                log.warning("Telegram-бот @%s запущен", name)
             updates = _api("getUpdates", {"offset": offset, "timeout": POLL_TIMEOUT,
-                                          "allowed_updates": ALLOWED_UPDATES}, timeout=POLL_TIMEOUT + 10)
+                                          "allowed_updates": ALLOWED_UPDATES}, timeout=POLL_TIMEOUT + 10, token=token)
             backoff = 5
+            _set_error(token, "")
         except TelegramError as e:
+            if stop.is_set():
+                return
             if e.code in (401, 404):
-                log.error("Telegram: TELEGRAM_BOT_TOKEN не подходит (%s) — бот выключен", e.description)
+                log.error("Telegram: токен бота не подходит (%s) — бот выключен", e.description)
+                _set_error(token, f"Telegram не принимает токен ({e.description}). Задайте новый.")
                 return
             if e.code == 409:
                 log.warning("Telegram: этим ботом уже пользуется другая программа или у него вебхук (%s)",
                             e.description)
+                _set_error(token, "Этим ботом пользуется другая программа или у него настроен вебхук.")
             elif e.code:
                 log.warning("Telegram getUpdates: %s", e.description)
+                _set_error(token, f"Telegram: {e.description}")
+            else:
+                _set_error(token, f"Нет связи с api.telegram.org ({e.description})")
             stop.wait(backoff)
             backoff = min(backoff * 2, 300)
             continue
@@ -420,10 +444,88 @@ def _poller(stop: threading.Event) -> None:
                 conn.close()
 
 
-def start() -> threading.Event | None:
-    if not enabled():
-        return None
-    stop = threading.Event()
-    threading.Thread(target=_poller, args=(stop,), daemon=True, name="tg-poll").start()
-    threading.Thread(target=_sender, args=(stop,), daemon=True, name="tg-send").start()
-    return stop
+# ---------- токен бота (суперадмин → «Настройки») ----------
+
+def saved_token(conn) -> tuple[str, str]:
+    """(токен, откуда: 'admin' — задан в суперадмине, 'env' — из .env, '' — нет)."""
+    row = conn.execute("SELECT value FROM settings WHERE key=?", (TOKEN_KEY,)).fetchone()
+    token = services.unseal(row["value"]) if row else ""
+    if token:
+        return token, "admin"
+    return (TELEGRAM_BOT_TOKEN, "env") if TELEGRAM_BOT_TOKEN else ("", "")
+
+
+def check_token(token: str) -> str:
+    """Спросить Telegram, чей это токен: username бота. TelegramError — не подходит или нет связи."""
+    me = _api("getMe", token=token, timeout=15) or {}
+    if not me.get("is_bot") or not me.get("username"):
+        raise TelegramError(0, "это не токен бота")
+    return str(me["username"])
+
+
+def bot_id(token: str) -> str:
+    return token.split(":", 1)[0] if token else ""
+
+
+def apply(token: str, username: str = "") -> None:
+    """Запустить бота с этим токеном (прежний останавливается); '' — бота нет."""
+    global TOKEN, bot_username, last_error, _stop
+    with _apply_lock:
+        if _stop:
+            _stop.set()
+            _stop = None
+        TOKEN, bot_username, last_error = token, username, ""
+        if token:
+            _stop = threading.Event()
+            threading.Thread(target=_poller, args=(_stop, token), daemon=True, name="tg-poll").start()
+            threading.Thread(target=_sender, args=(_stop,), daemon=True, name="tg-send").start()
+
+
+def set_token(conn, token: str) -> tuple[str, int]:
+    """Суперадмин задал токен: проверить у Telegram, сохранить, перезапустить бота. (username, сколько групп
+    отключено). Другой бот (другой номер до «:») не состоит в группах компаний — их нужно подключить заново."""
+    token = token.strip()
+    if not TOKEN_RE.match(token):
+        raise ValueError("Это не похоже на токен бота: он выглядит как 123456789:AAH… (выдаёт @BotFather)")
+    try:
+        username = check_token(token)
+    except TelegramError as e:
+        if e.code == 0 and e.description != "это не токен бота":
+            raise ValueError(f"Нет связи с api.telegram.org — токен не проверен, бот не изменён ({e.description})") \
+                from None
+        raise ValueError(f"Telegram не принял токен: {e.description}") from None
+    old, _ = saved_token(conn)
+    unlinked = 0
+    with db.write_lock:
+        conn.execute("INSERT OR REPLACE INTO settings(key, value) VALUES (?,?)", (TOKEN_KEY, services.seal(token)))
+        if bot_id(old) and bot_id(old) != bot_id(token):
+            unlinked = conn.execute("UPDATE companies SET tg_chat_id='', tg_chat_title='', tg_link_code='', "
+                                    "tg_link_at=0 WHERE tg_chat_id<>''").rowcount
+        services.audit(conn, None, "telegram_token", f"@{username}" + (f", групп отключено: {unlinked}" if unlinked else ""))
+        conn.commit()
+    apply(token, username)
+    return username, unlinked
+
+
+def delete_token(conn) -> str:
+    """Убрать токен из суперадмина. Остаётся токен из .env, если он есть; иначе бот выключается."""
+    with db.write_lock:
+        conn.execute("DELETE FROM settings WHERE key=?", (TOKEN_KEY,))
+        services.audit(conn, None, "telegram_token", "удалён")
+        conn.commit()
+    token, _ = saved_token(conn)
+    apply(token)
+    return token
+
+
+def start() -> None:
+    conn = db.connect()
+    try:
+        token, _ = saved_token(conn)
+    finally:
+        conn.close()
+    apply(token)
+
+
+def stop() -> None:
+    apply("")

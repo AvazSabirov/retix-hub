@@ -136,6 +136,12 @@ CREATE TABLE IF NOT EXISTS wake_requests (
 );
 CREATE INDEX IF NOT EXISTS ix_wake_helper ON wake_requests(helper_id, delivered_at);
 
+-- настройки сервера, которые суперадмин меняет на странице «Настройки» (секреты — зашифрованы, services.seal)
+CREATE TABLE IF NOT EXISTS settings (
+    key    TEXT PRIMARY KEY,
+    value  TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS audit_log (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     company_id  INTEGER,

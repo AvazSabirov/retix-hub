@@ -1,0 +1,32 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="card" style="max-width:720px" id="telegram">
+  <h2>Telegram-бот</h2>
+  <p class="muted">Бот присылает в группы компаний запросы на подключение новых компьютеров с кнопками «Одобрить» и «Заблокировать». Группу подключает администратор компании в своём кабинете (блок «Telegram»).</p>
+  {% if tg_running %}
+    <p>Бот: <b>{{ ('@' ~ tg_bot) if tg_bot else 'запускается…' }}</b> · токен <code>{{ tg_masked }}</code>{% if tg_source == 'env' %} <span class="tag">из .env</span>{% endif %}</p>
+    {% if tg_error %}<p class="msg err">{{ tg_error }}</p>{% else %}<p class="muted">Работает: сообщения из групп и нажатия кнопок принимаются.</p>{% endif %}
+  {% else %}
+    <p><span class="tag warn">выключен</span> токен не задан</p>
+  {% endif %}
+  <form method="post" action="/admin/settings/telegram">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <label><span>{{ 'Новый токен бота' if tg_running else 'Токен бота' }}</span><input type="password" name="token" autocomplete="off" placeholder="123456789:AAH…" required></label>
+    <button class="primary">{{ 'Заменить' if tg_running else 'Подключить бота' }}</button>
+  </form>
+  {% if tg_source == 'admin' %}
+  <form method="post" action="/admin/settings/telegram/delete" data-confirm="Удалить токен? Бот перестанет присылать запросы в группы компаний." style="margin-top:10px">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <button class="small danger">Удалить токен</button>
+  </form>
+  {% endif %}
+  <p class="muted">Где взять токен: в Telegram откройте <b>@BotFather</b> → <code>/newbot</code> → имя и username бота (на <code>bot</code>) — BotFather пришлёт токен. Сервер проверит его у Telegram и запустит бота сразу, без перезапуска. Токен хранится в базе зашифрованным. Серверу нужен выход на <code>api.telegram.org</code>; входящие порты и вебхук не нужны.</p>
+  <p class="muted">Другой бот (не тот, что сейчас) не состоит в группах компаний — подключённые группы отключатся, и компании подключат их заново.</p>
+  {% if tg_linked %}
+  <h2 style="margin-top:16px">Подключённые группы</h2>
+  <table class="log">
+    {% for c in tg_linked %}<tr><td><b>{{ c.login }}</b> <span class="muted">{{ c.name }}</span></td><td>{{ c.tg_chat_title or 'группа' }}</td></tr>{% endfor %}
+  </table>
+  {% endif %}
+</div>
+{% endblock %}

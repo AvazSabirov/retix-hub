@@ -2,6 +2,7 @@
 import concurrent.futures
 import os
 import re
+import time
 
 import pytest
 
@@ -1723,7 +1724,7 @@ def tg(monkeypatch):
     from app import telegram
     sent = []
 
-    def fake_api(method, params=None, timeout=15):
+    def fake_api(method, params=None, timeout=15, token=None):
         sent.append((method, dict(params or {})))
         return {"message_id": len(sent)} if method == "sendMessage" else True
 
@@ -1943,7 +1944,7 @@ class TestTelegram:
         _link_group(ctx, tg)
         calls = []
 
-        def api(method, params=None, timeout=15):
+        def api(method, params=None, timeout=15, token=None):
             calls.append(params["chat_id"])
             if len(calls) == 1:
                 raise telegram.TelegramError(429, "Too Many Requests", {"retry_after": 0})
@@ -2162,3 +2163,126 @@ class TestWakeOnLan:
         ctx.api.post("/api/heartbeat", headers=ctx.h(kassa["token"]), json={"nics": []})
         assert "EE:01" in db.connect().execute("SELECT nics FROM devices WHERE id=?",
                                                (kassa["device_id"],)).fetchone()[0]
+
+
+
+# ---------------------------------------------------------------- токен бота в суперадмине
+
+TOKEN_A = "111111111:AAH" + "a" * 32
+TOKEN_A2 = "111111111:AAH" + "b" * 32     # тот же бот, токен перевыпущен
+TOKEN_B = "222222222:AAH" + "c" * 32      # другой бот
+
+
+class TestBotToken:
+    @pytest.fixture()
+    def bot(self, monkeypatch):
+        """Telegram подменён: getMe отвечает по известным токенам; потоки бота не запускаются."""
+        from app import telegram
+        applied = []
+        names = {TOKEN_A: "RetixA", TOKEN_A2: "RetixA", TOKEN_B: "RetixB"}
+
+        def api(method, params=None, timeout=15, token=None):
+            if method == "getMe":
+                if token not in names:
+                    raise telegram.TelegramError(401, "Unauthorized")
+                return {"is_bot": True, "username": names[token]}
+            return True
+
+        def apply(token, username=""):
+            applied.append(token)
+            telegram.TOKEN, telegram.bot_username = token, username
+        monkeypatch.setattr(telegram, "_api", api)
+        monkeypatch.setattr(telegram, "apply", apply)
+        monkeypatch.setattr(telegram, "TOKEN", "")
+        monkeypatch.setattr(telegram, "bot_username", "")
+        return telegram, applied
+
+    @staticmethod
+    def _csrf(client):
+        page = client.get("/admin/settings").text
+        return re.search(r'name="csrf" value="([^"]+)"', page).group(1)
+
+    def test_only_superadmin(self, ctx):
+        ctx.company("firma1")
+        cab = ctx.cabinet("firma1")
+        assert cab.get("/admin/settings", follow_redirects=False).headers["location"] == "/admin/login"
+        r = cab.post("/admin/settings/telegram", data={"token": TOKEN_A}, follow_redirects=False)
+        assert r.headers["location"] == "/admin/login"
+
+    def test_set_replace_delete(self, ctx, bot):
+        telegram, applied = bot
+        from app import db
+        page = ctx.admin.get("/admin/settings").text
+        assert "Настройки" in page and "выключен" in page
+        csrf = self._csrf(ctx.admin)
+        r = ctx.admin.post("/admin/settings/telegram", data={"csrf": csrf, "token": f"  {TOKEN_A} "})
+        assert "Бот @RetixA подключён" in r.text and applied == [TOKEN_A]
+        assert "@RetixA" in r.text and "111111111:•••••aaaa" in r.text and TOKEN_A not in r.text
+        stored = db.connect().execute("SELECT value FROM settings WHERE key='telegram_token'").fetchone()[0]
+        assert TOKEN_A not in stored                                # в базе — зашифрован
+        assert telegram.saved_token(db.connect()) == (TOKEN_A, "admin")
+
+        r = ctx.admin.post("/admin/settings/telegram", data={"csrf": csrf, "token": "не токен"})
+        assert "не похоже на токен" in r.text and applied == [TOKEN_A]
+        r = ctx.admin.post("/admin/settings/telegram", data={"csrf": csrf, "token": "333333333:AAH" + "d" * 32})
+        assert "Telegram не принял токен: Unauthorized" in r.text and applied == [TOKEN_A]
+        assert telegram.saved_token(db.connect())[0] == TOKEN_A
+        monkeypatch_api = telegram._api
+        telegram._api = lambda *a, **k: (_ for _ in ()).throw(telegram.TelegramError(0, "URLError: timed out"))
+        r = ctx.admin.post("/admin/settings/telegram", data={"csrf": csrf, "token": TOKEN_B})
+        telegram._api = monkeypatch_api
+        assert "Нет связи с api.telegram.org" in r.text and applied == [TOKEN_A]
+        r = ctx.admin.post("/admin/settings/telegram", data={"csrf": "чужой", "token": TOKEN_B})
+        assert "Форма устарела" in r.text and applied == [TOKEN_A]
+
+        r = ctx.admin.post("/admin/settings/telegram/delete", data={"csrf": csrf})
+        assert "Telegram-бот выключен" in r.text and applied[-1] == ""
+        assert telegram.saved_token(db.connect()) == ("", "")
+        assert db.connect().execute("SELECT COUNT(*) FROM audit_log WHERE action='telegram_token'").fetchone()[0] == 2
+
+    def test_other_bot_unlinks_groups(self, ctx, bot):
+        from app import db
+        ctx.company("firma1")
+        csrf = self._csrf(ctx.admin)
+        ctx.admin.post("/admin/settings/telegram", data={"csrf": csrf, "token": TOKEN_A})
+        conn = db.connect()
+        conn.execute("UPDATE companies SET tg_chat_id='-100', tg_chat_title='Кассы'")
+        conn.commit()
+        assert "Кассы" in ctx.admin.get("/admin/settings").text
+        r = ctx.admin.post("/admin/settings/telegram", data={"csrf": csrf, "token": TOKEN_A2})
+        assert "Бот @RetixA подключён" in r.text and "отключены" not in r.text   # тот же бот — группы остаются
+        assert conn.execute("SELECT tg_chat_id FROM companies").fetchone()[0] == "-100"
+        r = ctx.admin.post("/admin/settings/telegram", data={"csrf": csrf, "token": TOKEN_B})
+        assert "Это другой бот: группы компаний (1) отключены" in r.text
+        assert conn.execute("SELECT tg_chat_id FROM companies").fetchone()[0] == ""
+
+    def test_env_token_is_fallback(self, ctx, bot, monkeypatch):
+        telegram, applied = bot
+        from app import db
+        monkeypatch.setattr(telegram, "TELEGRAM_BOT_TOKEN", TOKEN_B)
+        conn = db.connect()
+        assert telegram.saved_token(conn) == (TOKEN_B, "env")
+        csrf = self._csrf(ctx.admin)
+        ctx.admin.post("/admin/settings/telegram", data={"csrf": csrf, "token": TOKEN_A})
+        assert telegram.saved_token(conn) == (TOKEN_A, "admin")      # суперадмин важнее .env
+        telegram.start()
+        assert applied[-1] == TOKEN_A
+        r = ctx.admin.post("/admin/settings/telegram/delete", data={"csrf": csrf})
+        assert "работает токен из .env" in r.text and applied[-1] == TOKEN_B
+        assert "из .env" in ctx.admin.get("/admin/settings").text
+
+    def test_apply_restarts_bot(self, monkeypatch):
+        from app import telegram
+        started = []
+        monkeypatch.setattr(telegram, "_poller", lambda stop, token: started.append((stop, token)))
+        monkeypatch.setattr(telegram, "_sender", lambda stop: None)
+        try:
+            telegram.apply(TOKEN_A, "RetixA")
+            telegram.apply(TOKEN_B)
+            time.sleep(0.1)
+            assert [t for _, t in started] == [TOKEN_A, TOKEN_B]
+            assert started[0][0].is_set() and not started[1][0].is_set()   # прежний бот остановлен
+            assert telegram.enabled() and telegram.bot_username == ""
+        finally:
+            telegram.apply("")
+        assert not telegram.enabled() and started[1][0].is_set()

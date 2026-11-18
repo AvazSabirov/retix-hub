@@ -51,7 +51,7 @@ def csrf_token(request) -> str:
 
 def csrf_ok(request, token) -> bool:
     expected = request.session.get("csrf") or ""
-    return bool(expected) and hmac.compare_digest(expected, str(token or ""))
+    return bool(expected) and hmac.compare_digest(expected.encode(), str(token or "").encode())
 
 
 templates.env.filters["dt"] = lambda s: dt_text(s) if s else "—"

@@ -71,7 +71,7 @@ def clean(app, net):
         pass
     conn = db.connect()
     conn.executescript("DELETE FROM token_history; DELETE FROM messages; DELETE FROM devices; DELETE FROM companies;"
-                       "DELETE FROM audit_log; DELETE FROM app_releases; DELETE FROM device_logs; DELETE FROM wake_requests;"
+                       "DELETE FROM audit_log; DELETE FROM app_releases; DELETE FROM device_logs; DELETE FROM wake_requests; DELETE FROM settings;"
                        "DELETE FROM sqlite_sequence;")
     import shutil
     from app.config import DATA_DIR
