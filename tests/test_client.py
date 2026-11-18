@@ -238,7 +238,7 @@ class Client:
 def patch_windows(monkeypatch):
     calls = []
     monkeypatch.setattr(rc, "run", lambda args, timeout=60: (calls.append(args), (0, ""))[1])
-    monkeypatch.setattr(rc, "local_addresses", lambda: list(LAN_NOW["addrs"]))
+    monkeypatch.setattr(rc, "local_addresses", lambda: None if LAN_NOW["addrs"] is None else list(LAN_NOW["addrs"]))
     monkeypatch.setattr(rc, "ensure_autostart", lambda: calls.append(["autostart"]))
     return calls
 
@@ -465,6 +465,46 @@ def test_peers_list(make_client, company):
     names = {p["name"]: p for p in b.peers}
     assert set(names) == {"Склад", "Бухгалтерия"} and names["Бухгалтерия"]["is_me"]
     assert names["Склад"]["ip"] == a.w.cfg["ip"]
+
+
+def test_rename_from_client(make_client, company):
+    a = make_client("PC1"); login(a, company, name="Склад"); a.step(2)
+    b = make_client("BUH-01"); login(b, company, name="Бухгалтерия"); b.step(2)
+    assert a.w.rename("  ") == "Введите имя компьютера."
+    assert a.w.rename(" Склад  №2 ") is None
+    assert a.state.get("device_name") == "Склад №2" and a.w.cfg["device_name"] == "Склад №2"
+    b.step()
+    assert {p["name"] for p in b.peers} == {"Склад №2", "Бухгалтерия"}
+    # повторный вход (токен сброшен) — имя то же, а не прежнее
+    a.state.set(token=""); a.step(2)
+    assert a.w.cfg["device_name"] == "Склад №2"
+
+
+def test_rename_in_cabinet_survives_reregister(make_client, company):
+    c = make_client(); login(c, company, name="Старое"); c.step(2)
+    company.cab.post(BASE + f"/cabinet/devices/{device_id(company, 'Старое')}/rename", data={"value": "Касса"})
+    c.step()
+    assert c.state.get("device_name") == "Касса"
+    c.state.set(token=""); c.step(2)
+    assert c.w.cfg["device_name"] == "Касса"
+
+
+def test_rename_server_down(make_client, company):
+    c = make_client(); login(c, company); c.step(2)
+    c.state.set(server_url="http://127.0.0.1:1")
+    assert "Сервер недоступен" in c.w.rename("Новое")
+    assert c.state.get("device_name") == "Бухгалтерия"
+
+
+def test_peer_link_icons():
+    assert rc.peer_link({"direct": True, "direct_wan": True}, True) == "wan"
+    assert rc.peer_link({"direct": True}, True) == "lan"
+    assert rc.peer_link({}, True) == "server"
+    assert rc.peer_link({"direct": True}, False) == "off"
+    pytest.importorskip("PIL")
+    for kind in rc.LINK_COLORS:
+        img = rc.render_link_icon(kind)
+        assert img.size == (16, 16) and img.getbbox()
 
 
 def test_hosts_never_touched(make_client, company, patch_windows):
@@ -1021,6 +1061,36 @@ def test_direct_reset_on_reinstall(make_client, company, server):
     assert direct_peer(a, b)["allowed_ips"]
 
 
+def test_direct_path_survives_unreadable_lan_addresses(make_client, company, server):
+    """PowerShell не успел прочитать адреса — это не «локальной сети нет»: порт и прямой путь остаются,
+    сервер не перестаёт называть ПК соседом (раньше путь «моргал» у обоих ПК)."""
+    lan, a, b = lan_pair(make_client, company, server)
+    a.step(); b.step(); a.step(); b.step()
+    assert direct_peer(a, b)["allowed_ips"]
+    a.lan_addrs = None
+    a.step(); mark_online(server); b.step()
+    assert a.w.lan == ["192.168.1.10/24"] and a.state.get("fw_direct") == a.tunnel.port
+    assert direct_peer(a, b)["allowed_ips"] and direct_peer(b, a)["allowed_ips"]
+
+
+def test_direct_neighbor_kept_after_short_rx_gap(make_client, company, server):
+    """Сервер 60 с не видел пакетов от соседа (потерялся keepalive): «в сети» уже нет, но соседа для прямого
+    пути он ещё называет — работающий путь не закрывается."""
+    import sqlite3
+    lan, a, b = lan_pair(make_client, company, server)
+    a.step(); b.step(); a.step(); b.step()
+    conn = sqlite3.connect(Path(server.data) / "vpn.db", timeout=10)
+    conn.execute("UPDATE devices SET last_rx_at=? WHERE name='Бухгалтерия'", (int(time.time()) - 60,))
+    conn.commit(); conn.close()
+    a.step()
+    assert direct_peer(a, b)["allowed_ips"]
+    conn = sqlite3.connect(Path(server.data) / "vpn.db", timeout=10)
+    conn.execute("UPDATE devices SET last_rx_at=? WHERE name='Бухгалтерия'", (int(time.time()) - 200,))
+    conn.commit(); conn.close()
+    a.step()
+    assert direct_peer(a, b) is None                     # действительно пропал — путь закрыт
+
+
 def test_direct_neighbors_validation():
     cfg = {"direct_enabled": True, "ip": "10.66.3.2", "subnet": "10.66.3.0/24", "server_ip": "10.66.0.1",
            "server_public_key": "S" * 43 + "="}
@@ -1070,6 +1140,8 @@ def test_local_addresses_filter(monkeypatch):
     monkeypatch.setattr(rc, "WINDOWS", False)
     monkeypatch.setattr(rc, "run", lambda args, timeout=60: (0, out))
     assert REAL_LOCAL_ADDRESSES() == ["192.168.1.15/24", "10.1.2.3/8"]
+    monkeypatch.setattr(rc, "run", lambda args, timeout=60: (1, "timeout"))
+    assert REAL_LOCAL_ADDRESSES() is None
 
 
 # ------------------------------------------------------------------ сохранённые соседи (без сервера)

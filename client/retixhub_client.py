@@ -37,7 +37,7 @@ import requests
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
 
-VERSION = "1.0.12"
+VERSION = "1.0.13"
 APP_NAME = "RetixHub"          # служебное имя: папки, задачи, мьютекс
 APP_TITLE = "Retix Hub"        # то, что видит пользователь
 TUNNEL = "retixhub"
@@ -393,6 +393,9 @@ class Api:
     def logout(self):
         return self._req("POST", "/api/logout")
 
+    def rename(self, name: str):
+        return self._req("POST", "/api/rename", json={"name": name})
+
     def update_info(self):
         return self._req("GET", "/api/update")
 
@@ -515,8 +518,9 @@ def direct_neighbors(cfg: dict, own_key: str = "") -> list[dict]:
     return out
 
 
-def local_addresses() -> list[str]:
-    """Свои IPv4 в локальных сетях: ["192.168.1.15/24", …] (без туннеля, 127.*, 169.254.*)."""
+def local_addresses() -> list[str] | None:
+    """Свои IPv4 в локальных сетях: ["192.168.1.15/24", …] (без туннеля, 127.*, 169.254.*).
+    None — адреса не прочитать (PowerShell не ответил вовремя): это не «локальной сети нет»."""
     if WINDOWS:
         ps = ("Get-NetIPAddress -AddressFamily IPv4 -AddressState Preferred -ErrorAction SilentlyContinue | "
               "ForEach-Object { $_.IPAddress + '/' + $_.PrefixLength }")
@@ -526,7 +530,7 @@ def local_addresses() -> list[str]:
         out = "\n".join(w[i + 1] for w in (line.split() for line in out.splitlines())
                         for i, x in enumerate(w[:-1]) if x == "inet")
     if code != 0:
-        return []
+        return None
     found = []
     for line in out.split():
         try:
@@ -1246,6 +1250,11 @@ def is_admin() -> bool:
 
 # ====================================================================== логика подключения
 
+def clean_device_name(name: str) -> str:
+    """Имя ПК в сети компании: без управляющих символов, пробелы схлопнуты, до 64 символов (как на сервере)."""
+    return " ".join("".join(ch for ch in (name or "") if ch.isprintable()).split())[:64]
+
+
 class Status:
     NEED_LOGIN = "need_login"
     CONNECTING = "connecting"
@@ -1305,7 +1314,7 @@ class Worker(threading.Thread):
                 if not self.state.activate(target):   # уже в списке — тот же ключ, тот же ПК на сервере
                     self.state.set(token="", private_key="", join_password="", company_name="", last_conf_hash="",
                                    direct_cache={})
-            self.state.set(server_url=server, company_login=company, device_name=device.strip())
+            self.state.set(server_url=server, company_login=company, device_name=clean_device_name(device))
             try:
                 self._register(password)
             except (ApiError, ServerUnreachable) as e:
@@ -1396,6 +1405,31 @@ class Worker(threading.Thread):
         self.state.set(last_conf_hash="")
         self.wake.set()
 
+    def rename(self, name: str) -> str | None:
+        """Сменить имя этого ПК в сети компании (из потока окна). None — готово, иначе текст ошибки."""
+        name = clean_device_name(name)
+        if not name:
+            return "Введите имя компьютера."
+        if not self.state.get("token"):
+            # ещё не подключён — имя уйдёт на сервер при входе
+            self.state.set(device_name=name)
+            return None
+        try:
+            res = self.api.rename(name)
+        except ApiError as e:
+            if e.status in (404, 405):
+                return "Сервер ещё не умеет менять имя из программы — попросите администратора компании."
+            return e.detail
+        except ServerUnreachable:
+            return "Сервер недоступен, имя не изменено."
+        name = clean_device_name(str((res or {}).get("device_name") or name)) or name
+        log.info("имя компьютера: %s", name)
+        self.state.set(device_name=name)
+        if self.cfg:
+            self.cfg = dict(self.cfg, device_name=name)
+        self.wake.set()   # список компьютеров с новым именем — сразу
+        return None
+
     def send_message(self, to: int, text: str) -> str | None:
         """Отправить сообщение ПК своей компании (из потока окна). None — отправлено, иначе текст ошибки."""
         try:
@@ -1453,7 +1487,14 @@ class Worker(threading.Thread):
     def _direct_step(self, now: float):
         enabled = bool(self.cfg.get("direct_enabled"))
         if enabled and now - self.lan_checked > LAN_CHECK_EVERY:
-            self.lan, self.lan_checked = local_addresses(), now
+            found = local_addresses()
+            if found is None:
+                # не прочитались (PowerShell не успел за 20 с при нагрузке): оставляем прежние. Иначе сервер
+                # на минуту решал, что у ПК нет локальной сети, соседи закрывали прямой путь, а через 35 с
+                # без пакетов его закрывал и этот ПК — путь «моргал» каждые несколько минут
+                log.warning("адреса локальной сети не прочитаны — оставляем прежние")
+                found = self.lan
+            self.lan, self.lan_checked = found, now
         elif not enabled:
             self.lan = []
         _, pub = self.state.keypair()
@@ -1680,6 +1721,10 @@ class Worker(threading.Thread):
             return
         if self.cfg.get("company") and self.cfg["company"] != self.state.get("company_name"):
             self.state.set(company_name=str(self.cfg["company"])[:100])
+        # имя могли сменить в кабинете — запоминаем, иначе повторный вход вернул бы старое
+        name = clean_device_name(str(self.cfg.get("device_name") or ""))
+        if name and name != self.state.get("device_name"):
+            self.state.set(device_name=name)
 
         if self.cfg["status"] == "blocked":
             if self.tunnel.service_state() != "missing":
@@ -1926,20 +1971,139 @@ def natural_key(text: str):
     return [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", (text or "").lower())]
 
 
-def make_signal_image(online: bool) -> "tk.PhotoImage":
-    """Значок уровня сигнала: 4 зелёные полоски или серый крестик."""
-    w, h = 18, 14
-    img = tk.PhotoImage(width=w, height=h)
-    if online:
+# как связан ПК из списка: значок вместо подписи «⇄ LAN / ⇄ WAN» рядом с IP.
+# Через сервер — зелёная R с логотипа Retix Hub
+LINK_COLORS = {"server": C["green"], "lan": "#2dd4bf", "wan": "#60a5fa", "off": C["muted"]}
+LINK_HINTS = {"server": "В сети · связь через сервер Retix Hub", "lan": "В сети · напрямую по локальной сети",
+              "wan": "В сети · напрямую через интернет", "off": "Не в сети"}
+
+
+def peer_link(p: dict, online: bool) -> str:
+    """Значок ПК в списке: server / lan / wan / off."""
+    if not online:
+        return "off"
+    if p.get("direct"):
+        return "wan" if p.get("direct_wan") else "lan"
+    return "server"
+
+
+def logo_letter(color: str, size: int = 16):
+    """Буква R из значка Retix Hub (app_icon.ico) цветом color, без фона, по размеру значка."""
+    from PIL import Image, ImageChops
+    icon = Image.open(resource_dir() / "app_icon.ico")
+    icon.size = max(icon.info.get("sizes") or [icon.size])
+    r, g, b, a = icon.convert("RGBA").split()
+    # белая буква на зелёном фоне: светлое (min(r,g,b) > 90) — буква, остальное прозрачно
+    light = ImageChops.darker(ImageChops.darker(r, g), b).point(lambda v: max(0, min(255, (v - 90) * 255 // 150)))
+    mask = ImageChops.multiply(light, a)
+    box = mask.getbbox()
+    if not box:
+        raise ValueError("в значке нет буквы")
+    x0, y0, x1, y1 = box
+    side = max(x1 - x0, y1 - y0)
+    cx, cy = (x0 + x1) // 2, (y0 + y1) // 2
+    crop = (cx - side // 2, cy - side // 2, cx - side // 2 + side, cy - side // 2 + side)
+    out = Image.new("RGBA", mask.size, color)
+    out.putalpha(mask)
+    # высота — как у остальных значков списка (13 из 16 точек, поля по краям), а не во весь квадрат
+    inner = max(1, round(size * 13 / 16))
+    canvas = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    canvas.alpha_composite(out.crop(crop).resize((inner, inner), Image.LANCZOS),
+                           ((size - inner + 1) // 2, (size - inner + 1) // 2))
+    return canvas
+
+
+def render_link_icon(kind: str, size: int = 16):
+    """Значок связи (Pillow, рисуется в 8 раз крупнее и уменьшается — со сглаживанием):
+    server — зелёная R как на логотипе, lan — гнездо сетевого кабеля, wan — глобус, off — крестик."""
+    from PIL import Image, ImageDraw
+    if kind == "server":
+        try:
+            return logo_letter(LINK_COLORS["server"], size)
+        except Exception:  # noqa: BLE001 — нет значка программы: полоски сигнала
+            log.debug("буква R из app_icon.ico не собрана", exc_info=True)
+    S = size * 8
+    u = S / 16                         # 1 точка значка 16×16
+    img = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    col = tuple(int(LINK_COLORS[kind][i:i + 2], 16) for i in (1, 3, 5)) + (255,)
+    w, thin = max(1, round(1.5 * u)), max(1, round(1.2 * u))
+    if kind == "server":
         for i in range(4):
-            bh = 4 + i * 3
-            x0 = 1 + i * 4
-            img.put(C["green"], to=(x0, h - bh, x0 + 3, h))
+            x0, h = (1.5 + i * 3.5) * u, (4 + i * 3) * u
+            d.rounded_rectangle((x0, 14.5 * u - h, x0 + 2.5 * u, 14.5 * u), radius=0.6 * u, fill=col)
+    elif kind == "lan":
+        d.rounded_rectangle((1 * u, 1.5 * u, 15 * u, 14.5 * u), radius=2.2 * u, outline=col, width=w)
+        d.polygon([(4 * u, 4.5 * u), (12 * u, 4.5 * u), (12 * u, 10 * u), (10.5 * u, 10 * u), (10.5 * u, 12 * u),
+                   (5.5 * u, 12 * u), (5.5 * u, 10 * u), (4 * u, 10 * u)], fill=col)
+        for i in range(4):             # контакты
+            x = (5.5 + i * 1.65) * u
+            d.rectangle((x, 4.5 * u, x + 0.7 * u, 7 * u), fill=(0, 0, 0, 0))
+    elif kind == "wan":
+        c, r = 8 * u, 6.6 * u
+        d.ellipse((c - r, c - r, c + r, c + r), outline=col, width=w)
+        d.ellipse((c - 2.6 * u, c - r, c + 2.6 * u, c + r), outline=col, width=thin)
+        d.line((c - r, c, c + r, c), fill=col, width=thin)
+        for dy in (-1, 1):             # параллели
+            d.arc((c - 5.6 * u, c + dy * 3.2 * u - 3 * u, c + 5.6 * u, c + dy * 3.2 * u + 3 * u),
+                  start=200 if dy < 0 else 20, end=340 if dy < 0 else 160, fill=col, width=thin)
     else:
-        for i in range(7):
-            img.put(C["muted"], to=(5 + i, 4 + i, 7 + i, 6 + i))
-            img.put(C["muted"], to=(11 - i, 4 + i, 13 - i, 6 + i))
-    return img
+        d.line((4 * u, 4 * u, 12 * u, 12 * u), fill=col, width=round(1.8 * u))
+        d.line((12 * u, 4 * u, 4 * u, 12 * u), fill=col, width=round(1.8 * u))
+    return img.resize((size, size), Image.LANCZOS)
+
+
+def make_link_images() -> dict:
+    """Значки связи для списка компьютеров. Без Pillow — попроще, по точкам."""
+    try:
+        from PIL import ImageTk
+        return {k: ImageTk.PhotoImage(render_link_icon(k)) for k in LINK_COLORS}
+    except Exception:  # noqa: BLE001
+        log.debug("значки через Pillow не нарисованы", exc_info=True)
+    w = h = 16
+    imgs = {k: tk.PhotoImage(width=w, height=h) for k in LINK_COLORS}
+    for i in range(4):
+        bh = 4 + i * 3
+        imgs["server"].put(LINK_COLORS["server"], to=(1 + i * 4, h - 1 - bh, 4 + i * 4, h - 1))
+    lan = imgs["lan"]
+    for x0, y0, x1, y1 in ((1, 1, 15, 3), (1, 13, 15, 15), (1, 1, 3, 15), (13, 1, 15, 15), (4, 7, 12, 10), (6, 10, 10, 12)):
+        lan.put(LINK_COLORS["lan"], to=(x0, y0, x1, y1))
+    for x in (4, 6, 8, 10):
+        lan.put(LINK_COLORS["lan"], to=(x, 5, x + 1, 7))
+    wan = imgs["wan"]
+    for y in range(16):                # круг, меридиан и экватор
+        for x in range(16):
+            r = ((x - 7.5) ** 2 + (y - 7.5) ** 2) ** 0.5
+            if 5.6 <= r <= 7.1 or (y in (7, 8) and r < 7) or (abs((x - 7.5) / 2.6) ** 2 + ((y - 7.5) / 6.6) ** 2 - 1) ** 2 < 0.06:
+                wan.put(LINK_COLORS["wan"], to=(x, y, x + 1, y + 1))
+    for i in range(7):
+        imgs["off"].put(LINK_COLORS["off"], to=(4 + i, 4 + i, 6 + i, 6 + i))
+        imgs["off"].put(LINK_COLORS["off"], to=(10 - i, 4 + i, 12 - i, 6 + i))
+    return imgs
+
+
+class Tooltip:
+    """Подсказка у курсора (для значков в списке компьютеров)."""
+
+    def __init__(self, root):
+        self.root, self.win, self.text = root, None, ""
+
+    def show(self, text: str, x: int, y: int):
+        if self.win and text == self.text:
+            return
+        self.hide()
+        self.text = text
+        self.win = tk.Toplevel(self.root)
+        self.win.wm_overrideredirect(True)
+        self.win.attributes("-topmost", True)
+        tk.Label(self.win, text=text, bg=C["head"], fg=C["text"], font=("Segoe UI", 8), padx=6, pady=2,
+                 highlightthickness=1, highlightbackground=C["line"]).pack()
+        self.win.geometry(f"+{x + 14}+{y + 16}")
+
+    def hide(self):
+        if self.win:
+            self.win.destroy()
+        self.win, self.text = None, ""
 
 
 def setup_style(root: tk.Tk) -> None:
@@ -1963,7 +2127,7 @@ def setup_style(root: tk.Tk) -> None:
                  padding=(10, 5))
     st.map("TButton", background=[("disabled", C["off"]), ("active", C["on_hover"])])
     st.configure("Hub.Treeview", background=C["panel"], fieldbackground=C["panel"], foreground=C["text"],
-                 rowheight=24, borderwidth=0, font=("Segoe UI", 9))
+                 rowheight=20, borderwidth=0, font=("Segoe UI", 8))
     st.map("Hub.Treeview", background=[("selected", C["sel"])], foreground=[("selected", "white")])
     st.layout("Hub.Treeview", [("Treeview.treearea", {"sticky": "nswe"})])
     st.configure("Hub.Vertical.TScrollbar", background=C["line"], troughcolor=C["panel"], bordercolor=C["panel"],
@@ -2042,6 +2206,67 @@ class LoginDialog(tk.Toplevel):
             self.close()
 
 
+class RenameDialog(tk.Toplevel):
+    """Сменить имя этого компьютера в сети компании (его видят другие ПК и кабинет компании)."""
+
+    def __init__(self, app: "App"):
+        super().__init__(app)
+        self.app = app
+        self.title("Имя компьютера")
+        self.configure(bg=C["bg"])
+        self.resizable(False, False)
+        self.transient(app)
+        try:
+            self.iconbitmap(str(resource_dir() / "app_icon.ico"))
+        except Exception:  # noqa: BLE001
+            pass
+        frm = ttk.Frame(self, padding=16)
+        frm.pack(fill="both")
+        current = (app.cfg or {}).get("device_name") or app.state_.get("device_name") or socket.gethostname()
+        ttk.Label(frm, text="Имя этого компьютера в сети компании").grid(row=0, column=0, sticky="w", pady=(0, 2))
+        ttk.Label(frm, text="Так его видят другие компьютеры и кабинет компании.", style="Muted.TLabel")\
+            .grid(row=1, column=0, sticky="w", pady=(0, 6))
+        self.var = tk.StringVar(value=current)
+        self.entry = ttk.Entry(frm, textvariable=self.var, width=36)
+        self.entry.grid(row=2, column=0, sticky="ew")
+        self.entry.focus_set()
+        self.entry.select_range(0, "end")
+        self.err = ttk.Label(frm, text="", style="Err.TLabel", wraplength=280)
+        self.err.grid(row=3, column=0, sticky="w", pady=(4, 0))
+        self.btn = ttk.Button(frm, text="Сохранить", command=self.submit)
+        self.btn.grid(row=4, column=0, pady=(8, 0), sticky="ew")
+        self.bind("<Return>", lambda _e: self.submit())
+        self.bind("<Escape>", lambda _e: self.close())
+        self.protocol("WM_DELETE_WINDOW", self.close)
+        self.update_idletasks()   # по центру над главным окном
+        ax, ay, aw, _ = app.frame_box()
+        self.geometry(f"+{max(0, ax + (aw - self.winfo_reqwidth()) // 2)}+{max(0, ay + 60)}")
+        dark_titlebar(self)
+        self.grab_set()
+
+    def close(self):
+        self.app.rename_dialog = None
+        self.destroy()
+
+    def submit(self):
+        name = clean_device_name(self.var.get())
+        if not name:
+            self.err.config(text="Введите имя компьютера")
+            return
+        self.btn.config(state="disabled", text="Сохранение…")
+
+        def work():
+            self.app.ui_q.put(("rename_done", (name, self.app.worker.rename(name))))
+        threading.Thread(target=work, daemon=True, name="rename").start()
+
+    def done(self, err):
+        if err:
+            self.err.config(text=err)
+            self.btn.config(state="normal", text="Сохранить")
+        else:
+            self.close()
+
+
 class MessageWindow(tk.Toplevel):
     """Переписка с одним компьютером: входящие показываются здесь, отсюда же — ответ."""
 
@@ -2050,9 +2275,8 @@ class MessageWindow(tk.Toplevel):
         self.app, self.peer = app, peer
         self.title(f"Сообщения — {peer['name']}")
         self.configure(bg=C["bg"])
-        ax, ay, _, ah = app.frame_box()
-        left, top, _, bottom = work_area(app)
-        self.geometry(f"380x360+{max(left, ax - 380 - 24)}+{max(top, min(ay + ah - 360, bottom - 360 - 40))}")
+        left, top, right, bottom = work_area(app)   # по центру экрана (рабочей области без панели задач)
+        self.geometry(f"380x360+{max(left, (left + right - 380) // 2)}+{max(top, (top + bottom - 360) // 2 - 16)}")
         self.minsize(300, 240)
         try:
             self.iconbitmap(str(resource_dir() / "app_icon.ico"))
@@ -2228,6 +2452,7 @@ class App(tk.Tk):
         self.cfg = None
         self.peers: list[dict] = []
         self.login_dialog: LoginDialog | None = None
+        self.rename_dialog: RenameDialog | None = None
         self.last_status = None
         self.status_now = None
         self.collapsed = False
@@ -2242,7 +2467,7 @@ class App(tk.Tk):
         self.geometry("360x620")
         self.minsize(320, 380)
         self.resizable(False, True)   # только по высоте; кнопки «развернуть» нет (см. no_maximize_button)
-        self.img_on, self.img_off = make_signal_image(True), make_signal_image(False)
+        self.link_img = make_link_images()   # значки связи в списке: через сервер / LAN / интернет / не в сети
         self._build()
         self.tray = Tray(self.ui_q)
         # крестик — спрятать в трей (VPN работает дальше); без трея — свернуть
@@ -2273,6 +2498,7 @@ class App(tk.Tk):
         m.add_command(label="Подключить / отключить", command=self.toggle)
         m.add_command(label="Переподключить", command=self.worker.force_reconnect)
         m.add_separator()
+        m.add_command(label="Имя компьютера…", command=self.rename)
         m.add_command(label="Добавить компанию…", command=lambda: self.show_login(add=True))
         m.add_command(label="Выйти из сети компании", command=self.logout)
         m.add_separator()
@@ -2308,8 +2534,9 @@ class App(tk.Tk):
         info = tk.Frame(top, bg=C["panel"])
         info.pack(side="left", fill="x", expand=True, pady=10)
         self.name_lbl = tk.Label(info, text=self.state_.get("device_name") or socket.gethostname(), bg=C["panel"],
-                                 fg=C["name"], font=("Segoe UI", 12, "bold"), anchor="w")
+                                 fg=C["name"], font=("Segoe UI", 12, "bold"), anchor="w", cursor="hand2")
         self.name_lbl.pack(fill="x")
+        self.name_lbl.bind("<Double-1>", lambda _e: self.rename())   # двойной щелчок по имени — сменить
         self.ip_lbl = tk.Label(info, text="—", bg=C["panel"], fg=C["text"], font=("Segoe UI", 11, "bold"),
                                anchor="w")
         self.ip_lbl.pack(fill="x")
@@ -2338,7 +2565,7 @@ class App(tk.Tk):
         self.tree = ttk.Treeview(self.list_frame, columns=("ip",), show="tree", style="Hub.Treeview",
                                  selectmode="browse")
         self.tree.column("#0", width=200, stretch=True)
-        self.tree.column("ip", width=92, stretch=False, anchor="e")
+        self.tree.column("ip", width=84, stretch=False, anchor="e")
         self.tree.tag_configure("off", foreground=C["muted"])
         sb = ttk.Scrollbar(self.list_frame, orient="vertical", command=self.tree.yview,
                            style="Hub.Vertical.TScrollbar")
@@ -2354,6 +2581,9 @@ class App(tk.Tk):
         self.tree.bind("<Double-1>", lambda _e: self.open_shares())
         self.tree.bind("<Return>", lambda _e: self.open_shares())
         self.tree.bind("<Button-3>", self.peer_menu)
+        self.tip = Tooltip(self)
+        self.tree.bind("<Motion>", self._tree_hover)
+        self.tree.bind("<Leave>", lambda _e: self.tip.hide())
 
         # меню правой кнопки: с пунктами Radmin Viewer — только если у того ПК есть Radmin Server, а здесь Viewer
         self.ctx_menus = {radmin: self._build_peer_menu(radmin) for radmin in (True, False)}
@@ -2423,6 +2653,14 @@ class App(tk.Tk):
             # установщик уже запущен: закрываемся, он поставит новую версию и запустит её
             self.tray.notify(APP_TITLE, f"Обновление до версии {data}…")
             self.after(800, self.quit_app)
+        elif kind == "rename_done":
+            name, err = data
+            if not err:
+                self.name_lbl.config(text=name)
+                if self.cfg:
+                    self.cfg = dict(self.cfg, device_name=name)
+            if self.rename_dialog:
+                self.rename_dialog.done(err)
         elif kind == "login_done":
             if self.login_dialog:
                 self.login_dialog.done(data)
@@ -2508,7 +2746,7 @@ class App(tk.Tk):
             self.show_login(text)
         if status in (Status.SERVER_DOWN, Status.BLOCKED):
             for i in self.tree.get_children():
-                self.tree.item(i, image=self.img_off, tags=("off",))
+                self.tree.item(i, image=self.link_img["off"], tags=("off",))
         self.last_status = status
 
     def _on_peers(self, peers):
@@ -2520,14 +2758,23 @@ class App(tk.Tk):
         for p in others:
             online = p["online"] and self.status_now not in (Status.SERVER_DOWN, Status.BLOCKED, Status.OFF)
             self.tree.insert("", "end", iid=str(p["id"]), text=" " + p["name"],
-                             image=self.img_on if online else self.img_off,
-                             values=(p["ip"] + (("  ⇄ WAN" if p.get("direct_wan") else "  ⇄ LAN")
-                                                if online and p.get("direct") else ""),),
+                             image=self.link_img[peer_link(p, online)], values=(p["ip"],),
                              tags=() if online else ("off",))
         if sel and self.tree.exists(sel[0]):
             self.tree.selection_set(sel[0])
         online = sum(1 for p in others if p["online"])
         self.count_lbl.config(text=f"{online} / {len(others)}" if others else "")
+
+    def _tree_hover(self, event):
+        """Подсказка над значком: как связан ПК (через сервер, по локальной сети, через интернет)."""
+        row = self.tree.identify_row(event.y)
+        box = self.tree.bbox(row, "#0") if row else None
+        p = next((x for x in self.peers if str(x.get("id")) == row), None) if box else None
+        if not p or event.x > box[0] + 40:   # только над значком (он после отступа строки)
+            self.tip.hide()
+            return
+        online = "off" not in self.tree.item(row, "tags")
+        self.tip.show(LINK_HINTS[peer_link(p, online)], event.x_root, event.y_root)
 
     # --- окно и трей
     def show(self):
@@ -2893,6 +3140,13 @@ class App(tk.Tk):
                 self.ui_q.put(("error", out.strip() or "Ошибка net use"))
         threading.Thread(target=work, daemon=True, name="net-use").start()
 
+    def rename(self):
+        if self.rename_dialog and self.rename_dialog.winfo_exists():
+            self.rename_dialog.lift()
+            return
+        self.show()
+        self.rename_dialog = RenameDialog(self)
+
     def logout(self):
         if not messagebox.askyesno(APP_TITLE, "Отключить этот компьютер от сети компании?\n"
                                               "Для повторного входа понадобится пароль подключения.", parent=self):
@@ -3043,7 +3297,7 @@ def selftest() -> int:
         root = tk.Tk()
         root.withdraw()
         setup_style(root)
-        make_signal_image(True)
+        make_link_images()
         version = root.tk.call("info", "patchlevel")
         root.destroy()
         return f"Tcl/Tk {version}"

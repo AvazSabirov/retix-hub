@@ -366,6 +366,27 @@ class TestCabinet:
         cab.post(f"/cabinet/devices/{d['device_id']}/rename", data={"value": "Новое имя"})
         assert ctx.api.get("/api/me", headers=ctx.h(d["token"])).json()["device_name"] == "Новое имя"
 
+    def test_rename_from_client(self, ctx):
+        ctx.company("firma1")
+        d = ctx.register("firma1", "старое"); other = ctx.register("firma1", "сосед")
+        h = ctx.h(d["token"])
+        assert ctx.api.post("/api/rename", headers=h, json={"name": "  \t "}).status_code == 400
+        assert ctx.api.post("/api/rename", headers=h, json={"name": "x" * 65}).status_code == 422
+        r = ctx.api.post("/api/rename", headers=h, json={"name": " Склад\n  №2 "})
+        assert r.status_code == 200 and r.json()["device_name"] == "Склад №2"
+        assert ctx.api.get("/api/me", headers=h).json()["device_name"] == "Склад №2"
+        names = {p["name"] for p in ctx.api.get("/api/peers", headers=ctx.h(other["token"])).json()["peers"]}
+        assert names == {"Склад №2", "сосед"}
+        from app import db
+        assert db.connect().execute("SELECT COUNT(*) FROM audit_log WHERE action='device_rename_self'").fetchone()[0] == 1
+        assert ctx.api.post("/api/rename", json={"name": "чужой"}).status_code == 401
+
+    def test_rename_from_client_blocked(self, ctx):
+        ctx.company("firma1")
+        d = ctx.register("firma1", "старое")
+        ctx.cabinet("firma1").post(f"/cabinet/devices/{d['device_id']}/block")
+        assert ctx.api.post("/api/rename", headers=ctx.h(d["token"]), json={"name": "новое"}).status_code == 403
+
     def test_unknown_action(self, ctx):
         ctx.company("firma1")
         d = ctx.register("firma1")

@@ -42,6 +42,11 @@ def clean_hostname(name: str) -> str:
     return HOSTNAME_RE.sub("", name or "")[:63]
 
 
+def clean_device_name(name: str) -> str:
+    """Имя ПК в сети компании: без управляющих символов, пробелы схлопнуты, до 64 символов."""
+    return " ".join("".join(ch for ch in (name or "") if ch.isprintable()).split())[:64]
+
+
 def clean_ports(ports: str) -> str | None:
     ports = (ports or "").replace(" ", "")
     if not PORTS_RE.match(ports) or any(not 0 < int(p) < 65536 for p in ports.split(",")):
@@ -55,6 +60,18 @@ def is_online(dev) -> bool:
     now = time.time()
     return (bool(dev["last_handshake"]) and now - dev["last_handshake"] < ONLINE_SECONDS
             and now - dev["last_rx_at"] < OFFLINE_AFTER_SECONDS)
+
+
+# Для прямого пути — терпимее, чем для отметки «в сети»: один потерянный keepalive (25 с) плюс интервал опроса
+# wg (10 с) уже давали паузу больше OFFLINE_AFTER_SECONDS, сервер на один ответ переставал называть соседа,
+# и работающий прямой путь закрывался у обоих ПК.
+DIRECT_RX_GRACE = 120   # сек
+
+
+def online_for_direct(dev) -> bool:
+    now = time.time()
+    return (bool(dev["last_handshake"]) and now - dev["last_handshake"] < ONLINE_SECONDS
+            and now - dev["last_rx_at"] < max(OFFLINE_AFTER_SECONDS, DIRECT_RX_GRACE))
 
 
 def device_status(dev) -> str:
@@ -181,7 +198,7 @@ def direct_neighbors(conn, dev, company) -> list[dict]:
     rows = conn.execute("SELECT * FROM devices WHERE company_id=? AND id<>? AND is_blocked=0 AND is_approved=1 "
                         "AND token_hash IS NOT NULL ORDER BY id", (company["id"], dev["id"])).fetchall()
     for o in rows:
-        if not is_online(o) or not _lan_ready(o, now):
+        if not online_for_direct(o) or not _lan_ready(o, now):
             continue
         theirs = [t for t in _lan(o) if t.ip not in my_ips]
         their_pub = _public_ip(o["endpoint"])
@@ -220,7 +237,8 @@ def wan_neighbors(conn, dev, company) -> list[dict]:
                         "AND token_hash IS NOT NULL ORDER BY id", (company["id"], dev["id"])).fetchall()
     for o in rows:
         theirs = _internet_endpoint(o["endpoint"])
-        if not theirs or _public_ip(theirs) == _public_ip(mine) or not is_online(o) or not _wan_ready(o, now):
+        if not theirs or _public_ip(theirs) == _public_ip(mine) or not online_for_direct(o) \
+                or not _wan_ready(o, now):
             continue                                    # тот же внешний IP — это один офис (direct_neighbors)
         result.append({"id": o["id"], "public_key": o["public_key"], "ip": o["ip"], "endpoints": [theirs]})
     return result
@@ -382,7 +400,7 @@ def device_action(conn, company_id: int, device_id: int, action: str, value: str
             conn.execute("UPDATE devices SET speed_limit=? WHERE id=?", (mbit, device_id))
             msg = f"{dev['name']}: скорость через сервер " + (f"до {mbit} Мбит/с" if mbit else "без ограничения")
         elif action == "rename":
-            name = (value or "").strip()[:64]
+            name = clean_device_name(value)
             if not name:
                 raise ValueError("Пустое имя")
             conn.execute("UPDATE devices SET name=? WHERE id=?", (name, device_id))
