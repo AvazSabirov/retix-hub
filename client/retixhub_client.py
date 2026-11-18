@@ -37,7 +37,7 @@ import requests
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
 
-VERSION = "1.0.16"
+VERSION = "1.0.17"
 APP_NAME = "RetixHub"          # служебное имя: папки, задачи, мьютекс
 APP_TITLE = "Retix Hub"        # то, что видит пользователь
 TUNNEL = "retixhub"
@@ -1030,6 +1030,34 @@ REMOTE_MODES = ("ask", "auto")
 REMOTE_PW_RE = re.compile(r"^[A-Za-z0-9]{12,64}$")
 
 
+def run_rd(args: list, timeout: int = 30) -> tuple[int, str]:
+    """Команда rustdesk.exe. Не как run(): RustDesk запускает свои процессы (служба, значок у часов), и они
+    наследуют каналы вывода — subprocess.run ждал бы их закрытия вечно, даже после таймаута (так в 1.0.16
+    висел весь цикл программы, и сеть переставала обслуживаться). Здесь вывод — во временный файл,
+    ждём только сам процесс и не дольше timeout."""
+    import tempfile
+    try:
+        with tempfile.TemporaryFile() as out:
+            p = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT,
+                                 creationflags=CREATE_NO_WINDOW)
+            try:
+                code = p.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                p.kill()
+                log.warning("RustDesk: %s не ответил за %d с", " ".join(map(str, args[1:2])), timeout)
+                return -1, "timeout"
+            out.seek(0)
+            data = out.read()
+    except OSError as e:
+        return -1, str(e)
+    for enc in ("utf-8", "cp866", "cp1251"):
+        try:
+            return code, data.decode(enc)
+        except UnicodeDecodeError:
+            pass
+    return code, data.decode("utf-8", "replace")
+
+
 def rustdesk_exe() -> Path | None:
     return RUSTDESK_EXE if RUSTDESK_EXE.is_file() else None
 
@@ -1047,7 +1075,7 @@ def install_rustdesk() -> bool:
         log.warning("RustDesk: установщик rustdesk-*.exe рядом с программой не найден")
         return False
     log.info("ставлю %s", setup.name)
-    run([str(setup), "--silent-install"], timeout=300)
+    run_rd([str(setup), "--silent-install"], timeout=900)   # в своём потоке: сеть не ждёт
     for _ in range(30):
         if rustdesk_exe():
             return True
@@ -1076,8 +1104,8 @@ def rustdesk_options(mode: str, subnet: str, server_ip: str, port: int = REMOTE_
 def configure_rustdesk(exe: Path, options: dict[str, str]) -> bool:
     """Записать настройки через службу RustDesk. True — служба подтвердила главную (прямой доступ)."""
     for key, value in options.items():
-        run([str(exe), "--option", key, value], timeout=30)
-    code, out = run([str(exe), "--option", "direct-server"], timeout=30)
+        run_rd([str(exe), "--option", key, value])
+    code, out = run_rd([str(exe), "--option", "direct-server"])
     got = out.strip().splitlines()[-1].strip() if out.strip() else ""
     if got != options["direct-server"]:
         log.warning("RustDesk: настройки не применились (служба не запущена?): %r", out.strip()[:200])
@@ -1086,7 +1114,7 @@ def configure_rustdesk(exe: Path, options: dict[str, str]) -> bool:
 
 
 def set_rustdesk_password(exe: Path, password: str) -> bool:
-    code, out = run([str(exe), "--password", password], timeout=30)
+    code, out = run_rd([str(exe), "--password", password])
     if "Done" in out:
         return True
     log.warning("RustDesk: пароль не установлен: %s", out.strip()[:200])
@@ -1135,7 +1163,7 @@ def disable_remote() -> None:
     """Удалённое управление выключено (в кабинете, выход из сети): RustDesk больше не принимает подключения."""
     exe = rustdesk_exe()
     if exe:
-        run([str(exe), "--option", "direct-server", "N"], timeout=30)
+        run_rd([str(exe), "--option", "direct-server", "N"])
     run(["netsh", "advfirewall", "firewall", "delete", "rule", f"name={FW_RULE_REMOTE}"])
     log.info("удалённое управление выключено")
 
@@ -1146,7 +1174,7 @@ def uninstall_remote(state: "State") -> None:
     exe = rustdesk_exe()
     if exe and state.get("rustdesk_by_retix"):
         log.info("удаляю RustDesk")
-        run([str(exe), "--uninstall"], timeout=300)
+        run_rd([str(exe), "--uninstall"], timeout=300)
     elif exe and state.get("remote_applied"):
         disable_remote()
     remove_remote_firewall()
@@ -1494,6 +1522,7 @@ class Worker(threading.Thread):
         self.remote_applied_at = 0.0
         self.remote_pw_force = False             # RustDesk только что настроен — нужен свой пароль
         self.remote_session_checked = 0.0        # когда последний раз смотрели, идёт ли сеанс RustDesk
+        self.remote_job: threading.Thread | None = None   # установка и настройка RustDesk — в своём потоке
         self.last_peers: list[dict] = []         # список компьютеров с последнего ответа сервера
         # шаг цикла и смена компании (вход, переключение, выход) не идут одновременно
         self.op_lock = threading.RLock()
@@ -1660,9 +1689,32 @@ class Worker(threading.Thread):
         except ServerUnreachable:
             return None, "Сервер недоступен: без него подключение не разрешается."
 
+    REMOTE_ASYNC = True   # в тестах — False: работа с RustDesk сразу, в том же потоке
+
     def _remote_step(self, now: float):
-        """Удалённое управление (RustDesk): ставит и настраивает его по режиму из кабинета компании."""
+        """Удалённое управление (RustDesk). Установка и команды rustdesk.exe идут в отдельном потоке: основной
+        цикл (туннель, прямые пути, список ПК) никогда их не ждёт, что бы ни случилось с RustDesk."""
         remote = self.cfg.get("remote") if isinstance(self.cfg.get("remote"), dict) else {}
+        if remote.get("mode") not in REMOTE_MODES and not self.state.get("remote_applied"):
+            self.remote_ok = False   # выключено и ничего не настроено — делать нечего
+            return
+        if not self.REMOTE_ASYNC:
+            self._remote_work(now, self.cfg)
+            return
+        if self.remote_job and self.remote_job.is_alive():
+            return                   # прошлая работа с RustDesk ещё идёт — не ждём её
+        cfg = dict(self.cfg)
+        self.remote_job = threading.Thread(target=self._remote_job, args=(now, cfg), daemon=True, name="rustdesk")
+        self.remote_job.start()
+
+    def _remote_job(self, now: float, cfg: dict):
+        try:
+            self._remote_work(now, cfg)
+        except Exception:  # noqa: BLE001
+            log.exception("удалённое управление")
+
+    def _remote_work(self, now: float, cfg: dict):
+        remote = cfg.get("remote") if isinstance(cfg.get("remote"), dict) else {}
         mode = remote.get("mode") if remote.get("mode") in REMOTE_MODES else "off"
         if mode == "off":
             if self.state.get("remote_applied"):
@@ -1681,10 +1733,10 @@ class Worker(threading.Thread):
         if not exe:
             self.remote_ok = False
             return
-        want = f"{mode}|{self.cfg['subnet']}|{self.cfg['server_ip']}|{port}"
+        want = f"{mode}|{cfg['subnet']}|{cfg['server_ip']}|{port}"
         if want != self.state.get("remote_applied") or now - self.remote_applied_at > REMOTE_REAPPLY:
-            ensure_remote_firewall(self.cfg["subnet"], port, exe)
-            ok = configure_rustdesk(exe, rustdesk_options(mode, self.cfg["subnet"], self.cfg["server_ip"], port))
+            ensure_remote_firewall(cfg["subnet"], port, exe)
+            ok = configure_rustdesk(exe, rustdesk_options(mode, cfg["subnet"], cfg["server_ip"], port))
             self.remote_applied_at = now
             if not ok:
                 self.state.set(remote_applied="")

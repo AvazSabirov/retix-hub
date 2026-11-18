@@ -1672,6 +1672,8 @@ def fake_rustdesk(monkeypatch, patch_windows):
                 return 0, "Done!\n"
         return 0, ""
     monkeypatch.setattr(rc, "run", run)
+    monkeypatch.setattr(rc, "run_rd", run)
+    monkeypatch.setattr(rc.Worker, "REMOTE_ASYNC", False)   # в тестах — сразу, без своего потока
     monkeypatch.setattr(rc, "rustdesk_exe", lambda: FAKE_RUSTDESK if RD_NOW["rd"] and RD_NOW["rd"].installed else None)
     monkeypatch.setattr(rc, "rustdesk_session_active", lambda port=rc.REMOTE_PORT: RD_NOW["rd"].sessions)
     yield patch_windows
@@ -1790,3 +1792,34 @@ def test_rustdesk_helpers(tmp_path, monkeypatch):
     assert rc.rustdesk_installer().name == "rustdesk-1.10.0-x86_64.exe"       # самая новая версия
     assert not rc.remote_menu_allowed({"remote": True}, {"remote": {"mode": "off"}})
     assert not rc.remote_menu_allowed({"remote": True}, {})                    # старый сервер
+
+
+def test_run_rd_does_not_wait_for_children():
+    """1.0.17: rustdesk.exe --silent-install запускает службу и значок у часов, они наследуют вывод.
+    subprocess.run с каналами ждал их вечно (и после таймаута) — висел весь цикл программы."""
+    t = time.time()
+    code, out = rc.run_rd(["sh", "-c", "(sleep 20 &); echo Done!"], timeout=10)
+    assert code == 0 and "Done!" in out and time.time() - t < 5
+    t = time.time()
+    assert rc.run_rd(["sleep", "20"], timeout=1) == (-1, "timeout") and time.time() - t < 5
+
+
+def test_remote_work_never_blocks_main_loop(make_client, company, monkeypatch):
+    """RustDesk завис (установка, служба не отвечает) — основной цикл идёт дальше, второй раз не запускается."""
+    import threading
+    release, started = threading.Event(), []
+
+    def stuck(now, cfg):
+        started.append(1)
+        release.wait(30)
+    monkeypatch.setattr(rc.Worker, "_remote_work", lambda self, now, cfg: stuck(now, cfg))
+    company.cab.post(BASE + "/cabinet/settings", data={"share_name": "share", "share_ports": "445",
+                                                       "remote_mode": "auto"})
+    c = make_client("PC1"); login(c, company, name="Касса")
+    t = time.time()
+    assert c.step(3)["status"] == rc.Status.ONLINE and time.time() - t < 10
+    assert started == [1]                       # пока прошлая работа идёт — новую не начинаем
+    release.set(); c.w.remote_job.join(5)
+    c.step()
+    assert len(started) == 2
+    release.set()
