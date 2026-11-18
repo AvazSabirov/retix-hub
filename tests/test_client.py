@@ -2001,3 +2001,29 @@ def test_stop_service_mark_cleared_before_install(tmp_path, monkeypatch):
     monkeypatch.setattr(rc.time, "sleep", lambda s: None)
     rc.install_rustdesk()
     assert calls and "stop-service" not in calls[0]                        # к началу установки отметки уже нет
+
+
+def test_menu_repair_rustdesk(make_client, company, fake_rustdesk, patch_windows, monkeypatch, tmp_path):
+    """Меню «Управление»: установить/запустить службу RustDesk и переустановить RustDesk."""
+    rd = FakeRustDesk()
+    c = make_client("PC1"); login(c, company, name="Касса"); step_as(c, rd)
+    RD_NOW["rd"] = rd
+    installs = []
+    monkeypatch.setattr(rc, "install_rustdesk", lambda: installs.append(1) or setattr(rd, "service", "running") or True)
+    monkeypatch.setattr(rc, "rustdesk_installer", lambda: tmp_path / "rustdesk-1.5.3-x86_64.exe")
+
+    assert c.w.repair_rustdesk() == (True, "RustDesk работает, служба запущена.") and installs == []
+    rd.service = "stopped"
+    assert c.w.repair_rustdesk() == (True, "Служба RustDesk запущена.") and ["sc", "start", "RustDesk"] in patch_windows
+    rd.service = "missing"
+    ok, text = c.w.repair_rustdesk()
+    assert ok and installs == [1] and c.state.get("rustdesk_by_retix") is True
+    ok, text = c.w.repair_rustdesk(reinstall=True)                      # работает — всё равно переставить
+    assert ok and installs == [1, 1] and text == "RustDesk установлен, служба работает."
+    # RustDesk после починки никуда, кроме сети Retix Hub, не ходит — даже если удалённое управление выключено
+    assert any("RetixHub RustDesk only VPN (out)" in " ".join(a) and "action=block" in " ".join(a) for a in patch_windows)
+    assert "Служба RustDesk:  работает" in c.w.rustdesk_status() and "Управлять этим ПК:  нельзя" in c.w.rustdesk_status()
+    monkeypatch.setattr(rc, "rustdesk_installer", lambda: None)
+    rd.service = "missing"
+    ok, text = c.w.repair_rustdesk()
+    assert not ok and "Установщика RustDesk нет" in text
