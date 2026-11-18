@@ -1,11 +1,12 @@
 """API для Windows-клиента."""
 import json
 import time
+import zlib
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel, Field
 
-from .. import db, services, updates, wg
+from .. import db, services, telegram, updates, wg
 from ..auth import RateLimiter, check_pw, client_ip, limiter, new_token, sha256
 from ..config import REMOTE_PORT, TOKEN_ROTATE_SECONDS
 
@@ -39,6 +40,11 @@ MESSAGES_PER_MINUTE = 30
 MESSAGES_KEEP_DAYS = 7
 
 
+class NicIn(BaseModel):
+    addr: str = Field(default="", max_length=43)   # 192.168.1.15/24
+    mac: str = Field(default="", max_length=17)
+
+
 class HeartbeatIn(BaseModel):
     client_version: str = Field(default="", max_length=32)
     # прямой путь по локальной сети (клиенты 1.0.11+): адреса ПК в локальной сети, порт WireGuard
@@ -54,6 +60,12 @@ class HeartbeatIn(BaseModel):
     remote_ok: bool | None = None
     # клиент 1.0.18+: как пользователь ПК разрешил управлять своим компьютером ('' — как администратор)
     remote_local: str | None = Field(default=None, pattern="^(|ask|own|off)$")
+    # клиент 1.0.21+: сетевые карты (адрес в локальной сети и MAC) — для включения по сети. Нет поля — прежние
+    nics: list[NicIn] | None = Field(default=None, max_length=services.NICS_MAX)
+
+
+class WakeIn(BaseModel):
+    to: int
 
 
 class RemotePasswordIn(BaseModel):
@@ -75,12 +87,15 @@ def _token_reused(conn, device_id: int, now: int) -> None:
         dev = conn.execute("SELECT * FROM devices WHERE id=?", (device_id,)).fetchone()
         if not dev:
             return
+        was_active = services.device_status(dev) == "active"
         services.revoke_tokens(conn, "id=?", (device_id,))
         conn.execute("UPDATE devices SET is_approved=0 WHERE id=?", (device_id,))
         services.audit(conn, dev["company_id"], "token_reuse",
                        f"{dev['name']} {dev['ip']}: токен использован на двух ПК, ждёт одобрения")
         conn.commit()
         services.reconcile(conn)
+    if was_active:   # копия стучится снова и снова — в группу только первый раз
+        telegram.notify_pending(conn, device_id, "token_reuse")
 
 
 def current_device(request: Request, response: Response, conn=Depends(db.get_db)):
@@ -178,6 +193,8 @@ def register(data: RegisterIn, request: Request, conn=Depends(db.get_db)):
             services.audit(conn, company["id"], "device_register", f"{name} {new_ip} from {ip}")
         conn.commit()
         services.reconcile(conn)
+    if not existing:
+        telegram.notify_pending(conn, dev_id, "new", ip)   # ждёт одобрения — запрос в группу компании
 
     dev = conn.execute("SELECT * FROM devices WHERE id=?", (dev_id,)).fetchone()
     return {"token": token, **services.client_config(conn, dev, company)}
@@ -186,7 +203,9 @@ def register(data: RegisterIn, request: Request, conn=Depends(db.get_db)):
 @router.get("/me")
 def me(ctx=Depends(current_device)):
     conn, dev, company = ctx
-    return services.client_config(conn, dev, company)
+    cfg = services.client_config(conn, dev, company)
+    cfg["wake"] = services.take_wake_jobs(conn, dev)   # разбудить выключенные ПК своей локальной сети
+    return cfg
 
 
 @router.get("/peers")
@@ -213,6 +232,8 @@ def peers(ctx=Depends(current_device)):
             # к нему можно подключиться через RustDesk (и этому ПК разрешено управлять)
             "remote": me_controls and bool(d["remote_ok"]) and d["remote_effective"] != "off",
             "remote_mode": d["remote_effective"] if me_controls else "off",
+            # выключен, но его можно включить по сети (этому ПК разрешено управлять)
+            "wake": me_controls and not d["online"] and d["wol_ready"] and d["id"] != dev["id"],
             "is_me": d["id"] == dev["id"],
         })
     return {"company": company["name"] or company["login"], "peers": result, "peers_hidden": hidden}
@@ -306,6 +327,11 @@ def heartbeat(data: HeartbeatIn, ctx=Depends(current_device)):
         conn.execute("UPDATE devices SET radmin_server=? WHERE id=?", (1 if data.radmin_server else 0, dev["id"]))
     if data.remote_ok is not None:
         conn.execute("UPDATE devices SET remote_ok=? WHERE id=?", (1 if data.remote_ok else 0, dev["id"]))
+    if data.nics is not None:
+        nics = services.clean_nics([n.model_dump() for n in data.nics])
+        if nics:   # пусто (карты не прочитались) — оставляем последние известные: по ним ПК и будят
+            conn.execute("UPDATE devices SET nics=?, nics_at=? WHERE id=?",
+                         (json.dumps(nics), int(time.time()), dev["id"]))
     if data.remote_local is not None and data.remote_local != dev["remote_local"]:
         conn.execute("UPDATE devices SET remote_local=? WHERE id=?", (data.remote_local, dev["id"]))
         if data.remote_local:   # не «как администратор» — пароль сервера больше не действует
@@ -373,3 +399,52 @@ def remote_connect(data: RemoteConnectIn, ctx=Depends(current_device)):
                        f"{' (файлы)' if data.kind == 'files' else ''}")
         conn.commit()
     return {"ip": target["ip"], "port": REMOTE_PORT, "mode": mode, "password": password, "name": target["name"]}
+
+
+@router.post("/wake")
+def wake(data: WakeIn, ctx=Depends(current_device)):
+    """Включить выключенный ПК своей компании по сети (Wake-on-LAN): может ПК с правом «управляет»."""
+    conn, dev, company = ctx
+    _require_active(dev)
+    if not dev["show_peers"]:
+        raise HTTPException(403, "Администратор компании не дал этому компьютеру доступ к другим компьютерам")
+    if not services.can_control(dev, company):
+        raise HTTPException(403, "Включать компьютеры по сети могут только ПК, которым администратор разрешил "
+                                 "управлять другими, пока в компании включено удалённое управление")
+    if data.to == dev["id"]:
+        raise HTTPException(404, "Компьютер не найден")
+    remote_limiter.check(str(dev["id"]))
+    remote_limiter.fail(str(dev["id"]))
+    try:
+        msg = services.wake_device(conn, company, data.to, f"{dev['name']} {dev['ip']}")
+    except LookupError:
+        raise HTTPException(404, "Компьютер не найден") from None
+    except ValueError as e:
+        raise HTTPException(409, str(e)) from None
+    return {"ok": True, "message": msg}
+
+
+# ---------- журнал программы по запросу администратора ----------
+
+@router.post("/log")
+async def upload_log(request: Request, ctx=Depends(current_device)):
+    """ПК присылает свой журнал (gzip), когда администратор его запросил (log_request в /api/me)."""
+    conn, dev, _ = ctx
+    if not dev["log_requested_at"]:
+        raise HTTPException(409, "Журнал не запрашивали")
+    if int(request.headers.get("content-length") or 0) > services.LOG_UPLOAD_MAX:
+        raise HTTPException(413, "Журнал слишком большой")
+    body = await request.body()
+    if not body or len(body) > services.LOG_UPLOAD_MAX:
+        raise HTTPException(413 if body else 400, "Журнал слишком большой" if body else "Пустой журнал")
+    unzip = zlib.decompressobj(16 + zlib.MAX_WBITS)
+    try:
+        text = unzip.decompress(body, services.LOG_TEXT_MAX)
+    except zlib.error:
+        raise HTTPException(400, "Журнал не в формате gzip") from None
+    if unzip.unconsumed_tail:
+        raise HTTPException(413, "Журнал слишком большой")
+    if not unzip.eof:
+        raise HTTPException(400, "Журнал передан не полностью")
+    services.save_log(conn, dev, body, len(text))
+    return {"ok": True}

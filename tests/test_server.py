@@ -2,6 +2,7 @@
 import concurrent.futures
 import os
 import re
+import time
 
 import pytest
 
@@ -1712,3 +1713,576 @@ class TestPublishCli:
         from app import publish
         with pytest.raises(SystemExit):
             publish.main(["1.x"])
+
+
+# ---------------------------------------------------------------- Telegram-бот: запросы на подключение ПК
+
+@pytest.fixture()
+def tg(monkeypatch):
+    """Telegram-бот включён, Bot API подменён: что сервер отправил бы в Telegram."""
+    import queue
+    from app import telegram
+    sent = []
+
+    def fake_api(method, params=None, timeout=15, token=None):
+        sent.append((method, dict(params or {})))
+        return {"message_id": len(sent)} if method == "sendMessage" else True
+
+    monkeypatch.setattr(telegram, "TOKEN", "123:test")
+    monkeypatch.setattr(telegram, "bot_username", "RetixTestBot")
+    monkeypatch.setattr(telegram, "_api", fake_api)
+    monkeypatch.setattr(telegram, "_outbox", queue.Queue())
+
+    def flush():
+        telegram.drain()
+        out = list(sent)
+        sent.clear()
+        return out
+    return telegram, flush
+
+
+GROUP = {"id": -100500, "type": "supergroup", "title": "Касса офис"}
+IVAN = {"id": 7, "first_name": "Иван", "username": "ivan"}
+
+
+def _link_group(ctx, tg, login="firma1", chat=GROUP):
+    telegram, flush = tg
+    from app import db
+    cab = ctx.cabinet(login)
+    r = cab.post("/cabinet/telegram/link")
+    assert "Код создан" in r.text
+    conn = db.connect()
+    code = conn.execute("SELECT tg_link_code FROM companies WHERE login=?", (login,)).fetchone()[0]
+    assert f"https://t.me/RetixTestBot?startgroup={code}" in r.text and f"/link@RetixTestBot {code}" in r.text
+    telegram.handle_update(conn, {"update_id": 1, "message": {"chat": chat, "from": IVAN,
+                                                              "text": f"/start@RetixTestBot {code}"}})
+    conn.close()
+    return cab, flush()
+
+
+def _press(tg, data, chat=GROUP, user=IVAN, text="Новый компьютер ждёт одобрения"):
+    telegram, flush = tg
+    from app import db
+    conn = db.connect()
+    telegram.handle_update(conn, {"update_id": 2, "callback_query": {
+        "id": "cb1", "from": user, "data": data,
+        "message": {"message_id": 55, "chat": chat, "text": text}}})
+    conn.close()
+    return flush()
+
+
+class TestTelegram:
+    def test_link_group_and_approve_by_button(self, ctx, tg):
+        cid = ctx.company("firma1", approval=True)
+        cab, out = _link_group(ctx, tg)
+        assert out[0][0] == "sendMessage" and out[0][1]["chat_id"] == -100500
+        assert "Группа подключена к компании" in out[0][1]["text"]
+        page = cab.get("/cabinet").text
+        assert "Касса офис" in page and "Отключить группу" in page
+
+        pc = ctx.register("firma1", "Касса 1", hostname="KASSA-01")
+        out = tg[1]()
+        assert len(out) == 1
+        method, msg = out[0]
+        assert method == "sendMessage" and msg["chat_id"] == "-100500"
+        assert "Новый компьютер ждёт одобрения" in msg["text"] and "Касса 1" in msg["text"] and "KASSA-01" in msg["text"]
+        buttons = msg["reply_markup"]["inline_keyboard"][0]
+        assert [b["callback_data"] for b in buttons] == [f"ap:{pc['device_id']}", f"bl:{pc['device_id']}"]
+        assert ctx.api.get("/api/me", headers=ctx.h(pc["token"])).json()["status"] == "pending"
+
+        out = _press(tg, f"ap:{pc['device_id']}")
+        assert ("answerCallbackQuery", {"callback_query_id": "cb1", "text": "Одобрено", "show_alert": False}) in out
+        edit = next(p for m, p in out if m == "editMessageText")
+        assert "Одобрил: Иван (@ivan)" in edit["text"] and "reply_markup" not in edit
+        assert ctx.api.get("/api/me", headers=ctx.h(pc["token"])).json()["status"] == "active"
+        from app import db
+        log = [r[0] for r in db.connect().execute("SELECT details FROM audit_log WHERE company_id=? "
+                                                  "AND action='device_approve'", (cid,))]
+        assert any("Telegram: Иван (@ivan)" in d for d in log)
+        # вторая кнопка того же сообщения — уже решено, ничего не меняется
+        out = _press(tg, f"bl:{pc['device_id']}")
+        assert any(m == "answerCallbackQuery" and p["text"] == "Уже решено: одобрен" for m, p in out)
+        assert ctx.api.get("/api/me", headers=ctx.h(pc["token"])).json()["status"] == "active"
+
+    def test_block_button(self, ctx, tg):
+        ctx.company("firma1", approval=True)
+        _link_group(ctx, tg)
+        pc = ctx.register("firma1", "Чужой")
+        tg[1]()
+        _press(tg, f"bl:{pc['device_id']}")
+        assert ctx.api.get("/api/me", headers=ctx.h(pc["token"])).json()["status"] == "blocked"
+
+    def test_other_chat_cannot_approve(self, ctx, tg):
+        ctx.company("firma1", approval=True)
+        ctx.company("firma2", approval=True)
+        _link_group(ctx, tg, "firma1")
+        _link_group(ctx, tg, "firma2", chat={"id": -777, "type": "group", "title": "Другая"})
+        pc = ctx.register("firma1", "Касса")
+        tg[1]()
+        out = _press(tg, f"ap:{pc['device_id']}", chat={"id": -777, "type": "group"})
+        assert any(m == "answerCallbackQuery" and p["show_alert"] for m, p in out)
+        assert ctx.api.get("/api/me", headers=ctx.h(pc["token"])).json()["status"] == "pending"
+        out = _press(tg, "ap:abc")
+        assert out[0][1]["text"] == "Неизвестная кнопка"
+
+    def test_bad_codes_and_private_chat(self, ctx, tg):
+        telegram, flush = tg
+        from app import db
+        ctx.company("firma1", approval=True)
+        cab = ctx.cabinet("firma1")
+        cab.post("/cabinet/telegram/link")
+        conn = db.connect()
+        code = conn.execute("SELECT tg_link_code FROM companies").fetchone()[0]
+        telegram.handle_update(conn, {"message": {"chat": {"id": 5, "type": "private"}, "text": f"/start {code}"}})
+        assert "в личном чате" in flush()[0][1]["text"]
+        telegram.handle_update(conn, {"message": {"chat": GROUP, "text": "/link@RetixTestBot wrongcode123"}})
+        assert "Код не найден" in flush()[0][1]["text"]
+        telegram.handle_update(conn, {"message": {"chat": GROUP, "text": f"/link@OtherBot {code}"}})
+        assert flush() == []                                     # команда другому боту
+        conn.execute("UPDATE companies SET tg_link_at=tg_link_at-?", (telegram.LINK_TTL + 1,))
+        conn.commit()
+        telegram.handle_update(conn, {"message": {"chat": GROUP, "text": f"/link {code}"}})
+        assert "Код не найден" in flush()[0][1]["text"]
+        assert conn.execute("SELECT tg_chat_id FROM companies").fetchone()[0] == ""
+        assert "Подключить группу" in cab.get("/cabinet").text   # код устарел — снова кнопка
+
+    def test_no_group_no_messages(self, ctx, tg):
+        ctx.company("firma1", approval=True)
+        ctx.register("firma1", "PC")
+        assert tg[1]() == []
+        ctx.company("firma2")                                    # без одобрения — и запроса нет
+        _link_group(ctx, tg, "firma2")
+        ctx.register("firma2", "PC")
+        assert tg[1]() == []
+
+    def test_token_reuse_notifies_once(self, ctx, tg):
+        import time as _t
+        from app import db
+        ctx.company("firma1")
+        _link_group(ctx, tg)
+        pc = ctx.register("firma1", "Касса")
+        assert tg[1]() == []
+        conn = db.connect()
+        conn.execute("UPDATE devices SET token_set_at=?", (int(_t.time()) - 10_000,))
+        conn.commit()
+        r = ctx.api.get("/api/me", headers=ctx.h(pc["token"]))
+        new = r.headers["x-retix-token"]
+        ctx.api.get("/api/me", headers=ctx.h(new))               # перешёл на новый: старый — в истории
+        for _ in range(3):                                       # копия стучится со старым
+            assert ctx.api.get("/api/me", headers=ctx.h(pc["token"])).status_code == 401
+        out = tg[1]()
+        assert len(out) == 1 and "Вход скопирован на другой компьютер" in out[0][1]["text"]
+        assert out[0][1]["reply_markup"]["inline_keyboard"][0][0]["callback_data"] == f"ap:{pc['device_id']}"
+
+    def test_pending_command_lists_waiting(self, ctx, tg):
+        telegram, flush = tg
+        from app import db
+        ctx.company("firma1", approval=True)
+        ctx.register("firma1", "PC1")
+        ctx.register("firma1", "PC2")
+        _, out = _link_group(ctx, tg)
+        texts = [p["text"] for _, p in out]
+        assert sum("Ждёт одобрения" in t for t in texts) == 2   # после подключения — кто уже ждёт
+        conn = db.connect()
+        telegram.handle_update(conn, {"message": {"chat": GROUP, "text": "/pending@RetixTestBot"}})
+        assert len(flush()) == 2
+        telegram.handle_update(conn, {"message": {"chat": {"id": -1, "type": "group"}, "text": "/pending"}})
+        assert "не подключена" in flush()[0][1]["text"]
+
+    def test_bot_removed_and_group_migrated(self, ctx, tg):
+        telegram, flush = tg
+        from app import db
+        ctx.company("firma1", approval=True)
+        _link_group(ctx, tg)
+        conn = db.connect()
+        telegram.handle_update(conn, {"message": {"chat": {"id": -100500, "type": "group", "title": "Касса офис"},
+                                                  "migrate_to_chat_id": -100900}})
+        assert conn.execute("SELECT tg_chat_id FROM companies").fetchone()[0] == "-100900"
+        telegram.handle_update(conn, {"message": {"chat": {"id": -100900, "type": "supergroup", "title": "Кассы"},
+                                                  "text": "привет"}})
+        assert conn.execute("SELECT tg_chat_title FROM companies").fetchone()[0] == "Кассы"
+        telegram.handle_update(conn, {"my_chat_member": {"chat": {"id": -100900}, "from": IVAN,
+                                                         "new_chat_member": {"status": "kicked"}}})
+        assert conn.execute("SELECT tg_chat_id FROM companies").fetchone()[0] == ""
+        assert conn.execute("SELECT COUNT(*) FROM audit_log WHERE action='telegram_unlink'").fetchone()[0] == 1
+
+    def test_unlink_from_cabinet_and_admin(self, ctx, tg):
+        from app import db
+        cid = ctx.company("firma1", approval=True)
+        cab, _ = _link_group(ctx, tg)
+        r = cab.post("/cabinet/telegram/test")
+        assert "Проверочное сообщение" in r.text and "Проверка" in tg[1]()[0][1]["text"]
+        page = ctx.admin.get(f"/admin/companies/{cid}").text
+        assert "Касса офис" in page
+        r = ctx.admin.post(f"/admin/companies/{cid}/telegram/unlink")
+        assert "Группа Telegram отключена" in r.text
+        assert "отключена от компании" in tg[1]()[0][1]["text"]
+        assert db.connect().execute("SELECT tg_chat_id FROM companies").fetchone()[0] == ""
+        assert "Подключить группу" in cab.get("/cabinet").text
+        r = cab.post("/cabinet/telegram/test")
+        assert "не подключена" in r.text
+
+    def test_bot_not_configured(self, ctx):
+        from app import telegram
+        assert not telegram.enabled()
+        ctx.company("firma1")
+        cab = ctx.cabinet("firma1")
+        assert "Telegram-бот не настроен" in cab.get("/cabinet").text
+        assert "не настроен" in cab.post("/cabinet/telegram/link").text
+
+    def test_company_name_is_escaped(self, ctx, tg):
+        ctx.company("firma1", name="<b>x</b>&", approval=True)
+        _link_group(ctx, tg)
+        ctx.register("firma1", "<i>PC</i>")
+        text = tg[1]()[0][1]["text"]
+        assert "&lt;b&gt;x&lt;/b&gt;&amp;" in text and "&lt;i&gt;PC&lt;/i&gt;" in text
+
+    def test_deliver_retries_and_migrates(self, ctx, tg, monkeypatch):
+        telegram, _ = tg
+        from app import db
+        ctx.company("firma1", approval=True)
+        _link_group(ctx, tg)
+        calls = []
+
+        def api(method, params=None, timeout=15, token=None):
+            calls.append(params["chat_id"])
+            if len(calls) == 1:
+                raise telegram.TelegramError(429, "Too Many Requests", {"retry_after": 0})
+            if len(calls) == 2:
+                raise telegram.TelegramError(400, "group chat was upgraded", {"migrate_to_chat_id": -100777})
+            return {}
+        monkeypatch.setattr(telegram, "_api", api)
+        monkeypatch.setattr(telegram.time, "sleep", lambda s: None)
+        telegram.deliver("sendMessage", {"chat_id": "-100500", "text": "x"})
+        assert calls == ["-100500", "-100500", -100777]
+        assert db.connect().execute("SELECT tg_chat_id FROM companies").fetchone()[0] == "-100777"
+
+
+# ---------------------------------------------------------------- журнал программы с ПК
+
+def _gz(text: str) -> bytes:
+    import gzip
+    return gzip.compress(text.encode())
+
+
+class TestDeviceLog:
+    def test_request_upload_download(self, ctx):
+        cid = ctx.company("firma1")
+        cid2 = ctx.company("firma2")
+        pc = ctx.register("firma1", "Касса")
+        h = ctx.h(pc["token"])
+        assert ctx.api.get("/api/me", headers=h).json()["log_request"] is False
+        r = ctx.api.post("/api/log", headers=h, content=_gz("без запроса"))
+        assert r.status_code == 409                               # без запроса журнал не принимается
+        cab = ctx.cabinet("firma1")
+        r = cab.post(f"/cabinet/devices/{pc['device_id']}/log_request")
+        assert "Журнал Касса запрошен" in r.text and "журнал запрошен" in r.text and "ждём ответа ПК" in r.text
+        assert ctx.api.get("/api/me", headers=h).json()["log_request"] is True
+        assert ctx.api.post("/api/log", headers=h, content=b"not gzip").status_code == 400
+        assert ctx.api.post("/api/log", headers=h, content=_gz("x")[:-4]).status_code == 400
+        r = ctx.api.post("/api/log", headers=h, content=_gz("Retix Hub 1.0.21\nстрока журнала"))
+        assert r.status_code == 200
+        assert ctx.api.get("/api/me", headers=h).json()["log_request"] is False
+        page = cab.get("/cabinet").text
+        m = re.search(r'href="/cabinet/logs/(\d+)"', page)
+        assert m and "ждём ответа ПК" not in page
+        r = cab.get(f"/cabinet/logs/{m.group(1)}")
+        assert r.status_code == 200 and "строка журнала" in r.text
+        assert r.headers["content-disposition"].startswith('attachment; filename="retixhub-')
+        # чужая компания журнал не скачает, суперадмин — да
+        other = ctx.cabinet("firma2")
+        r = other.get(f"/cabinet/logs/{m.group(1)}")
+        assert "Журнал не найден" in r.text
+        r = ctx.admin.get(f"/admin/companies/{cid}/logs/{m.group(1)}")
+        assert "строка журнала" in r.text
+        assert "Журнал не найден" in ctx.admin.get(f"/admin/companies/{cid2}/logs/{m.group(1)}").text
+        assert "скачать" in ctx.admin.get(f"/admin/companies/{cid}").text
+        # второй раз без нового запроса — нельзя
+        assert ctx.api.post("/api/log", headers=h, content=_gz("ещё")).status_code == 409
+
+    def test_limits_and_keep_last(self, ctx):
+        from app import db, services
+        ctx.company("firma1")
+        pc = ctx.register("firma1", "Касса")
+        h = ctx.h(pc["token"])
+        cab = ctx.cabinet("firma1")
+        cab.post(f"/cabinet/devices/{pc['device_id']}/log_request")
+        bomb = _gz("0" * (services.LOG_TEXT_MAX + 10))           # маленький gzip, огромный текст
+        assert len(bomb) < services.LOG_UPLOAD_MAX
+        assert ctx.api.post("/api/log", headers=h, content=bomb).status_code == 413
+        big = os.urandom(services.LOG_UPLOAD_MAX + 1)
+        assert ctx.api.post("/api/log", headers=h, content=big).status_code == 413
+        for i in range(services.LOG_KEEP + 2):
+            cab.post(f"/cabinet/devices/{pc['device_id']}/log_request")
+            assert ctx.api.post("/api/log", headers=h, content=_gz(f"журнал {i}")).status_code == 200
+        rows = db.connect().execute("SELECT data FROM device_logs ORDER BY id").fetchall()
+        import gzip
+        assert [gzip.decompress(r[0]).decode() for r in rows] == [f"журнал {i}" for i in range(2, services.LOG_KEEP + 2)]
+
+    def test_pending_device_can_send_log_and_delete_cascades(self, ctx):
+        from app import db
+        ctx.company("firma1", approval=True)
+        pc = ctx.register("firma1", "Новый")
+        cab = ctx.cabinet("firma1")
+        cab.post(f"/cabinet/devices/{pc['device_id']}/log_request")
+        assert ctx.api.post("/api/log", headers=ctx.h(pc["token"]), content=_gz("ждёт")).status_code == 200
+        cab.post(f"/cabinet/devices/{pc['device_id']}/delete")
+        assert db.connect().execute("SELECT COUNT(*) FROM device_logs").fetchone()[0] == 0
+
+
+# ---------------------------------------------------------------- включение по сети (Wake-on-LAN)
+
+class TestWakeOnLan:
+    @staticmethod
+    def _online(*devs, endpoint="203.0.113.7:40000"):
+        import time as _t
+        from app import db
+        conn = db.connect()
+        now = int(_t.time())
+        for d in devs:
+            conn.execute("UPDATE devices SET last_handshake=?, last_rx_at=?, endpoint=? WHERE id=?",
+                         (now, now, endpoint, d["device_id"]))
+        conn.commit()
+
+    @staticmethod
+    def _offline(*devs):
+        from app import db
+        conn = db.connect()
+        for d in devs:
+            conn.execute("UPDATE devices SET last_handshake=0, last_rx_at=0 WHERE id=?", (d["device_id"],))
+        conn.commit()
+
+    def _office(self, ctx, remote="auto"):
+        ctx.company("firma1")
+        cab = ctx.cabinet("firma1")
+        cab.post("/cabinet/settings", data={"share_name": "share", "share_ports": "445", "remote_mode": remote})
+        kassa = ctx.register("firma1", "Касса")
+        sklad = ctx.register("firma1", "Склад")
+        for pc, addr, mac in ((kassa, "192.168.1.20/24", "aa-bb-cc-dd-ee-01"),
+                              (sklad, "192.168.1.30/24", "AA:BB:CC:DD:EE:02")):
+            r = ctx.api.post("/api/heartbeat", headers=ctx.h(pc["token"]),
+                             json={"client_version": "1.0.21", "nics": [{"addr": addr, "mac": mac}]})
+            assert r.status_code == 200
+        self._online(kassa, sklad)
+        self._offline(kassa)
+        return cab, kassa, sklad
+
+    def test_cabinet_wakes_through_neighbor(self, ctx):
+        cab, kassa, sklad = self._office(ctx)
+        assert ctx.api.get("/api/me", headers=ctx.h(sklad["token"])).json()["wol"] is True
+        page = cab.get("/cabinet").text
+        assert f'/cabinet/devices/{kassa["device_id"]}/wake' in page
+        assert f'/cabinet/devices/{sklad["device_id"]}/wake' not in page        # он в сети
+        r = cab.post(f"/cabinet/devices/{kassa['device_id']}/wake")
+        assert "Команда включения Касса отправлена через Склад" in r.text
+        me = ctx.api.get("/api/me", headers=ctx.h(sklad["token"])).json()
+        assert me["wake"] == [{"id": kassa["device_id"], "name": "Касса", "mac": "AA:BB:CC:DD:EE:01",
+                               "broadcast": "192.168.1.255"}]
+        assert ctx.api.get("/api/me", headers=ctx.h(sklad["token"])).json()["wake"] == []   # один раз
+        assert "уже отправлена" in cab.post(f"/cabinet/devices/{kassa['device_id']}/wake").text
+        from app import db
+        assert db.connect().execute("SELECT details FROM audit_log WHERE action='device_wake'").fetchone()[0] \
+            == f"Касса {kassa['ip']} через Склад (кабинет)"
+
+    def test_wake_refused(self, ctx):
+        from app import db
+        cab, kassa, sklad = self._office(ctx)
+        r = cab.post(f"/cabinet/devices/{sklad['device_id']}/wake")
+        assert "уже в сети" in r.text
+        conn = db.connect()
+        conn.execute("UPDATE devices SET nics=? WHERE id=?",
+                     ('[{"addr": "10.0.5.30/24", "mac": "AA:BB:CC:DD:EE:02"}]', sklad["device_id"]))
+        conn.commit()
+        assert "Некому включить Касса" in cab.post(f"/cabinet/devices/{kassa['device_id']}/wake").text
+        conn.execute("UPDATE devices SET nics='' WHERE id=?", (kassa["device_id"],))
+        conn.commit()
+        assert "MAC-адрес Касса ещё неизвестен" in cab.post(f"/cabinet/devices/{kassa['device_id']}/wake").text
+        cab.post("/cabinet/settings", data={"share_name": "share", "share_ports": "445", "remote_mode": "off"})
+        r = cab.post(f"/cabinet/devices/{kassa['device_id']}/wake")
+        assert "когда в компании включено удалённое управление" in r.text
+        assert ctx.api.get("/api/me", headers=ctx.h(sklad["token"])).json()["wol"] is False
+        assert f'/devices/{kassa["device_id"]}/wake' not in cab.get("/cabinet").text
+
+    def test_helper_must_be_fresh_and_same_office_first(self, ctx):
+        from app import db, services
+        cab, kassa, sklad = self._office(ctx)
+        third = ctx.register("firma1", "Офис-2")
+        ctx.api.post("/api/heartbeat", headers=ctx.h(third["token"]),
+                     json={"nics": [{"addr": "192.168.1.40/24", "mac": "AA:BB:CC:DD:EE:03"}]})
+        self._online(third, endpoint="198.51.100.9:40000")      # другой офис, та же 192.168.1.0/24
+        conn = db.connect()
+        conn.execute("UPDATE devices SET endpoint='203.0.113.7:40000' WHERE id=?", (kassa["device_id"],))
+        conn.commit()
+        company = conn.execute("SELECT * FROM companies").fetchone()
+        target = conn.execute("SELECT * FROM devices WHERE id=?", (kassa["device_id"],)).fetchone()
+        assert [h["name"] for h, _ in services.wake_helpers(conn, target, company)] == ["Склад", "Офис-2"]
+        conn.execute("UPDATE devices SET nics_at=nics_at-? WHERE id=?",
+                     (services.WOL_HELPER_FRESH + 1, sklad["device_id"]))
+        conn.commit()
+        assert [h["name"] for h, _ in services.wake_helpers(conn, target, company)] == ["Офис-2"]
+
+    def test_pc_with_control_can_wake(self, ctx):
+        cab, kassa, sklad = self._office(ctx)
+        r = ctx.api.post("/api/wake", headers=ctx.h(sklad["token"]), json={"to": kassa["device_id"]})
+        assert r.status_code == 403
+        peers = ctx.api.get("/api/peers", headers=ctx.h(sklad["token"])).json()["peers"]
+        assert next(p for p in peers if p["name"] == "Касса")["wake"] is False
+        cab.post(f"/cabinet/devices/{sklad['device_id']}/control_on")
+        peers = ctx.api.get("/api/peers", headers=ctx.h(sklad["token"])).json()["peers"]
+        assert next(p for p in peers if p["name"] == "Касса")["wake"] is True
+        assert next(p for p in peers if p["name"] == "Склад")["wake"] is False
+        r = ctx.api.post("/api/wake", headers=ctx.h(sklad["token"]), json={"to": kassa["device_id"]})
+        assert r.status_code == 200 and "отправлена через Склад" in r.json()["message"]
+        assert ctx.api.post("/api/wake", headers=ctx.h(sklad["token"]), json={"to": 99999}).status_code == 404
+        assert ctx.api.post("/api/wake", headers=ctx.h(sklad["token"]),
+                            json={"to": sklad["device_id"]}).status_code == 404
+
+    def test_other_company_cannot_wake(self, ctx):
+        cab, kassa, sklad = self._office(ctx)
+        ctx.company("firma2")
+        other = ctx.cabinet("firma2")
+        assert "Устройство не найдено" in other.post(f"/cabinet/devices/{kassa['device_id']}/wake").text
+
+    def test_clean_nics(self):
+        from app import services
+        assert services.clean_nics([
+            {"addr": "192.168.1.5/24", "mac": "aa-bb-cc-dd-ee-ff"},
+            {"addr": "192.168.1.5/24", "mac": "AA:BB:CC:DD:EE:FF"},      # повтор
+            {"addr": "8.8.8.8/24", "mac": "AA:BB:CC:DD:EE:01"},          # не локальная сеть
+            {"addr": "10.66.1.5/24", "mac": "AA:BB:CC:DD:EE:02"},        # сама сеть Retix Hub
+            {"addr": "192.168.2.5/24", "mac": "01:00:5E:00:00:01"},      # групповой MAC
+            {"addr": "192.168.3.5/24", "mac": "FF:FF:FF:FF:FF:FF"},
+            {"addr": "192.168.4.5/32", "mac": "AA:BB:CC:DD:EE:03"},      # без широковещательного адреса
+            {"addr": "192.168.5.5/24", "mac": "zz"}, "мусор",
+        ]) == [{"addr": "192.168.1.5/24", "mac": "AA:BB:CC:DD:EE:FF"}]
+
+    def test_heartbeat_without_nics_keeps_last(self, ctx):
+        from app import db
+        cab, kassa, sklad = self._office(ctx)
+        ctx.api.post("/api/heartbeat", headers=ctx.h(kassa["token"]), json={"client_version": "1.0.20"})
+        ctx.api.post("/api/heartbeat", headers=ctx.h(kassa["token"]), json={"nics": []})
+        assert "EE:01" in db.connect().execute("SELECT nics FROM devices WHERE id=?",
+                                               (kassa["device_id"],)).fetchone()[0]
+
+
+
+# ---------------------------------------------------------------- токен бота в суперадмине
+
+TOKEN_A = "111111111:AAH" + "a" * 32
+TOKEN_A2 = "111111111:AAH" + "b" * 32     # тот же бот, токен перевыпущен
+TOKEN_B = "222222222:AAH" + "c" * 32      # другой бот
+
+
+class TestBotToken:
+    @pytest.fixture()
+    def bot(self, monkeypatch):
+        """Telegram подменён: getMe отвечает по известным токенам; потоки бота не запускаются."""
+        from app import telegram
+        applied = []
+        names = {TOKEN_A: "RetixA", TOKEN_A2: "RetixA", TOKEN_B: "RetixB"}
+
+        def api(method, params=None, timeout=15, token=None):
+            if method == "getMe":
+                if token not in names:
+                    raise telegram.TelegramError(401, "Unauthorized")
+                return {"is_bot": True, "username": names[token]}
+            return True
+
+        def apply(token, username=""):
+            applied.append(token)
+            telegram.TOKEN, telegram.bot_username = token, username
+        monkeypatch.setattr(telegram, "_api", api)
+        monkeypatch.setattr(telegram, "apply", apply)
+        monkeypatch.setattr(telegram, "TOKEN", "")
+        monkeypatch.setattr(telegram, "bot_username", "")
+        return telegram, applied
+
+    @staticmethod
+    def _csrf(client):
+        page = client.get("/admin/settings").text
+        return re.search(r'name="csrf" value="([^"]+)"', page).group(1)
+
+    def test_only_superadmin(self, ctx):
+        ctx.company("firma1")
+        cab = ctx.cabinet("firma1")
+        assert cab.get("/admin/settings", follow_redirects=False).headers["location"] == "/admin/login"
+        r = cab.post("/admin/settings/telegram", data={"token": TOKEN_A}, follow_redirects=False)
+        assert r.headers["location"] == "/admin/login"
+
+    def test_set_replace_delete(self, ctx, bot):
+        telegram, applied = bot
+        from app import db
+        page = ctx.admin.get("/admin/settings").text
+        assert "Настройки" in page and "выключен" in page
+        csrf = self._csrf(ctx.admin)
+        r = ctx.admin.post("/admin/settings/telegram", data={"csrf": csrf, "token": f"  {TOKEN_A} "})
+        assert "Бот @RetixA подключён" in r.text and applied == [TOKEN_A]
+        assert "@RetixA" in r.text and "111111111:•••••aaaa" in r.text and TOKEN_A not in r.text
+        stored = db.connect().execute("SELECT value FROM settings WHERE key='telegram_token'").fetchone()[0]
+        assert TOKEN_A not in stored                                # в базе — зашифрован
+        assert telegram.saved_token(db.connect()) == (TOKEN_A, "admin")
+
+        r = ctx.admin.post("/admin/settings/telegram", data={"csrf": csrf, "token": "не токен"})
+        assert "не похоже на токен" in r.text and applied == [TOKEN_A]
+        r = ctx.admin.post("/admin/settings/telegram", data={"csrf": csrf, "token": "333333333:AAH" + "d" * 32})
+        assert "Telegram не принял токен: Unauthorized" in r.text and applied == [TOKEN_A]
+        assert telegram.saved_token(db.connect())[0] == TOKEN_A
+        monkeypatch_api = telegram._api
+        telegram._api = lambda *a, **k: (_ for _ in ()).throw(telegram.TelegramError(0, "URLError: timed out"))
+        r = ctx.admin.post("/admin/settings/telegram", data={"csrf": csrf, "token": TOKEN_B})
+        telegram._api = monkeypatch_api
+        assert "Нет связи с api.telegram.org" in r.text and applied == [TOKEN_A]
+        r = ctx.admin.post("/admin/settings/telegram", data={"csrf": "чужой", "token": TOKEN_B})
+        assert "Форма устарела" in r.text and applied == [TOKEN_A]
+
+        r = ctx.admin.post("/admin/settings/telegram/delete", data={"csrf": csrf})
+        assert "Telegram-бот выключен" in r.text and applied[-1] == ""
+        assert telegram.saved_token(db.connect()) == ("", "")
+        assert db.connect().execute("SELECT COUNT(*) FROM audit_log WHERE action='telegram_token'").fetchone()[0] == 2
+
+    def test_other_bot_unlinks_groups(self, ctx, bot):
+        from app import db
+        ctx.company("firma1")
+        csrf = self._csrf(ctx.admin)
+        ctx.admin.post("/admin/settings/telegram", data={"csrf": csrf, "token": TOKEN_A})
+        conn = db.connect()
+        conn.execute("UPDATE companies SET tg_chat_id='-100', tg_chat_title='Кассы'")
+        conn.commit()
+        assert "Кассы" in ctx.admin.get("/admin/settings").text
+        r = ctx.admin.post("/admin/settings/telegram", data={"csrf": csrf, "token": TOKEN_A2})
+        assert "Бот @RetixA подключён" in r.text and "отключены" not in r.text   # тот же бот — группы остаются
+        assert conn.execute("SELECT tg_chat_id FROM companies").fetchone()[0] == "-100"
+        r = ctx.admin.post("/admin/settings/telegram", data={"csrf": csrf, "token": TOKEN_B})
+        assert "Это другой бот: группы компаний (1) отключены" in r.text
+        assert conn.execute("SELECT tg_chat_id FROM companies").fetchone()[0] == ""
+
+    def test_env_token_is_fallback(self, ctx, bot, monkeypatch):
+        telegram, applied = bot
+        from app import db
+        monkeypatch.setattr(telegram, "TELEGRAM_BOT_TOKEN", TOKEN_B)
+        conn = db.connect()
+        assert telegram.saved_token(conn) == (TOKEN_B, "env")
+        csrf = self._csrf(ctx.admin)
+        ctx.admin.post("/admin/settings/telegram", data={"csrf": csrf, "token": TOKEN_A})
+        assert telegram.saved_token(conn) == (TOKEN_A, "admin")      # суперадмин важнее .env
+        telegram.start()
+        assert applied[-1] == TOKEN_A
+        r = ctx.admin.post("/admin/settings/telegram/delete", data={"csrf": csrf})
+        assert "работает токен из .env" in r.text and applied[-1] == TOKEN_B
+        assert "из .env" in ctx.admin.get("/admin/settings").text
+
+    def test_apply_restarts_bot(self, monkeypatch):
+        from app import telegram
+        started = []
+        monkeypatch.setattr(telegram, "_poller", lambda stop, token: started.append((stop, token)))
+        monkeypatch.setattr(telegram, "_sender", lambda stop: None)
+        try:
+            telegram.apply(TOKEN_A, "RetixA")
+            telegram.apply(TOKEN_B)
+            time.sleep(0.1)
+            assert [t for _, t in started] == [TOKEN_A, TOKEN_B]
+            assert started[0][0].is_set() and not started[1][0].is_set()   # прежний бот остановлен
+            assert telegram.enabled() and telegram.bot_username == ""
+        finally:
+            telegram.apply("")
+        assert not telegram.enabled() and started[1][0].is_set()

@@ -21,6 +21,10 @@ CREATE TABLE IF NOT EXISTS companies (
     share_ports       TEXT NOT NULL DEFAULT '445',
     speed_limit       INTEGER NOT NULL DEFAULT 0,  -- Мбит/с через сервер на всю компанию, 0 — без ограничения
     remote_mode       TEXT NOT NULL DEFAULT 'off', -- удалённое управление (RustDesk): off, ask — с согласием, auto — без
+    tg_chat_id        TEXT NOT NULL DEFAULT '',    -- группа Telegram компании: запросы на подключение ПК
+    tg_chat_title     TEXT NOT NULL DEFAULT '',
+    tg_link_code      TEXT NOT NULL DEFAULT '',    -- одноразовый код из кабинета: /link@бот КОД в группе
+    tg_link_at        INTEGER NOT NULL DEFAULT 0,
     is_active         INTEGER NOT NULL DEFAULT 1,
     created_at        TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
@@ -58,6 +62,9 @@ CREATE TABLE IF NOT EXISTS devices (
     remote_control  INTEGER NOT NULL DEFAULT 0, -- может управлять другими ПК компании (решает администратор)
     remote_access   TEXT NOT NULL DEFAULT 'company', -- управление ЭТИМ ПК: company (как в компании), off, ask
     remote_local    TEXT NOT NULL DEFAULT '',   -- что выбрал пользователь ПК в программе: '', ask, own, off
+    log_requested_at INTEGER NOT NULL DEFAULT 0, -- администратор запросил журнал программы: ПК пришлёт его (/api/log)
+    nics            TEXT NOT NULL DEFAULT '',   -- JSON [{addr, mac}]: сетевые карты ПК (включение по сети, клиент 1.0.21+)
+    nics_at         INTEGER NOT NULL DEFAULT 0, -- когда ПК последний раз сообщил nics
     last_seen       TEXT,
     update_state    TEXT NOT NULL DEFAULT '',   -- что ПК сообщает об обновлении: downloading:1.0.6 …
     update_state_at TEXT,
@@ -105,6 +112,36 @@ CREATE TABLE IF NOT EXISTS token_history (
     revoked_at  INTEGER NOT NULL
 );
 
+-- журналы программы, которые ПК прислали по запросу администратора (сжаты gzip)
+CREATE TABLE IF NOT EXISTS device_logs (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    company_id  INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+    device_id   INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+    created_at  INTEGER NOT NULL,
+    size        INTEGER NOT NULL,               -- байт текста (без сжатия)
+    data        BLOB NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_device_logs_device ON device_logs(device_id);
+
+-- включение по сети (Wake-on-LAN): команда включённому ПК той же локальной сети разбудить выключенный
+CREATE TABLE IF NOT EXISTS wake_requests (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    company_id    INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+    target_id     INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+    helper_id     INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+    mac           TEXT NOT NULL,
+    broadcast     TEXT NOT NULL,
+    created_at    INTEGER NOT NULL,
+    delivered_at  INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS ix_wake_helper ON wake_requests(helper_id, delivered_at);
+
+-- настройки сервера, которые суперадмин меняет на странице «Настройки» (секреты — зашифрованы, services.seal)
+CREATE TABLE IF NOT EXISTS settings (
+    key    TEXT PRIMARY KEY,
+    value  TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS audit_log (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     company_id  INTEGER,
@@ -146,8 +183,15 @@ MIGRATIONS = [
     ("devices", "remote_control", "INTEGER NOT NULL DEFAULT 0"),
     ("devices", "remote_access", "TEXT NOT NULL DEFAULT 'company'"),
     ("devices", "remote_local", "TEXT NOT NULL DEFAULT ''"),
+    ("devices", "log_requested_at", "INTEGER NOT NULL DEFAULT 0"),
+    ("devices", "nics", "TEXT NOT NULL DEFAULT ''"),
+    ("devices", "nics_at", "INTEGER NOT NULL DEFAULT 0"),
     ("companies", "speed_limit", "INTEGER NOT NULL DEFAULT 0"),
     ("companies", "remote_mode", "TEXT NOT NULL DEFAULT 'off'"),
+    ("companies", "tg_chat_id", "TEXT NOT NULL DEFAULT ''"),
+    ("companies", "tg_chat_title", "TEXT NOT NULL DEFAULT ''"),
+    ("companies", "tg_link_code", "TEXT NOT NULL DEFAULT ''"),
+    ("companies", "tg_link_at", "INTEGER NOT NULL DEFAULT 0"),
 ]
 
 

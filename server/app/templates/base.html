@@ -34,7 +34,7 @@
   .tag.share { background:#dcfce7; color:#166534; }
   .actions { display:flex; gap:4px; flex-wrap:wrap; } .actions form { margin:0; }
   button, .btn { font:inherit; padding:6px 12px; border-radius:7px; border:1px solid var(--line); background:#fff; cursor:pointer; color:var(--text); text-decoration:none; }
-  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+  button.primary, .btn.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
   button.danger { color:var(--bad); } button.small { padding:3px 8px; font-size:12px; }
   button.link { background:none; border:none; color:#fff; padding:0; }
   input[type=text], input[type=password], input[type=number], select { font:inherit; padding:7px 9px; border:1px solid var(--line); border-radius:7px; width:100%; }
@@ -96,7 +96,7 @@
 <body>
 <header>
   <a href="/"><b>Retix Hub</b></a><span class="sub">{{ title }}</span>
-  {% if admin_nav %}<nav class="adminnav"><a href="/admin" class="{{ 'on' if admin_nav == 'companies' }}">Компании</a><a href="/admin/updates" class="{{ 'on' if admin_nav == 'updates' }}">Обновления</a><span class="muted small" title="Версия сервера Retix Hub">сервер {{ server_version }}</span></nav>{% endif %}
+  {% if admin_nav %}<nav class="adminnav"><a href="/admin" class="{{ 'on' if admin_nav == 'companies' }}">Компании</a><a href="/admin/updates" class="{{ 'on' if admin_nav == 'updates' }}">Обновления</a><a href="/admin/settings" class="{{ 'on' if admin_nav == 'settings' }}">Настройки</a><span class="muted small" title="Версия сервера Retix Hub">сервер {{ server_version }}</span></nav>{% endif %}
   {% if logout_url %}<form method="post" action="{{ logout_url }}"><button class="link">Выйти</button></form>{% endif %}
 </header>
 <main>

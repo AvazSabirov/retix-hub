@@ -1,5 +1,6 @@
 {% extends "base.html" %}
 {% from "_devices.html" import devices_table %}
+{% from "_extras.html" import telegram_card, logs_card %}
 {% block content %}
 <p><a href="/admin">← Все компании</a></p>
 <div class="card">
@@ -17,6 +18,7 @@
   <h2>Компьютеры</h2>
   {{ devices_table(devices, action_prefix, remote_mode != 'off', remote_access) }}
 </div>
+{{ logs_card(logs, devices, log_prefix) }}
 <div class="grid">
   <div class="card">
     <h2>Параметры</h2>
@@ -56,6 +58,7 @@
     </form>
   </div>
 </div>
+{{ telegram_card(tg, tg_prefix, True) }}
 <div class="card">
   <h2>Журнал</h2>
   <table class="log">

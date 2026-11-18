@@ -4,10 +4,11 @@ from urllib.parse import urlencode
 
 from fastapi import APIRouter, Depends, Form, Request
 
-from .. import db, services
+from .. import db, services, telegram
 from ..auth import client_ip, hash_pw, limiter
 from ..config import SUPERADMIN_LOGIN, SUPERADMIN_PASSWORD
-from ..web import LoginRequired, redirect, templates
+from ..web import LoginRequired, csrf_ok, csrf_token, redirect, templates
+from .cabinet import log_response, tg_view
 
 router = APIRouter(prefix="/admin", include_in_schema=False)
 
@@ -105,6 +106,8 @@ def company_page(request: Request, company_id: int, conn=Depends(require_admin),
         "remote_modes": services.REMOTE_MODES, "remote_access": services.REMOTE_ACCESS,
         "remote_mode": services.remote_mode(c),
         "online": sum(d["online"] for d in devices), "log": log,
+        "logs": services.company_logs(conn, c["id"]), "log_prefix": f"/admin/companies/{c['id']}/logs/",
+        "tg": tg_view(c), "tg_prefix": f"/admin/companies/{c['id']}/telegram/",
         "action_prefix": f"/admin/companies/{c['id']}/devices/", "logout_url": "/admin/logout", "admin_nav": "companies",
         "msg": msg, "err": err})
 
@@ -172,6 +175,54 @@ def device_action(company_id: int, device_id: int, action: str, value: str = For
     c = get_company(conn, company_id)
     url = f"/admin/companies/{c['id']}"
     try:
-        return redirect(url, services.device_action(conn, c["id"], device_id, action, value))
+        return redirect(url, services.device_action(conn, c["id"], device_id, action, value, actor="суперадмин"))
     except (LookupError, ValueError) as e:
         return redirect(url, str(e), err=True)
+
+
+@router.get("/companies/{company_id}/logs/{log_id}")
+def download_log(company_id: int, log_id: int, conn=Depends(require_admin)):
+    c = get_company(conn, company_id)
+    return log_response(conn, c["id"], log_id) or redirect(f"/admin/companies/{c['id']}", "Журнал не найден", err=True)
+
+
+@router.post("/companies/{company_id}/telegram/unlink")
+def telegram_unlink(company_id: int, conn=Depends(require_admin)):
+    c = get_company(conn, company_id)
+    telegram.unlink(conn, c, "суперадмин")
+    return redirect(f"/admin/companies/{c['id']}", "Группа Telegram отключена")
+
+
+# ---------- настройки сервера ----------
+
+@router.get("/settings")
+def settings_page(request: Request, conn=Depends(require_admin), msg: str = "", err: int = 0):
+    token, source = telegram.saved_token(conn)
+    linked = conn.execute("SELECT login, name, tg_chat_title FROM companies WHERE tg_chat_id<>'' ORDER BY login").fetchall()
+    return templates.TemplateResponse(request, "admin_settings.html", {
+        "title": "Настройки", "csrf": csrf_token(request), "logout_url": "/admin/logout", "admin_nav": "settings",
+        "tg_source": source, "tg_running": telegram.enabled(), "tg_bot": telegram.bot_username,
+        "tg_error": telegram.last_error, "tg_masked": (token.split(":", 1)[0] + ":•••••" + token[-4:]) if token else "",
+        "tg_linked": linked, "msg": msg, "err": err})
+
+
+@router.post("/settings/telegram")
+def settings_telegram(request: Request, csrf: str = Form(""), token: str = Form(""), conn=Depends(require_admin)):
+    if not csrf_ok(request, csrf):
+        return redirect("/admin/settings", "Форма устарела, обновите страницу", err=True)
+    try:
+        username, unlinked = telegram.set_token(conn, token)
+    except ValueError as e:
+        return redirect("/admin/settings", str(e), err=True)
+    return redirect("/admin/settings", f"Бот @{username} подключён" + (
+        f". Это другой бот: группы компаний ({unlinked}) отключены, их нужно подключить заново в кабинетах"
+        if unlinked else ""))
+
+
+@router.post("/settings/telegram/delete")
+def settings_telegram_delete(request: Request, csrf: str = Form(""), conn=Depends(require_admin)):
+    if not csrf_ok(request, csrf):
+        return redirect("/admin/settings", "Форма устарела, обновите страницу", err=True)
+    left = telegram.delete_token(conn)
+    return redirect("/admin/settings", "Токен удалён" + (": работает токен из .env (TELEGRAM_BOT_TOKEN)" if left
+                                                         else ", Telegram-бот выключен"))

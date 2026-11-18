@@ -15,11 +15,13 @@ Retix Hub — клиент для Windows (окно, значок в трее).
 import base64
 import faulthandler
 import ctypes
+import gzip
 import hashlib
 import ipaddress
 import json
 import logging
 import os
+import platform
 import queue
 import re
 import socket
@@ -37,7 +39,7 @@ import requests
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
 
-VERSION = "1.0.20"
+VERSION = "1.0.21"
 APP_NAME = "RetixHub"          # служебное имя: папки, задачи, мьютекс
 APP_TITLE = "Retix Hub"        # то, что видит пользователь
 TUNNEL = "retixhub"
@@ -354,12 +356,14 @@ class Api:
         with self.lock:
             return self._req_locked(method, path, auth, **kw)
 
-    def _req_locked(self, method: str, path: str, auth: bool, **kw):
+    def _req_locked(self, method: str, path: str, auth: bool, timeout: float = 8, headers: dict | None = None,
+                    **kw):
         url = self.state.get("server_url").rstrip("/") + path
-        headers = {"Authorization": f"Bearer {self.state.get('token')}", "X-Retix-Version": VERSION,
-                   "X-Retix-Update-State": self.state.get("update_state") or "none"} if auth else {}
+        headers = ({"Authorization": f"Bearer {self.state.get('token')}", "X-Retix-Version": VERSION,
+                    "X-Retix-Update-State": self.state.get("update_state") or "none"} if auth else {}) \
+            | (headers or {})
         try:
-            r = self.http.request(method, url, headers=headers, timeout=8, **kw)
+            r = self.http.request(method, url, headers=headers, timeout=timeout, **kw)
         except requests.RequestException as e:
             raise ServerUnreachable(str(e)) from e
         new_token = r.headers.get(TOKEN_HEADER)
@@ -391,7 +395,7 @@ class Api:
 
     def heartbeat(self, lan: list | None = None, wg_port: int = 0, direct: list | None = None,
                   radmin_server: bool | None = None, remote_ok: bool | None = None,
-                  remote_local: str | None = None):
+                  remote_local: str | None = None, nics: list | None = None):
         # wan: этот клиент умеет прямой путь через интернет — сервер может свести его с ПК других офисов
         body = {"client_version": VERSION, "lan": list(lan or []), "wg_port": int(wg_port or 0),
                 "direct": list(direct or []), "wan": True}
@@ -401,7 +405,15 @@ class Api:
             body["remote_ok"] = bool(remote_ok)
         if remote_local is not None:
             body["remote_local"] = remote_local
+        if nics is not None:
+            body["nics"] = list(nics)
         return self._req("POST", "/api/heartbeat", json=body)
+
+    def wake(self, to: int):
+        return self._req("POST", "/api/wake", json={"to": to})
+
+    def upload_log(self, data: bytes):
+        return self._req("POST", "/api/log", data=data, timeout=60, headers={"Content-Type": "application/gzip"})
 
     def remote_password(self, password: str):
         return self._req("POST", "/api/remote/password", json={"password": password})
@@ -565,6 +577,131 @@ def local_addresses() -> list[str] | None:
         if lan_ip_ok(iface.ip) and iface.network.prefixlen >= 8 and str(iface) not in found:
             found.append(str(iface))
     return found[:16]
+
+
+# ---------------------------------------------------------------------- включение по сети (Wake-on-LAN)
+# Пока в компании включено удалённое управление, ПК сообщает серверу свои сетевые карты: адрес в локальной сети
+# и MAC. Когда администратор (или ПК с правом «управляет») включает выключенный ПК, сервер просит включённый ПК
+# той же подсети разбудить его: этот ПК шлёт «волшебный пакет» (6 × FF и 16 × MAC) на широковещательный адрес
+# своей подсети. Шлём только туда, куда сервер не может «направить» чужой трафик: на широковещательный адрес
+# собственной локальной сети, проверенный по своим же адресам.
+
+NICS_CHECK_EVERY = 300   # сек — как часто перечитывать свои сетевые карты (MAC меняется редко)
+MAC_RE = re.compile(r"^([0-9A-Fa-f]{2})([:-][0-9A-Fa-f]{2}){5}$")
+WOL_PORTS = (9, 7)       # порты «волшебного пакета»: сетевой карте порт не важен, но иные роутеры смотрят на 9
+WOL_REPEAT = 3
+
+
+def clean_mac(value) -> str:
+    raw = str(value or "").strip()
+    if not MAC_RE.match(raw):
+        return ""
+    hexs = raw.replace(":", "").replace("-", "").upper()
+    if hexs in ("000000000000", "FFFFFFFFFFFF") or int(hexs[:2], 16) & 1:
+        return ""
+    return ":".join(hexs[i:i + 2] for i in range(0, 12, 2))
+
+
+def local_nics() -> list[dict] | None:
+    """Свои сетевые карты в локальной сети: [{"addr": "192.168.1.15/24", "mac": "AA:BB:CC:DD:EE:FF"}, …].
+    None — не прочитать (PowerShell не ответил вовремя)."""
+    if WINDOWS:
+        ps = ("$m=@{}; Get-NetAdapter -ErrorAction SilentlyContinue | ForEach-Object { $m[[int]$_.ifIndex]=$_.MacAddress }; "
+              "Get-NetIPAddress -AddressFamily IPv4 -AddressState Preferred -ErrorAction SilentlyContinue | "
+              "ForEach-Object { $_.IPAddress + '/' + $_.PrefixLength + ' ' + $m[[int]$_.InterfaceIndex] }")
+        code, out = run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps], timeout=20)
+    else:
+        code, out = run(["ip", "-o", "-4", "addr", "show"], timeout=10)
+        lines = []
+        for line in out.splitlines():
+            w = line.split()
+            if len(w) > 3 and "inet" in w:
+                try:
+                    mac = Path(f"/sys/class/net/{w[1]}/address").read_text().strip()
+                except OSError:
+                    mac = ""
+                lines.append(f"{w[w.index('inet') + 1]} {mac}")
+        out = "\n".join(lines)
+    if code != 0:
+        return None
+    found = []
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) != 2:
+            continue
+        try:
+            iface = ipaddress.IPv4Interface(parts[0])
+        except ValueError:
+            continue
+        mac = clean_mac(parts[1])
+        item = {"addr": str(iface), "mac": mac}
+        if mac and lan_ip_ok(iface.ip) and 8 <= iface.network.prefixlen <= 30 and item not in found:
+            found.append(item)
+    return found[:16]
+
+
+def wake_job_ok(job, nics: list[dict] | None) -> bool:
+    """Команда сервера «разбуди»: MAC одной карты и широковещательный адрес одной из СВОИХ локальных сетей."""
+    if not isinstance(job, dict) or not clean_mac(job.get("mac")):
+        return False
+    for n in nics or []:
+        try:
+            if str(ipaddress.IPv4Interface(n["addr"]).network.broadcast_address) == str(job.get("broadcast")):
+                return True
+        except (ValueError, KeyError, TypeError):
+            continue
+    return False
+
+
+def magic_packet(mac: str) -> bytes:
+    return b"\xff" * 6 + bytes.fromhex(clean_mac(mac).replace(":", "")) * 16
+
+
+def send_magic_packet(mac: str, broadcast: str) -> bool:
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            for _ in range(WOL_REPEAT):
+                for port in WOL_PORTS:
+                    sock.sendto(magic_packet(mac), (broadcast, port))
+        return True
+    except OSError as e:
+        log.warning("включение по сети: пакет на %s не отправлен: %s", broadcast, e)
+        return False
+
+
+# ---------------------------------------------------------------------- журнал для администратора
+LOG_UPLOAD_MAX = 900_000     # байт gzip — столько принимает сервер (nginx по умолчанию — до 1 МБ)
+LOG_TEXT_MAX = 6_000_000     # байт журнала берём с конца, не больше
+LOG_RETRY = 60               # сек — не получилось отправить: снова не раньше
+
+
+def _tail(path: Path, limit: int) -> bytes:
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - limit))
+            return f.read()
+    except OSError:
+        return b""
+
+
+def log_files_text(limit: int = LOG_TEXT_MAX) -> bytes:
+    """Конец журнала программы: client.log.3 … client.log (старые — первыми)."""
+    d = log_dir()
+    parts = [_tail(p, limit) for p in [d / f"client.log.{i}" for i in (3, 2, 1)] + [d / "client.log"] if p.exists()]
+    return b"".join(parts)[-limit:]
+
+
+def pack_log(header: str, body: bytes, limit: int = LOG_UPLOAD_MAX) -> bytes:
+    """Заголовок + конец журнала, сжатые gzip и не больше limit: не влезает — берём меньше с конца."""
+    head = header.encode("utf-8", "replace")
+    while True:
+        data = gzip.compress(head + body, 6)
+        if len(data) <= limit or not body:
+            return data
+        body = body[len(body) // 2:]
 
 
 def peer_ip_ok(ip, subnet: str) -> bool:
@@ -931,6 +1068,11 @@ def remote_menu_allowed(peer: dict | None, cfg: dict | None) -> bool:
     remote = (cfg or {}).get("remote") if isinstance((cfg or {}).get("remote"), dict) else {}
     return bool(peer) and peer.get("remote") is True and not peer.get("is_me") and remote.get("mode") in REMOTE_MODES \
         and remote.get("can_control", True) is not False and rustdesk_exe() is not None
+
+
+def wake_menu_allowed(peer: dict | None) -> bool:
+    """«Включить компьютер»: ПК выключен, сервер знает его MAC, а этому ПК разрешено управлять другими."""
+    return bool(peer) and peer.get("wake") is True and not peer.get("online") and not peer.get("is_me")
 
 
 def lan_ports(cfg: dict) -> str:
@@ -1660,6 +1802,10 @@ class Worker(threading.Thread):
         self.remote_job: threading.Thread | None = None   # установка и настройка RustDesk — в своём потоке
         self.remote_lock = threading.Lock()      # работа с RustDesk (фон и меню «Управление») — по одной
         self.last_peers: list[dict] = []         # список компьютеров с последнего ответа сервера
+        self.nics: list[dict] | None = None      # свои сетевые карты для включения по сети (None — не сообщаем)
+        self.nics_checked = 0.0
+        self.log_sent_at = 0.0                   # когда последний раз отправляли журнал администратору
+        self.last_status = ""                    # последний статус (для журнала администратору)
         # шаг цикла и смена компании (вход, переключение, выход) не идут одновременно
         self.op_lock = threading.RLock()
 
@@ -1668,6 +1814,7 @@ class Worker(threading.Thread):
         self.events.put((kind, data))
 
     def status(self, status: str, text: str = "", cfg: dict | None = None):
+        self.last_status = f"{status}: {text}" if text else status
         self.emit("status", status=status, text=text, cfg=cfg or self.cfg)
 
     # --- команды из GUI (вызываются в отдельном потоке)
@@ -1824,6 +1971,73 @@ class Worker(threading.Thread):
             return None, e.detail
         except ServerUnreachable:
             return None, "Сервер недоступен: без него подключение не разрешается."
+
+    def wake_peer(self, to: int) -> tuple[str | None, str | None]:
+        """Включить выключенный ПК компании по сети (из потока окна): (сообщение, None) или (None, ошибка)."""
+        try:
+            return str(self.api.wake(to).get("message") or "Команда включения отправлена"), None
+        except ApiError as e:
+            if e.status in (404, 405) and "Компьютер" not in e.detail:
+                return None, "Сервер Retix Hub ещё не умеет включать компьютеры по сети — его нужно обновить."
+            return None, e.detail
+        except ServerUnreachable:
+            return None, "Сервер недоступен: без него включить компьютер нельзя."
+
+    # --- включение по сети: свои сетевые карты для сервера и команды «разбуди соседа»
+    def _wol_step(self, now: float):
+        if self.cfg.get("wol") is not True:
+            self.nics = None   # удалённое управление выключено — MAC серверу не сообщаем
+            return
+        jobs = self.cfg.get("wake") if isinstance(self.cfg.get("wake"), list) else []
+        every = NICS_CHECK_EVERY if self.nics is not None else 60
+        if now - self.nics_checked > every or (jobs and not self.nics):
+            found = local_nics()
+            if found is not None:
+                self.nics = found
+            self.nics_checked = now
+        for job in jobs:
+            if not wake_job_ok(job, self.nics):
+                log.warning("включение по сети: команда не для своей локальной сети — пропущена: %s", job)
+                continue
+            ok = send_magic_packet(job["mac"], str(job["broadcast"]))
+            log.info("включение по сети: %s (%s) через %s — %s", str(job.get("name"))[:64], clean_mac(job["mac"]),
+                     job["broadcast"], "пакет отправлен" if ok else "ошибка")
+
+    # --- журнал программы по запросу администратора (кабинет → «Журнал»)
+    def _log_header(self) -> str:
+        cfg = self.cfg or {}
+        nics = ", ".join(f"{n['addr']} {n['mac']}" for n in self.nics or []) or "—"
+        lines = [f"Retix Hub {VERSION} — журнал программы для администратора компании",
+                 f"Собран: {time.strftime('%Y-%m-%d %H:%M:%S %z')}",
+                 f"Компьютер: {socket.gethostname()} · {platform.platform()}",
+                 f"Компания: {self.state.get('company_name') or self.state.get('company_login') or '—'} · "
+                 f"ПК: {self.state.get('device_name') or '—'} · IP: {cfg.get('ip') or '—'}",
+                 f"Состояние: {self.last_status or '—'}",
+                 f"Служба туннеля: {self.tunnel.service_state()}",
+                 f"Локальная сеть: {', '.join(self.lan) or '—'} · прямые пути: {self.direct.active_ids() or '—'}",
+                 f"Сетевые карты: {nics}"]
+        if WINDOWS:
+            _, out = run([str(WG_EXE), "show", TUNNEL], timeout=15)   # без закрытого ключа: wg его не показывает
+            lines += ["", "--- wg show", out.strip()]
+        try:
+            lines += ["", "--- удалённое управление", self.rustdesk_status()]
+        except Exception:  # noqa: BLE001
+            log.exception("состояние RustDesk для журнала")
+        crash = _tail(log_dir() / "crash.log", 64_000)
+        if crash.strip():
+            lines += ["", "--- crash.log (конец)", crash.decode("utf-8", "replace").rstrip()]
+        return "\n".join(lines + ["", "--- client.log", ""])
+
+    def _log_step(self, now: float):
+        if self.cfg.get("log_request") is not True or now - self.log_sent_at < LOG_RETRY:
+            return
+        self.log_sent_at = now
+        try:
+            data = pack_log(self._log_header(), log_files_text())
+            self.api.upload_log(data)
+            log.info("журнал отправлен администратору компании (%d КБ)", len(data) // 1024)
+        except (ApiError, ServerUnreachable) as e:
+            log.warning("журнал администратору не отправлен: %s", getattr(e, "detail", e))
 
     REMOTE_ASYNC = True   # в тестах — False: работа с RustDesk сразу, в том же потоке
 
@@ -2306,6 +2520,11 @@ class Worker(threading.Thread):
         name = clean_device_name(str(self.cfg.get("device_name") or ""))
         if name and name != self.state.get("device_name"):
             self.state.set(device_name=name)
+        # администратор запросил журнал — отправляем сразу, даже если ПК ждёт одобрения или заблокирован
+        try:
+            self._log_step(time.time())
+        except Exception:  # noqa: BLE001
+            log.exception("журнал для администратора")
 
         if self.cfg["status"] == "blocked":
             if self.tunnel.service_state() != "missing":
@@ -2322,6 +2541,13 @@ class Worker(threading.Thread):
                 log.exception("прямой путь")
             self.status(Status.PENDING, "Ожидает одобрения администратора компании")
             return
+
+        # включение по сети: команды «разбуди соседа» приходят в этом ответе один раз — до всего, что может
+        # закончить шаг раньше (переустановка туннеля)
+        try:
+            self._wol_step(time.time())
+        except Exception:  # noqa: BLE001
+            log.exception("включение по сети")
 
         # 3. туннель: установлен, актуален, жив?
         priv, _ = self.state.keypair()
@@ -2411,11 +2637,13 @@ class Worker(threading.Thread):
             self.radmin_checked = now
         port = self.direct.listen_port if self.lan else 0
         local = self.state.get("remote_local") or ""
-        report = (tuple(self.lan), port, tuple(self.direct.active_ids()), self.radmin_server, self.remote_ok, local)
+        nics = None if self.nics is None else tuple((n["addr"], n["mac"]) for n in self.nics)
+        report = (tuple(self.lan), port, tuple(self.direct.active_ids()), self.radmin_server, self.remote_ok, local,
+                  nics)
         if now - self.last_heartbeat > HEARTBEAT_EVERY or report != self.reported:
             try:
                 self.api.heartbeat(self.lan, port, self.direct.active_ids(), self.radmin_server, self.remote_ok,
-                                   local)
+                                   local, self.nics)
                 self.last_heartbeat, self.reported = now, report
             except (ApiError, ServerUnreachable):
                 pass
@@ -3269,9 +3497,9 @@ class App(tk.Tk):
 
         # меню правой кнопки: с пунктами Radmin Viewer — только если у того ПК есть Radmin Server, а здесь Viewer;
         # с пунктами RustDesk — если удалённое управление включено в кабинете и готово на обоих ПК
-        self.ctx_menus = {(radmin, remote): self._build_peer_menu(radmin, remote)
-                          for radmin in (True, False) for remote in (True, False)}
-        self.ctx = self.ctx_menus[(False, False)]
+        self.ctx_menus = {(radmin, remote, wake): self._build_peer_menu(radmin, remote, wake)
+                          for radmin in (True, False) for remote in (True, False) for wake in (True, False)}
+        self.ctx = self.ctx_menus[(False, False, False)]
 
         self.msg_lbl = tk.Label(self, text="", bg=C["bg"], fg=C["muted"], anchor="w", justify="left",
                                 wraplength=330, padx=10)
@@ -3614,8 +3842,11 @@ class App(tk.Tk):
             return None
         return next((p for p in self.peers if str(p["id"]) == sel[0]), None)
 
-    def _build_peer_menu(self, radmin: bool, remote: bool = False):
+    def _build_peer_menu(self, radmin: bool, remote: bool = False, wake: bool = False):
         m = dark_menu(self)
+        if wake:
+            m.add_command(label="Включить компьютер", command=self.wake_peer, font=("Segoe UI", 9, "bold"))
+            m.add_separator()
         m.add_command(label="Сообщение", command=self.message)
         m.add_separator()
         m.add_command(label="Копировать IP-адрес", command=self.copy_ip)
@@ -3645,7 +3876,8 @@ class App(tk.Tk):
         self.tree.selection_set(row)
         viewer = find_radmin_viewer(self.state_.get("radmin_path") or "")
         peer = self.selected_peer()
-        self.ctx = self.ctx_menus[(radmin_menu_allowed(peer, viewer), remote_menu_allowed(peer, self.cfg))]
+        self.ctx = self.ctx_menus[(radmin_menu_allowed(peer, viewer), remote_menu_allowed(peer, self.cfg),
+                                   wake_menu_allowed(peer))]
         try:
             self.ctx.tk_popup(event.x_root, event.y_root)
         finally:
@@ -3803,6 +4035,17 @@ class App(tk.Tk):
                 self.ui_q.put(("info", f"Пользователь {p['name']} защитил компьютер своим паролем.\n"
                                        "Введите в окне RustDesk пароль, который он вам сообщил."))
         threading.Thread(target=work, daemon=True, name="remote").start()
+
+    def wake_peer(self):
+        """Включить выбранный выключенный ПК по сети: команду отправит включённый ПК из его локальной сети."""
+        p = self.selected_peer()
+        if not p:
+            return
+
+        def work():
+            msg, err = self.worker.wake_peer(p["id"])
+            self.ui_q.put(("error", f"Включить {p['name']}:\n{err}") if err else ("info", msg))
+        threading.Thread(target=work, daemon=True, name="wake").start()
 
     def remote_desktop(self):
         """Удалённый рабочий стол Windows (RDP). На том ПК он должен быть включён (Windows Pro),
