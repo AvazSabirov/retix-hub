@@ -37,7 +37,7 @@ import requests
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
 
-VERSION = "1.0.18"
+VERSION = "1.0.19"
 APP_NAME = "RetixHub"          # служебное имя: папки, задачи, мьютекс
 APP_TITLE = "Retix Hub"        # то, что видит пользователь
 TUNNEL = "retixhub"
@@ -1131,7 +1131,9 @@ def install_rustdesk() -> bool:
         log.warning("RustDesk: установщик rustdesk-*.exe рядом с программой не найден")
         return False
     log.info("ставлю %s", setup.name)
-    run_rd([str(setup), "--silent-install"], timeout=900)   # в своём потоке: сеть не ждёт
+    code, out = run_rd([str(setup), "--silent-install"], timeout=900)   # в своём потоке: сеть не ждёт
+    if out.strip():
+        log.info("RustDesk --silent-install (код %s): %s", code, " ".join(out.split())[:500])
     for _ in range(30):
         if rustdesk_exe() and rustdesk_service_state() != "missing":
             return True
