@@ -5,7 +5,7 @@ import uvicorn
 from fastapi import FastAPI
 from starlette.middleware.sessions import SessionMiddleware
 
-from . import db, monitor, services, wg
+from . import db, monitor, services, telegram, wg
 from .config import (APP_NAME, APP_VERSION, API_HOST, API_PORT, COOKIE_SECURE, DRY_RUN, LOG_LEVEL, SECRET_KEY,
                      SUPERADMIN_PASSWORD)
 from .routers import admin, api_client, cabinet, public, updates
@@ -26,9 +26,12 @@ async def lifespan(app: FastAPI):
     wg.setup_interface()
     services.reconcile()
     stop = monitor.start()
+    tg_stop = telegram.start()   # TELEGRAM_BOT_TOKEN не задан — бота нет
     log.info("Retix Hub %s запущен, server pubkey %s, журнал: %s", APP_VERSION, wg.server_public_key(), LOG_LEVEL)
     yield
     stop.set()
+    if tg_stop:
+        tg_stop.set()
 
 
 app = FastAPI(title=APP_NAME, version=APP_VERSION, lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)

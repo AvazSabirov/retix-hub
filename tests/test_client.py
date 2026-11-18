@@ -209,6 +209,7 @@ class FakeTunnel:
 
 
 LAN_NOW = {"addrs": []}   # что вернёт local_addresses() — адреса того ПК, чей шаг идёт
+NICS_NOW = {"nics": []}   # что вернёт local_nics() — сетевые карты того ПК, чей шаг идёт
 REAL_LOCAL_ADDRESSES = rc.local_addresses
 
 
@@ -220,6 +221,7 @@ class Client:
         self.state = rc.State(tmp / "state.json"); self.state.set(server_url=BASE)
         self.tunnel = FakeTunnel(lan, lan_ip, port)
         self.lan_addrs = [f"{lan_ip}/24"] if lan_ip else []
+        self.nics = []                      # сетевые карты (включение по сети): [{"addr", "mac"}]
         self.fw = []
         self.hostname = hostname
         self.events_seen = []
@@ -228,7 +230,9 @@ class Client:
     def step(self, n=1):
         for _ in range(n):
             LAN_NOW["addrs"] = self.lan_addrs
+            NICS_NOW["nics"] = self.nics
             self.w.lan_checked = 0          # адреса перечитываются на каждом шаге
+            self.w.nics_checked = 0
             self.w.step()
         return self.last()
 
@@ -250,6 +254,7 @@ def patch_windows(monkeypatch):
     monkeypatch.setattr(rc, "run", lambda args, timeout=60: (calls.append(args), (0, ""))[1])
     monkeypatch.setattr(rc, "local_addresses", lambda: None if LAN_NOW["addrs"] is None else list(LAN_NOW["addrs"]))
     monkeypatch.setattr(rc, "ensure_autostart", lambda: calls.append(["autostart"]))
+    monkeypatch.setattr(rc, "local_nics", lambda: [dict(n) for n in NICS_NOW["nics"]])
     return calls
 
 
@@ -2027,3 +2032,126 @@ def test_menu_repair_rustdesk(make_client, company, fake_rustdesk, patch_windows
     rd.service = "missing"
     ok, text = c.w.repair_rustdesk()
     assert not ok and "Установщика RustDesk нет" in text
+
+
+# ================================================================== включение по сети (Wake-on-LAN)
+
+REAL_LOCAL_NICS = rc.local_nics
+
+
+def test_local_nics_parses_powershell(monkeypatch):
+    out = ("192.168.1.15/24 AA-BB-CC-DD-EE-FF\r\n10.66.1.2/32 \r\n169.254.3.4/16 11-22-33-44-55-66\r\n"
+           "127.0.0.1/8 \r\n192.168.1.15/24 AA-BB-CC-DD-EE-FF\r\n172.16.0.9/16 \r\n192.168.7.2/32 AA-BB-CC-00-00-01\r\n"
+           "10.0.0.5/8 02-00-4C-4F-4F-50\r\n")
+    monkeypatch.setattr(rc, "WINDOWS", True)
+    monkeypatch.setattr(rc, "run", lambda args, timeout=60: (0, out))
+    assert REAL_LOCAL_NICS() == [{"addr": "192.168.1.15/24", "mac": "AA:BB:CC:DD:EE:FF"},
+                                 {"addr": "10.0.0.5/8", "mac": "02:00:4C:4F:4F:50"}]
+    monkeypatch.setattr(rc, "run", lambda args, timeout=60: (1, "timeout"))
+    assert REAL_LOCAL_NICS() is None
+
+
+def test_magic_packet_and_job_check():
+    assert rc.clean_mac("aa-bb-cc-dd-ee-ff") == "AA:BB:CC:DD:EE:FF"
+    assert rc.clean_mac("01:00:5e:00:00:01") == "" and rc.clean_mac("FF:FF:FF:FF:FF:FF") == "" and rc.clean_mac("x") == ""
+    pkt = rc.magic_packet("AA:BB:CC:DD:EE:FF")
+    assert len(pkt) == 102 and pkt[:6] == b"\xff" * 6 and pkt[6:12] == bytes.fromhex("AABBCCDDEEFF")
+    nics = [{"addr": "192.168.1.15/24", "mac": "AA:BB:CC:DD:EE:01"}]
+    assert rc.wake_job_ok({"mac": "AA:BB:CC:DD:EE:02", "broadcast": "192.168.1.255"}, nics)
+    # пакет — только на широковещательный адрес своей сети: сервер не может «направить» его куда-то ещё
+    assert not rc.wake_job_ok({"mac": "AA:BB:CC:DD:EE:02", "broadcast": "192.168.2.255"}, nics)
+    assert not rc.wake_job_ok({"mac": "AA:BB:CC:DD:EE:02", "broadcast": "8.8.8.8"}, nics)
+    assert not rc.wake_job_ok({"mac": "AA:BB:CC:DD:EE:02", "broadcast": "192.168.1.255"}, None)
+    assert not rc.wake_job_ok({"mac": "bad", "broadcast": "192.168.1.255"}, nics)
+    assert not rc.wake_job_ok("мусор", nics)
+
+
+def test_wake_on_lan_end_to_end(make_client, company, server, monkeypatch):
+    sent = []
+    monkeypatch.setattr(rc, "send_magic_packet", lambda mac, bcast: (sent.append((mac, bcast)), True)[1])
+    company.cab.post(BASE + "/cabinet/settings", data={"share_name": "share", "share_ports": "445",
+                                                       "remote_mode": "ask"})
+    a = make_client("KASSA"); a.nics = [{"addr": "192.168.1.20/24", "mac": "AA:BB:CC:DD:EE:01"}]
+    login(a, company, name="Касса"); a.step(2)
+    b = make_client("SKLAD"); b.nics = [{"addr": "192.168.1.30/24", "mac": "AA:BB:CC:DD:EE:02"}]
+    login(b, company, name="Склад"); b.step(2)
+    assert a.w.cfg["wol"] is True and a.w.nics == a.nics
+    import sqlite3
+    conn = sqlite3.connect(Path(server.data) / "vpn.db", timeout=10)
+    kassa = device_id(company, "Касса")
+    assert "AA:BB:CC:DD:EE:01" in conn.execute("SELECT nics FROM devices WHERE id=?", (kassa,)).fetchone()[0]
+    _set_online(server, "Склад")                                 # Касса выключена, Склад в сети
+    r = company.cab.post(BASE + f"/cabinet/devices/{kassa}/wake")
+    assert "отправлена через Склад" in r.text
+    b.step()
+    assert sent == [("AA:BB:CC:DD:EE:01", "192.168.1.255")]
+    b.step()
+    assert len(sent) == 1                                       # команда выполняется один раз
+
+    # из программы: только ПК, которому администратор разрешил управлять
+    _set_online(server, "Склад"); b.step()
+    peer = next(p for p in b.peers if p["name"] == "Касса")
+    assert not rc.wake_menu_allowed(peer)
+    assert "разрешил управлять" in b.w.wake_peer(kassa)[1]
+    allow_control(company, "Склад")
+    _set_online(server, "Склад"); b.step()
+    peer = next(p for p in b.peers if p["name"] == "Касса")
+    assert rc.wake_menu_allowed(peer) and not rc.wake_menu_allowed(next(p for p in b.peers if p["is_me"]))
+    time.sleep(0.01)
+    conn.execute("UPDATE wake_requests SET created_at=created_at-60 WHERE target_id=?", (kassa,)); conn.commit()
+    msg, err = b.w.wake_peer(kassa)
+    assert err is None and "отправлена через Склад" in msg
+    b.step()
+    assert len(sent) == 2
+
+    # удалённое управление выключили — MAC больше не сообщается, команды не принимаются
+    company.cab.post(BASE + "/cabinet/settings", data={"share_name": "share", "share_ports": "445",
+                                                       "remote_mode": "off"})
+    b.step()
+    assert b.w.cfg["wol"] is False and b.w.nics is None
+
+
+def test_wake_job_for_foreign_network_ignored(make_client, company, monkeypatch):
+    sent = []
+    monkeypatch.setattr(rc, "send_magic_packet", lambda mac, bcast: sent.append((mac, bcast)))
+    c = make_client(); c.nics = [{"addr": "192.168.1.30/24", "mac": "AA:BB:CC:DD:EE:02"}]
+    login(c, company); c.step(2)
+    c.w.cfg = dict(c.w.cfg, wol=True, wake=[{"mac": "AA:BB:CC:DD:EE:01", "broadcast": "10.20.30.255"},
+                                            {"mac": "AA:BB:CC:DD:EE:01", "broadcast": "192.168.1.255"}])
+    c.w._wol_step(time.time())
+    assert sent == [("AA:BB:CC:DD:EE:01", "192.168.1.255")]
+
+
+# ================================================================== журнал программы по запросу администратора
+
+def test_pack_log_fits_limit():
+    body = os.urandom(300_000)                                  # не сжимается
+    data = rc.pack_log("заголовок\n", body, limit=100_000)
+    import gzip
+    text = gzip.decompress(data)
+    assert len(data) <= 100_000 and text.startswith("заголовок\n".encode()) and body.endswith(text[-1000:])
+
+
+def test_log_request_end_to_end(make_client, company, server, monkeypatch, tmp_path):
+    logs = tmp_path / "logs"; logs.mkdir()
+    (logs / "client.log.1").write_text("старая строка\n", encoding="utf-8")
+    (logs / "client.log").write_text("строка журнала\n" * 1000, encoding="utf-8")
+    monkeypatch.setattr(rc, "log_dir", lambda: logs)
+    c = make_client("KASSA-01")
+    login(c, company, name="Касса"); c.step(2)
+    assert c.w.cfg["log_request"] is False
+    pc = device_id(company, "Касса")
+    r = company.cab.post(BASE + f"/cabinet/devices/{pc}/log_request")
+    assert "Журнал Касса запрошен" in r.text
+    c.step()
+    page = company.cab.get(BASE + "/cabinet").text
+    import re
+    m = re.search(r'href="/cabinet/logs/(\d+)"', page)
+    assert m, page[-3000:]
+    text = company.cab.get(BASE + f"/cabinet/logs/{m.group(1)}").text
+    assert text.startswith(f"Retix Hub {rc.VERSION} — журнал программы")
+    assert "ПК: Касса" in text and "старая строка" in text and text.rstrip().endswith("строка журнала")
+    assert c.state.get("token") not in text and "join123" not in text   # без секретов
+    c.step()
+    assert c.w.cfg["log_request"] is False
+    assert len(re.findall(r'href="/cabinet/logs/', company.cab.get(BASE + "/cabinet").text)) == 1   # один раз

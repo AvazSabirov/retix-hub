@@ -1,7 +1,8 @@
 """Кабинет компании. Компания берётся ТОЛЬКО из сессии — чужие данные недоступны."""
 from fastapi import APIRouter, Depends, Form, Request
+from fastapi.responses import Response
 
-from .. import db, services
+from .. import db, services, telegram
 from ..auth import check_pw, client_ip, hash_pw, limiter
 from ..web import LoginRequired, redirect, templates
 
@@ -58,15 +59,65 @@ def index(request: Request, ctx=Depends(current_company), msg: str = "", err: in
         "remote_modes": services.REMOTE_MODES, "remote_access": services.REMOTE_ACCESS,
         "remote_mode": services.remote_mode(company), "remote_log": remote_log,
         "online": sum(d["online"] for d in devices),
+        "logs": services.company_logs(conn, company["id"]), "log_prefix": "/cabinet/logs/",
+        "tg": tg_view(company), "tg_prefix": "/cabinet/telegram/",
         "action_prefix": "/cabinet/devices/", "logout_url": "/cabinet/logout",
         "msg": msg, "err": err})
+
+
+def tg_view(company) -> dict:
+    """Что показать в блоке «Telegram» (кабинет и суперадмин)."""
+    code = telegram.link_code(company)
+    return {"enabled": telegram.enabled(), "bot": telegram.bot_username, "chat": company["tg_chat_title"] or
+            ("группа" if company["tg_chat_id"] else ""), "linked": bool(company["tg_chat_id"]), "code": code,
+            "url": telegram.link_url(code), "ttl": telegram.LINK_TTL // 60}
+
+
+def log_response(conn, company_id: int, log_id: int):
+    found = services.log_file(conn, company_id, log_id)
+    if not found:
+        return None
+    name, text = found
+    return Response(text, media_type="text/plain; charset=utf-8",
+                    headers={"Content-Disposition": f'attachment; filename="{name}"'})
+
+
+@router.get("/logs/{log_id}")
+def download_log(log_id: int, ctx=Depends(current_company)):
+    conn, company = ctx
+    return log_response(conn, company["id"], log_id) or redirect("/cabinet", "Журнал не найден", err=True)
+
+
+@router.post("/telegram/link")
+def telegram_link(ctx=Depends(current_company)):
+    conn, company = ctx
+    if not telegram.enabled():
+        return redirect("/cabinet", "Telegram-бот не настроен на сервере Retix Hub", err=True)
+    telegram.new_link_code(conn, company)
+    return redirect("/cabinet#telegram", f"Код создан, действует {telegram.LINK_TTL // 60} минут")
+
+
+@router.post("/telegram/unlink")
+def telegram_unlink(ctx=Depends(current_company)):
+    conn, company = ctx
+    telegram.unlink(conn, company, "кабинет")
+    return redirect("/cabinet#telegram", "Группа Telegram отключена")
+
+
+@router.post("/telegram/test")
+def telegram_test(ctx=Depends(current_company)):
+    conn, company = ctx
+    if not company["tg_chat_id"]:
+        return redirect("/cabinet#telegram", "Группа Telegram не подключена", err=True)
+    telegram.send(company["tg_chat_id"], "Проверка: сообщения от Retix Hub приходят в эту группу ✅")
+    return redirect("/cabinet#telegram", "Проверочное сообщение отправлено в группу")
 
 
 @router.post("/devices/{device_id}/{action}")
 def device_action(device_id: int, action: str, value: str = Form(""), ctx=Depends(current_company)):
     conn, company = ctx
     try:
-        msg = services.device_action(conn, company["id"], device_id, action, value)
+        msg = services.device_action(conn, company["id"], device_id, action, value, actor="кабинет")
     except (LookupError, ValueError) as e:
         return redirect("/cabinet", str(e), err=True)
     return redirect("/cabinet", msg)

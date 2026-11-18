@@ -29,12 +29,14 @@ def _ago(ts: int) -> str:
 
 
 templates.env.filters["ago"] = _ago
+templates.env.filters["ts"] = lambda ts: time.strftime("%Y-%m-%d %H:%M", time.localtime(ts)) if ts else "—"
 templates.env.globals["server_version"] = APP_VERSION   # в шапке суперадмина: какой сервер сейчас работает
 
 
 def redirect(url: str, msg: str = "", err: bool = False) -> RedirectResponse:
     if msg:
-        url += ("&" if "?" in url else "?") + urlencode({"msg": msg, **({"err": 1} if err else {})})
+        url, hash_, fragment = url.partition("#")   # сообщение — до «#раздела», иначе браузер его не пошлёт
+        url += ("&" if "?" in url else "?") + urlencode({"msg": msg, **({"err": 1} if err else {})}) + hash_ + fragment
     return RedirectResponse(url, status_code=303)
 
 

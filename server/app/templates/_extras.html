@@ -1,0 +1,40 @@
+{% macro telegram_card(tg, prefix, admin=False) %}
+<div class="card" id="telegram">
+  <h2>Telegram</h2>
+  {% if tg.linked %}
+    <p>Подключена группа <b>{{ tg.chat }}</b>: сюда приходят запросы на подключение новых компьютеров, одобрить или заблокировать можно кнопками под сообщением.</p>
+    <p class="muted">Нажать кнопки может любой участник группы: кого добавить в группу, решает администратор компании. Кто нажал — в журнале компании.</p>
+    <div class="actions">
+      {% if not admin %}<form method="post" action="{{ prefix }}test"><button class="small">Проверить</button></form>{% endif %}
+      <form method="post" action="{{ prefix }}unlink" data-confirm="Отключить группу {{ tg.chat }}? Запросы на подключение туда больше не придут."><button class="small danger">Отключить группу</button></form>
+    </div>
+  {% elif not tg.enabled %}
+    <p class="muted">Telegram-бот не настроен на сервере Retix Hub{% if admin %} (TELEGRAM_BOT_TOKEN в .env){% endif %}.</p>
+  {% elif admin %}
+    <p class="muted">Группа не подключена. Подключает её администратор компании в своём кабинете.</p>
+  {% elif tg.code %}
+    <p>Код действует {{ tg.ttl }} минут.</p>
+    {% if tg.url %}<p><a class="btn primary" href="{{ tg.url }}" target="_blank" rel="noopener">Выбрать группу в Telegram</a></p>
+    <p class="muted">Telegram предложит группу, куда добавить бота, и сам отправит туда код. Или добавьте бота{% if tg.bot %} @{{ tg.bot }}{% endif %} в группу вручную и отправьте в ней:</p>
+    {% else %}<p class="muted">Добавьте бота в группу компании и отправьте в ней:</p>{% endif %}
+    <p><code>/link{% if tg.bot %}@{{ tg.bot }}{% endif %} {{ tg.code }}</code></p>
+  {% else %}
+    <p class="muted">Подключите группу Telegram компании — в неё будут приходить запросы на подключение новых компьютеров, и одобрять их можно прямо из Telegram.</p>
+    <form method="post" action="{{ prefix }}link"><button class="primary">Подключить группу</button></form>
+  {% endif %}
+</div>
+{% endmacro %}
+
+{% macro logs_card(logs, devices, prefix) %}
+{% set pending = devices | selectattr('log_requested_at') | list %}
+{% if logs or pending %}
+<div class="card">
+  <h2>Журналы компьютеров</h2>
+  <table class="log">
+    {% for d in pending %}<tr><td class="muted log-time">запрошен</td><td>{{ d.name }}</td><td class="muted">{{ d.log_requested_at | ago }} · ждём ответа ПК{% if not d.online %} (сейчас не в сети){% endif %}</td></tr>{% endfor %}
+    {% for l in logs %}<tr><td class="muted log-time">{{ l.created_at | ts }}</td><td>{{ l.name }} <code>{{ l.ip }}</code></td><td><a href="{{ prefix }}{{ l.id }}">скачать</a> <span class="muted">{{ (l.size / 1024) | round | int }} КБ</span></td></tr>{% endfor %}
+  </table>
+  <p class="muted">Кнопка «Журнал» у компьютера в списке выше просит программу прислать свой журнал: она сделает это при следующей связи с сервером. Хранятся последние 5 журналов каждого ПК.</p>
+</div>
+{% endif %}
+{% endmacro %}

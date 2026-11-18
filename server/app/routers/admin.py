@@ -4,10 +4,11 @@ from urllib.parse import urlencode
 
 from fastapi import APIRouter, Depends, Form, Request
 
-from .. import db, services
+from .. import db, services, telegram
 from ..auth import client_ip, hash_pw, limiter
 from ..config import SUPERADMIN_LOGIN, SUPERADMIN_PASSWORD
 from ..web import LoginRequired, redirect, templates
+from .cabinet import log_response, tg_view
 
 router = APIRouter(prefix="/admin", include_in_schema=False)
 
@@ -105,6 +106,8 @@ def company_page(request: Request, company_id: int, conn=Depends(require_admin),
         "remote_modes": services.REMOTE_MODES, "remote_access": services.REMOTE_ACCESS,
         "remote_mode": services.remote_mode(c),
         "online": sum(d["online"] for d in devices), "log": log,
+        "logs": services.company_logs(conn, c["id"]), "log_prefix": f"/admin/companies/{c['id']}/logs/",
+        "tg": tg_view(c), "tg_prefix": f"/admin/companies/{c['id']}/telegram/",
         "action_prefix": f"/admin/companies/{c['id']}/devices/", "logout_url": "/admin/logout", "admin_nav": "companies",
         "msg": msg, "err": err})
 
@@ -172,6 +175,19 @@ def device_action(company_id: int, device_id: int, action: str, value: str = For
     c = get_company(conn, company_id)
     url = f"/admin/companies/{c['id']}"
     try:
-        return redirect(url, services.device_action(conn, c["id"], device_id, action, value))
+        return redirect(url, services.device_action(conn, c["id"], device_id, action, value, actor="суперадмин"))
     except (LookupError, ValueError) as e:
         return redirect(url, str(e), err=True)
+
+
+@router.get("/companies/{company_id}/logs/{log_id}")
+def download_log(company_id: int, log_id: int, conn=Depends(require_admin)):
+    c = get_company(conn, company_id)
+    return log_response(conn, c["id"], log_id) or redirect(f"/admin/companies/{c['id']}", "Журнал не найден", err=True)
+
+
+@router.post("/companies/{company_id}/telegram/unlink")
+def telegram_unlink(company_id: int, conn=Depends(require_admin)):
+    c = get_company(conn, company_id)
+    telegram.unlink(conn, c, "суперадмин")
+    return redirect(f"/admin/companies/{c['id']}", "Группа Telegram отключена")

@@ -2,7 +2,7 @@ import os
 import secrets
 
 APP_NAME = "Retix Hub"
-APP_VERSION = "1.0.20"   # версия сервера — та же, что у клиента (client VERSION), поднимается вместе с ней
+APP_VERSION = "1.0.21"   # версия сервера — та же, что у клиента (client VERSION), поднимается вместе с ней
 PUBLIC_URL = os.getenv("PUBLIC_URL", "https://hub.retix.uz")
 
 DATA_DIR = os.getenv("DATA_DIR", "/data")
@@ -50,6 +50,11 @@ API_PORT = int(os.getenv("API_PORT", "8100"))
 
 SUPERADMIN_LOGIN = os.getenv("SUPERADMIN_LOGIN", "admin")
 SUPERADMIN_PASSWORD = os.getenv("SUPERADMIN_PASSWORD", "")
+
+# Telegram-бот (@BotFather): группа компании получает запросы на подключение новых ПК и одобряет их кнопками.
+# Пусто — бот выключен. Бот сам спрашивает Telegram о новых сообщениях (getUpdates): входящих адресов не нужно.
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_API = os.getenv("TELEGRAM_API", "https://api.telegram.org").rstrip("/")
 
 COOKIE_SECURE = os.getenv("COOKIE_SECURE", "1") == "1"
 

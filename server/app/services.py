@@ -101,7 +101,8 @@ def list_devices(conn, company_id: int) -> list[dict]:
         direct = [names[i] for i in _json_ints(r["direct_ids"]) if i in names] \
             if full_lan and online and time.time() - r["lan_at"] < LAN_FRESH_SECONDS else []
         out.append(dict(r, online=online, status=device_status(r), direct_peers=direct,
-                        remote_effective=effective_remote_mode(r, company) if company else "off"))
+                        remote_effective=effective_remote_mode(r, company) if company else "off",
+                        wol_ready=bool(_nics(r))))
     return out
 
 
@@ -373,7 +374,185 @@ def client_config(conn, dev, company) -> dict:
         "direct_wan": wan_neighbors(conn, dev, company),   # ПК других офисов: прямой путь через интернет
         "time": int(time.time()),   # часы сервера: ПК пробуют прямой путь через интернет одновременно
         "remote": remote_config(conn, dev, company),   # удалённое управление (RustDesk), клиент 1.0.16+
+        "log_request": bool(dev["log_requested_at"]),  # администратор ждёт журнал программы (клиент 1.0.21+)
+        # сообщать ли сетевые карты (MAC) для включения по сети: только пока включено удалённое управление
+        "wol": wol_enabled(company) and device_status(dev) == "active",
     }
+
+
+# ---------- включение по сети (Wake-on-LAN) ----------
+# Выключенный ПК не может сам выйти на связь. Его будит «волшебный пакет» в его локальной сети: шлёт его
+# включённый ПК той же компании из той же подсети. Каждый ПК (клиент 1.0.21+, удалённое управление в компании
+# включено) сообщает в heartbeat свои сетевые карты: адрес в локальной сети и MAC. Сервер помнит последние
+# известные карты выключенного ПК, находит включённый ПК в той же подсети и в /api/me отдаёт ему MAC
+# и широковещательный адрес подсети. Включить ПК может администратор (кабинет, суперадмин) и ПК с правом
+# «управляет» — только пока в компании включено удалённое управление.
+
+MAC_RE = re.compile(r"^([0-9A-F]{2})([:-]?[0-9A-F]{2}){5}$")
+NICS_MAX = 16
+WOL_HELPER_FRESH = 900    # сек: сетевые карты помощника сообщены не раньше — он и сейчас в той сети
+WOL_DELIVER_TTL = 120     # сек: команда не забрана за это время (помощник выключился) — не отдаём
+WOL_REPEAT = 15           # сек: чаще одну и ту же команду не создаём (двойное нажатие)
+WOL_HELPERS = 2           # через сколько ПК слать пакет (на случай, если один как раз выключается)
+
+
+def clean_mac(value) -> str:
+    """'aa-bb-cc-dd-ee-ff' -> 'AA:BB:CC:DD:EE:FF'; '' — не MAC одной сетевой карты (пустой, групповой, FF…)."""
+    raw = str(value or "").strip().upper()
+    if not MAC_RE.match(raw):
+        return ""
+    hexs = raw.replace(":", "").replace("-", "")
+    if hexs in ("000000000000", "FFFFFFFFFFFF") or int(hexs[:2], 16) & 1:
+        return ""
+    return ":".join(hexs[i:i + 2] for i in range(0, 12, 2))
+
+
+def clean_nics(nics) -> list[dict]:
+    """Сетевые карты ПК: адрес в частной локальной сети (как clean_lan) и MAC."""
+    out = []
+    for n in nics or []:
+        if not isinstance(n, dict):
+            continue
+        addr, mac = clean_lan([n.get("addr")]), clean_mac(n.get("mac"))
+        if addr and mac and ipaddress.IPv4Interface(addr[0]).network.prefixlen <= 30:
+            item = {"addr": addr[0], "mac": mac}
+            if item not in out:
+                out.append(item)
+    return out[:NICS_MAX]
+
+
+def _nics(dev) -> list[dict]:
+    try:
+        return clean_nics(json.loads(dev["nics"] or "[]"))
+    except (ValueError, TypeError, KeyError, IndexError):
+        return []
+
+
+def wol_enabled(company) -> bool:
+    return remote_mode(company) != "off"
+
+
+def wake_helpers(conn, target, company, limit: int = WOL_HELPERS) -> list[tuple]:
+    """[(ПК-помощник, [(широковещательный адрес, MAC), …]), …]: включённые ПК компании в одной подсети
+    с выключенным. Сначала — за тем же внешним IP (тот же офис: у двух офисов может быть одна 192.168.1.0/24)."""
+    now = time.time()
+    targets = [(ipaddress.IPv4Interface(n["addr"]).network, n["mac"]) for n in _nics(target)]
+    target_pub = _public_ip(target["endpoint"])
+    found = []
+    for o in conn.execute("SELECT * FROM devices WHERE company_id=? AND id<>? AND is_blocked=0 AND is_approved=1 "
+                          "AND token_hash IS NOT NULL ORDER BY id", (company["id"], target["id"])).fetchall():
+        if not is_online(o) or now - o["nics_at"] > WOL_HELPER_FRESH:
+            continue
+        own = {ipaddress.IPv4Interface(n["addr"]).network for n in _nics(o)}
+        jobs = []
+        for net, mac in targets:
+            job = (str(net.broadcast_address), mac)
+            if net in own and job not in jobs:
+                jobs.append(job)
+        if jobs:
+            same_office = bool(target_pub) and _public_ip(o["endpoint"]) == target_pub
+            found.append((0 if same_office else 1, o["id"], o, jobs))
+    found.sort(key=lambda x: (x[0], x[1]))
+    return [(o, jobs) for _, _, o, jobs in found[:limit]]
+
+
+def wake_device(conn, company, target_id: int, actor: str = "") -> str:
+    """Команда включить выключенный ПК. Сообщение для пользователя; ValueError/LookupError — почему нельзя."""
+    target = conn.execute("SELECT * FROM devices WHERE id=? AND company_id=?", (target_id, company["id"])).fetchone()
+    if not target:
+        raise LookupError("Устройство не найдено")
+    if not wol_enabled(company):
+        raise ValueError("Включение по сети доступно, когда в компании включено удалённое управление")
+    if device_status(target) != "active":
+        raise ValueError(f"{target['name']} не одобрен или заблокирован")
+    if is_online(target):
+        raise ValueError(f"{target['name']} уже в сети")
+    if not _nics(target):
+        raise ValueError(f"MAC-адрес {target['name']} ещё неизвестен: компьютер должен хотя бы раз выйти на связь "
+                         "с Retix Hub 1.0.21 или новее, пока в компании включено удалённое управление")
+    helpers = wake_helpers(conn, target, company)
+    if not helpers:
+        raise ValueError(f"Некому включить {target['name']}: в его локальной сети сейчас нет включённого "
+                         "компьютера компании с Retix Hub 1.0.21 или новее")
+    now = int(time.time())
+    with db.write_lock:
+        if conn.execute("SELECT 1 FROM wake_requests WHERE target_id=? AND created_at>?",
+                        (target["id"], now - WOL_REPEAT)).fetchone():
+            raise ValueError(f"Команда включения {target['name']} уже отправлена, подождите немного")
+        conn.execute("DELETE FROM wake_requests WHERE created_at<?", (now - 86400,))
+        for helper, jobs in helpers:
+            conn.executemany("INSERT INTO wake_requests(company_id, target_id, helper_id, mac, broadcast, created_at) "
+                             "VALUES (?,?,?,?,?,?)",
+                             [(company["id"], target["id"], helper["id"], mac, bcast, now) for bcast, mac in jobs])
+        names = ", ".join(h["name"] for h, _ in helpers)
+        audit(conn, company["id"], "device_wake",
+              f"{target['name']} {target['ip']} через {names}" + (f" ({actor})" if actor else ""))
+        conn.commit()
+    return (f"Команда включения {target['name']} отправлена через {names}. Компьютер включится за минуту, "
+            "если в его BIOS и сетевой карте разрешено пробуждение по сети (Wake-on-LAN)")
+
+
+def take_wake_jobs(conn, dev) -> list[dict]:
+    """Команды «разбудить» для этого ПК-помощника (каждая отдаётся один раз)."""
+    if device_status(dev) != "active":
+        return []
+    now = int(time.time())
+    rows = conn.execute("SELECT w.id, w.mac, w.broadcast, w.target_id, d.name FROM wake_requests w "
+                        "JOIN devices d ON d.id=w.target_id WHERE w.helper_id=? AND w.delivered_at=0 "
+                        "AND w.created_at>? ORDER BY w.id LIMIT 32", (dev["id"], now - WOL_DELIVER_TTL)).fetchall()
+    if not rows:
+        return []
+    conn.executemany("UPDATE wake_requests SET delivered_at=? WHERE id=?", [(now, r["id"]) for r in rows])
+    conn.commit()
+    return [{"id": r["target_id"], "name": r["name"], "mac": r["mac"], "broadcast": r["broadcast"]} for r in rows]
+
+
+# ---------- журнал программы с ПК ----------
+# Администратор нажимает «Журнал» у ПК — сервер ставит отметку, ПК видит её в следующем /api/me (через секунды)
+# и присылает свой журнал (/api/log, gzip). Без запроса ПК журнал не шлёт и сервер его не примет.
+
+LOG_UPLOAD_MAX = 900_000       # байт gzip: nginx по умолчанию пропускает тело до 1 МБ
+LOG_TEXT_MAX = 16_000_000      # байт после распаковки — больше не распаковываем (защита от «zip-бомбы»)
+LOG_KEEP = 5                   # журналов на ПК хранится
+
+
+def request_log(conn, dev, actor: str = "") -> str:
+    with db.write_lock:
+        conn.execute("UPDATE devices SET log_requested_at=? WHERE id=?", (int(time.time()), dev["id"]))
+        audit(conn, dev["company_id"], "log_request", f"{dev['name']} {dev['ip']}" + (f" ({actor})" if actor else ""))
+        conn.commit()
+    return (f"Журнал {dev['name']} запрошен: программа пришлёт его при следующей связи с сервером (обычно за "
+            "несколько секунд, если ПК в сети). Нужна Retix Hub 1.0.21 или новее")
+
+
+def save_log(conn, dev, data: bytes, size: int) -> None:
+    with db.write_lock:
+        conn.execute("INSERT INTO device_logs(company_id, device_id, created_at, size, data) VALUES (?,?,?,?,?)",
+                     (dev["company_id"], dev["id"], int(time.time()), size, data))
+        conn.execute("DELETE FROM device_logs WHERE device_id=? AND id NOT IN "
+                     "(SELECT id FROM device_logs WHERE device_id=? ORDER BY id DESC LIMIT ?)",
+                     (dev["id"], dev["id"], LOG_KEEP))
+        conn.execute("UPDATE devices SET log_requested_at=0 WHERE id=?", (dev["id"],))
+        audit(conn, dev["company_id"], "log_received", f"{dev['name']} {dev['ip']}: {size // 1024} КБ")
+        conn.commit()
+
+
+def company_logs(conn, company_id: int) -> list:
+    return conn.execute("SELECT l.id, l.created_at, l.size, d.name, d.ip FROM device_logs l "
+                        "JOIN devices d ON d.id=l.device_id WHERE l.company_id=? ORDER BY l.id DESC LIMIT 30",
+                        (company_id,)).fetchall()
+
+
+def log_file(conn, company_id: int, log_id: int):
+    """(имя файла, текст) журнала своей компании или None."""
+    import gzip
+    row = conn.execute("SELECT l.*, d.hostname FROM device_logs l JOIN devices d ON d.id=l.device_id "
+                       "WHERE l.id=? AND l.company_id=?", (log_id, company_id)).fetchone()
+    if not row:
+        return None
+    stamp = time.strftime("%Y%m%d-%H%M", time.localtime(row["created_at"]))
+    host = clean_hostname(row["hostname"]) or f"pc{row['device_id']}"
+    return f"retixhub-{host}-{stamp}.txt", gzip.decompress(row["data"])
 
 
 # ---------- синхронизация сети с базой ----------
@@ -462,12 +641,17 @@ def revoke_tokens(conn, where: str, args: tuple) -> None:
 
 # ---------- действия над устройствами (кабинет и админка) ----------
 
-def device_action(conn, company_id: int, device_id: int, action: str, value: str = "") -> str:
-    """Возвращает сообщение для пользователя. company_id ограничивает доступ."""
+def device_action(conn, company_id: int, device_id: int, action: str, value: str = "", actor: str = "") -> str:
+    """Возвращает сообщение для пользователя. company_id ограничивает доступ. actor — кто (для журнала)."""
     dev = conn.execute("SELECT * FROM devices WHERE id=? AND company_id=?",
                        (device_id, company_id)).fetchone()
     if not dev:
         raise LookupError("Устройство не найдено")
+    if action == "log_request":
+        return request_log(conn, dev, actor)
+    if action == "wake":
+        company = conn.execute("SELECT * FROM companies WHERE id=?", (company_id,)).fetchone()
+        return wake_device(conn, company, device_id, actor)
 
     with db.write_lock:
         if action == "approve":
@@ -517,7 +701,8 @@ def device_action(conn, company_id: int, device_id: int, action: str, value: str
             msg = "Переименовано"
         else:
             raise ValueError("Неизвестное действие")
-        audit(conn, company_id, f"device_{action}", f"{dev['name']} {dev['ip']} {value}".strip())
+        audit(conn, company_id, f"device_{action}",
+              f"{dev['name']} {dev['ip']} {value}".strip() + (f" ({actor})" if actor else ""))
         conn.commit()
         reconcile(conn)
     return msg

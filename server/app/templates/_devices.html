@@ -8,6 +8,7 @@
       <span class="dot {{ 'on' if d.online }}"></span>{{ 'online' if d.online else 'offline' }}
       {% if d.status == 'pending' %}<span class="tag warn">ждёт одобрения</span>{% endif %}
       {% if d.status == 'blocked' %}<span class="tag bad">заблокирован</span>{% endif %}
+      {% if d.log_requested_at %}<span class="tag" title="Программа на ПК пришлёт журнал при следующей связи с сервером (Retix Hub 1.0.21+)">журнал запрошен</span>{% endif %}
     </td>
     <td data-label="Имя">
       <form class="rename" method="post" action="{{ prefix }}{{ d.id }}/rename">
@@ -42,6 +43,9 @@
     </td>
     {% endif %}
     <td class="actions">
+      {% if remote_on and d.status == 'active' and not d.online and d.wol_ready %}
+        <form method="post" action="{{ prefix }}{{ d.id }}/wake"><button class="small primary" title="Включить по сети (Wake-on-LAN): команду отправит включённый ПК компании из той же локальной сети">Включить</button></form>
+      {% endif %}
       {% if d.status == 'pending' %}
         <form method="post" action="{{ prefix }}{{ d.id }}/approve"><button class="small primary">Одобрить</button></form>
       {% endif %}
@@ -50,6 +54,7 @@
       {% else %}
         <form method="post" action="{{ prefix }}{{ d.id }}/block"><button class="small danger" title="Устройство не сможет подключиться, даже зная пароль">Блок</button></form>
       {% endif %}
+      <form method="post" action="{{ prefix }}{{ d.id }}/log_request"><button class="small" title="Запросить журнал программы Retix Hub с этого ПК: он появится ниже, в «Журналах компьютеров»">Журнал</button></form>
       <form method="post" action="{{ prefix }}{{ d.id }}/delete" data-confirm="Удалить {{ d.name }}? Если на ПК сохранён пароль компании, он зарегистрируется снова. Чтобы запретить навсегда — используйте «Блок»."><button class="small danger">Удалить</button></form>
     </td>
   </tr>
