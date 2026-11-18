@@ -1027,6 +1027,32 @@ def test_direct_lost_falls_back(make_client, company, server, monkeypatch):
     assert not a.tunnel.peers and a.w.direct.active_ids() == []
 
 
+def test_direct_lan_retry_in_common_slot(make_client, company, server, monkeypatch):
+    """Путь пропал у обоих ПК в разное время — оба повторяют в начале общего окна по часам сервера, а не
+    каждый через своё время: иначе проверка одного попадала на паузу другого раз за разом."""
+    lan, a, b = lan_pair(make_client, company, server)
+    a.step(); b.step(); a.step(); b.step()
+    assert direct_peer(a, b)["allowed_ips"]
+    lan.blocked = True
+    monkeypatch.setattr(rc, "DIRECT_RX_TIMEOUT", -1)
+    a.step()
+    time.sleep(1.2)                                                        # B замечает обрыв позже A
+    b.step()
+    ka, kb = b.state.keypair()[1], a.state.keypair()[1]
+    ua, ub = a.w.direct.backoff[ka][0], b.w.direct.backoff[kb][0]
+    for u, c in ((ua, a), (ub, b)):
+        t = (u + c.w.direct.clock) % rc.DIRECT_RETRY_LOST
+        assert min(t, rc.DIRECT_RETRY_LOST - t) < 1e-3 and time.time() < u <= time.time() + rc.DIRECT_RETRY_LOST + 1
+    assert abs(ua - ub) < 1.5 or abs(abs(ua - ub) - rc.DIRECT_RETRY_LOST) < 1.5   # одно окно (или соседнее)
+    # окно наступило — оба пробуют снова одновременно и соединяются
+    lan.blocked = False
+    monkeypatch.setattr(rc, "DIRECT_RX_TIMEOUT", 35)
+    for c, k in ((a, ka), (b, kb)):
+        c.w.direct.backoff[k] = (time.time() - 1, c.w.direct.backoff[k][1])
+    a.step(); b.step(); a.step(); b.step()
+    assert direct_peer(a, b)["allowed_ips"] and direct_peer(b, a)["allowed_ips"]
+
+
 def test_direct_neighbor_blocked_is_removed(make_client, company, server):
     lan, a, b = lan_pair(make_client, company, server)
     a.step(); b.step(); a.step()
