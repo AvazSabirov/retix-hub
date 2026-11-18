@@ -1680,6 +1680,7 @@ def fake_rustdesk(monkeypatch, patch_windows):
     monkeypatch.setattr(rc, "rustdesk_service_state", lambda: RD_NOW["rd"].service)
     monkeypatch.setattr(rc, "rustdesk_ready", lambda: RD_NOW["rd"].service == "running")
     monkeypatch.setattr(rc, "RUSTDESK_START_WAIT", 0)
+    monkeypatch.setattr(rc, "rustdesk_msi_product", lambda: None)
 
     def sc(args, timeout=60):
         if args[:2] == ["sc", "start"] and RD_NOW["rd"].start_works:
@@ -1949,3 +1950,32 @@ def test_combine_remote_mode():
     assert c("off", "own", True) == "off"                                        # администратор выключил
     with pytest.raises(ValueError):
         rc.rustdesk_options("auto", "", "10.66.0.1")                             # пустой whitelist пустил бы всех
+
+
+def test_remote_broken_msi_rustdesk_removed_then_installed(make_client, company, fake_rustdesk, monkeypatch):
+    """1.0.19: на ПК стоял RustDesk из MSI без службы. Установщик-exe поверх MSI не ставит («Cannot install the
+    EXE package over an existing MSI installation») — сломанный MSI удаляется тихо, потом ставится RustDesk."""
+    rd = FakeRustDesk()
+    rd.service = "missing"
+    steps = []
+    guid = "{CD24A421-5DFB-4EC7-9E1A-7930D58ADA49}"
+    monkeypatch.setattr(rc, "rustdesk_msi_product", lambda: guid)
+    monkeypatch.setattr(rc, "remove_rustdesk_msi", lambda product: steps.append(("msi", product)) or True)
+    monkeypatch.setattr(rc, "install_rustdesk",
+                        lambda: steps.append(("install",)) or setattr(rd, "service", "running") or True)
+    company.cab.post(BASE + "/cabinet/settings", data={"share_name": "share", "share_ports": "445",
+                                                       "remote_mode": "ask"})
+    controller(make_client, company)
+    c = make_client("PC1"); login(c, company, name="Касса"); step_as(c, rd, 2)
+    assert steps == [("msi", guid), ("install",)] and c.w.remote_ok is True
+
+
+def test_msi_guid_parse_and_remove(monkeypatch):
+    assert rc.MSI_GUID_RE.search("MsiExec.exe /qn /X {CD24A421-5DFB-4EC7-9E1A-7930D58ADA49}").group(0) == \
+        "{CD24A421-5DFB-4EC7-9E1A-7930D58ADA49}"
+    calls = []
+    monkeypatch.setattr(rc, "run_rd", lambda args, timeout=30: (calls.append(args), (1605, ""))[1])
+    assert rc.remove_rustdesk_msi("{CD24A421-5DFB-4EC7-9E1A-7930D58ADA49}") is True    # уже удалён — тоже успех
+    assert calls[-1] == ["msiexec", "/x", "{CD24A421-5DFB-4EC7-9E1A-7930D58ADA49}", "/qn", "/norestart"]
+    monkeypatch.setattr(rc, "run_rd", lambda args, timeout=30: (1603, "ошибка"))
+    assert rc.remove_rustdesk_msi("{CD24A421-5DFB-4EC7-9E1A-7930D58ADA49}") is False

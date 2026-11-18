@@ -1118,6 +1118,42 @@ def start_rustdesk() -> bool:
     return rustdesk_ready()
 
 
+MSI_GUID_RE = re.compile(r"\{[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}\}")
+
+
+def rustdesk_msi_product() -> str | None:
+    """RustDesk, поставленный MSI-пакетом (раньше, не Retix Hub): код продукта {…} для msiexec /x.
+    Установщик RustDesk в виде exe поверх MSI не ставит: «Cannot install the EXE package over an existing MSI»."""
+    if not WINDOWS:
+        return None
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                            r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\RustDesk") as k:
+            values = {}
+            for name in ("WindowsInstaller", "UninstallString", "QuietUninstallString"):
+                try:
+                    values[name] = winreg.QueryValueEx(k, name)[0]
+                except OSError:
+                    pass
+    except OSError:
+        return None
+    if values.get("WindowsInstaller") != 1:
+        return None
+    m = MSI_GUID_RE.search(str(values.get("QuietUninstallString") or values.get("UninstallString") or ""))
+    return m.group(0) if m else None
+
+
+def remove_rustdesk_msi(product: str) -> bool:
+    """Тихо удалить сломанный RustDesk из MSI (файлы есть, службы нет), чтобы поставить его заново."""
+    log.warning("RustDesk: стоит MSI-пакет %s без службы — удаляю его, чтобы поставить заново", product)
+    code, out = run_rd(["msiexec", "/x", product, "/qn", "/norestart"], timeout=600)
+    if code not in (0, 1605, 3010):   # 1605 — уже не установлен, 3010 — нужна перезагрузка
+        log.error("RustDesk: MSI не удалился (код %s) %s", code, " ".join(out.split())[:300])
+        return False
+    return True
+
+
 def rustdesk_installer() -> Path | None:
     """Официальный установщик RustDesk, вложенный в установщик Retix Hub (rustdesk-<версия>-x86_64.exe)."""
     found = sorted(app_dir().glob("rustdesk-*.exe"), key=lambda p: vkey(p.name.split("-")[1]) or (0,))
@@ -1808,6 +1844,9 @@ class Worker(threading.Thread):
             self.remote_install_at = now
             if exe:
                 log.warning("RustDesk: rustdesk.exe есть, а службы нет — ставлю заново")
+                product = rustdesk_msi_product()
+                if product:
+                    remove_rustdesk_msi(product)
             if install_rustdesk():
                 self.state.set(rustdesk_by_retix=True, remote_applied="")
                 installed = True
