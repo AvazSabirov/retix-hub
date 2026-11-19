@@ -2155,3 +2155,31 @@ def test_log_request_end_to_end(make_client, company, server, monkeypatch, tmp_p
     c.step()
     assert c.w.cfg["log_request"] is False
     assert len(re.findall(r'href="/cabinet/logs/', company.cab.get(BASE + "/cabinet").text)) == 1   # один раз
+
+
+# ================================================================== сборка для Windows 8.1
+
+def test_win81_build_config():
+    """Один установщик для 8.1/10/11: на 8.1 — своя сборка (Python 3.11, старая cryptography) и WireGuard 0.5.3."""
+    import re
+    client = ROOT / "client"
+    iss = (client / "RetixHub.iss").read_text(encoding="utf-8-sig")
+    assert re.search(r"^MinVersion=6\.3", iss, re.M)                       # ставится на 8.1
+    files = [l for l in iss.splitlines() if l.startswith("Source:")]
+    win10 = [l for l in files if "Check: not IsWin81" in l]
+    win81 = [l for l in files if re.search(r"Check: IsWin81\b", l)]
+    assert any("{#DistDir}" in l for l in win10) and any("wireguard\\wireguard-amd64" in l for l in win10)
+    assert any("{#Dist81Dir}" in l for l in win81) and any("wireguard81\\wireguard-amd64" in l for l in win81)
+    # программа и WireGuard — только с условием: на ПК не попадают обе сборки сразу
+    assert not [l for l in files if ("DistDir" in l or "wireguard" in l) and "IsWin81" not in l]
+    assert "ucrtbase.dll" in iss                                           # 8.1 без UCRT — понятная ошибка
+    # cryptography для 8.1 — собрана до Rust 1.78 (ему нужна Windows 10)
+    pins = (client / "requirements-win81.txt").read_text(encoding="utf-8")
+    m = re.search(r"^cryptography==(\d+)\.(\d+)\.(\d+)$", pins, re.M)
+    assert m and tuple(map(int, m.groups())) <= (42, 0, 5)
+    bat = (client / "build.bat").read_text(encoding="utf-8")
+    assert "-c requirements-win81.txt" in bat and "--distpath dist81" in bat and "call :selftest dist81\\RetixHub" in bat
+    wg = (client / "get_wireguard.ps1").read_text(encoding="utf-8-sig")
+    assert "Get-WireGuard 'wireguard81'" in wg and "'0.5.3'" in wg
+    wf = (ROOT / ".github/workflows/client.yml").read_text(encoding="utf-8")
+    assert "python-version: '3.11'" in wf and "PY81: ${{ steps.py311.outputs.python-path }}" in wf

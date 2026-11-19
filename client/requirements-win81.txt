@@ -1,0 +1,4 @@
+# Ограничения для сборки под Windows 8.1 (build.bat: Python 3.11, pip install -r requirements.txt -c этот файл).
+# cryptography 42.0.6 и новее собраны Rust 1.78+, а ему нужна Windows 10: на 8.1 модуль не загрузится
+# («DLL load failed … The specified procedure could not be found»). 42.0.5 (февраль 2024) собрана Rust 1.76.
+cryptography==42.0.5

@@ -206,6 +206,22 @@ DNS: A-запись `hub.retix.uz` → IP сервера. SSL: см. выше (`
 `client_config.json`, официальный WireGuard (ставится сам, если его нет) и официальный RustDesk
 (ставится, только когда в компании включают удалённое управление).
 
+**Windows 8.1, 10 и 11 (x64) — один установщик.** Свежие WireGuard for Windows (0.6+), Python 3.13+ и
+`cryptography`, собранная Rust 1.78+, требуют Windows 10. Поэтому внутри установщика две сборки программы и два
+WireGuard, а на ПК ставится только нужное (`IsWin81` в `RetixHub.iss`):
+
+| | Windows 10/11 | Windows 8.1 |
+|---|---|---|
+| программа | `dist\RetixHub`: Python 3.12, свежие пакеты | `dist81\RetixHub`: Python 3.11, `cryptography` 42.0.5 (`requirements-win81.txt`) |
+| WireGuard | последний с download.wireguard.com | 0.5.3 — последний, что работает на 8.1 (`WIREGUARD_WIN81`) |
+
+Обновления у всех одни и те же: тот же установщик, та же публикация в «Обновлениях». ПК, который обновили с 8.1
+до Windows 10, при следующем обновлении Retix Hub получит обычную сборку. На 8.1 нужно обновление Windows
+KB2999226 (Universal C Runtime) — без него установщик скажет об этом и не продолжит. WireGuard 0.5.3 больше
+не получает исправлений, а сама Windows 8.1 — обновлений безопасности (с января 2023): такие ПК лучше перевести
+на Windows 10/11. RustDesk на 8.1 не проверялся: если он не встанет, удалённое управление этим ПК не заработает,
+остальное работает.
+
 ### Сборка в GitHub
 
 Workflow `.github/workflows/client.yml` собирает установщик на Windows **только для выпуска**:
@@ -227,15 +243,17 @@ Workflow `.github/workflows/client.yml` собирает установщик н
 
 ### Сборка на своём ПК
 
-Нужны Windows 10/11 x64, Python 3.10+ (64-бит) и [Inno Setup 6.3+](https://jrsoftware.org/isdl.php).
+Нужны Windows 10/11 x64, Python 3.10+ (64-бит, в PATH), Python 3.11 (64-бит — для сборки под Windows 8.1;
+`build.bat` берёт `py -3.11` или путь из `PY81`) и [Inno Setup 6.3+](https://jrsoftware.org/isdl.php).
 ```
 cd client
 :: при необходимости поменяйте server_url в client_config.json
 build.bat
 ```
 `build.bat`: ставит зависимости → PyInstaller (`RetixHub.spec`, onedir) → самопроверка собранного exe
-(`RetixHub.exe --selftest`: Tcl/Tk, cryptography, SSL, иконка) → скачивает WireGuard MSI с проверкой подписи
-(`get_wireguard.ps1`) → скачивает RustDesk с проверкой SHA-256 и подписи (`get_rustdesk.ps1`, версия — последний
+(`RetixHub.exe --selftest`: Tcl/Tk, cryptography, SSL, иконка) → то же для Windows 8.1 в окружении `.venv81`
+(Python 3.11, `-c requirements-win81.txt`, результат `dist81\RetixHub`) → скачивает WireGuard MSI с проверкой
+подписи: свежий в `wireguard\` и 0.5.3 в `wireguard81\` (`get_wireguard.ps1`) → скачивает RustDesk с проверкой SHA-256 и подписи (`get_rustdesk.ps1`, версия — последний
 релиз или `RUSTDESK_VERSION`) → Inno Setup (`RetixHub.iss`). Результат: `client\dist\RetixHub_Setup_<версия>.exe`.
 
 ### Установщик

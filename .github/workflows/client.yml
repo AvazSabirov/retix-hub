@@ -73,6 +73,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Python 3.11 — сборка программы для Windows 8.1 (build.bat, PY81); 3.12 — для Windows 10/11, он в PATH
+      - uses: actions/setup-python@v5
+        id: py311
+        with:
+          python-version: '3.11'
+          architecture: x64
+
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
@@ -96,7 +103,7 @@ jobs:
           $text = Get-Content client/CHANGELOG.md -Raw -Encoding UTF8
           $m = [regex]::Match($text, "(?ms)^## $([regex]::Escape($v))\s*\r?\n(.*?)(?=^## |\z)")
           $notes = if ($m.Success) { $m.Groups[1].Value.Trim() } else { "" }
-          $body = "## Что нового`n`n$notes`n`n---`n`nУстановщик клиента Retix Hub для Windows 10/11 (x64). WireGuard внутри — ставится сам, если его нет.`n`n" +
+          $body = "## Что нового`n`n$notes`n`n---`n`nУстановщик клиента Retix Hub для Windows 8.1, 10 и 11 (x64): на 8.1 ставится своя сборка программы и WireGuard 0.5.3. WireGuard внутри — ставится сам, если его нет.`n`n" +
                   "Выпуск на ПК: суперадмин → **Обновления** → загрузить ``RetixHub_Setup_$v.exe`` → опубликовать. ПК обновятся сами.`n`n" +
                   "Тихая установка вручную: ``RetixHub_Setup_$v.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART``"
           Set-Content -Path release_notes.md -Value $body -Encoding UTF8
@@ -105,6 +112,7 @@ jobs:
         shell: cmd
         env:
           GITHUB_TOKEN: ${{ github.token }}   # get_rustdesk.ps1: релиз RustDesk через API GitHub без лимита
+          PY81: ${{ steps.py311.outputs.python-path }}   # Python 3.11: сборка для Windows 8.1
         run: client\build.bat
 
       - uses: actions/upload-artifact@v4
