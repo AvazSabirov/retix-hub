@@ -17,7 +17,7 @@ from conftest import ROOT, fake_setup, new_pubkey
 try:
     import tkinter  # noqa: F401
 except ImportError:
-    tk = types.ModuleType("tkinter"); tk.Tk = tk.Toplevel = tk.Canvas = tk.Label = object
+    tk = types.ModuleType("tkinter"); tk.Tk = tk.Toplevel = tk.Canvas = tk.Label = tk.Frame = object
     sys.modules["tkinter"] = tk
     for sub in ("messagebox", "simpledialog", "ttk"):
         sys.modules[f"tkinter.{sub}"] = types.ModuleType(sub)
