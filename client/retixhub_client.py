@@ -21,6 +21,7 @@ import hmac
 import ipaddress
 import json
 import logging
+import ntpath
 import os
 import platform
 import queue
@@ -40,7 +41,7 @@ import requests
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
 
-VERSION = "1.0.24"
+VERSION = "1.0.25"
 APP_NAME = "RetixHub"          # служебное имя: папки, задачи, мьютекс
 APP_TITLE = "Retix Hub"        # то, что видит пользователь
 TUNNEL = "retixhub"
@@ -1574,12 +1575,33 @@ def verify_manifest(info: dict, keys: list[str]) -> dict:
     return {"version": version, "size": size, "sha256": sha, "file": str(m.get("file") or "")}
 
 
+RESTART_AFTER = 240   # сек — страховка автообновления: программы нет столько после запуска установщика — запустить
+
+
+def setup_log_path() -> Path:
+    """Журнал последней установки или обновления (копирует установщик; его прикладывает «Журнал» администратора)."""
+    return log_dir() / "setup.log"
+
+
 def launch_installer(path: Path) -> None:
     """Тихая установка новой версии. Через «start», а не дочерним процессом: если установщику
     придётся закрыть RetixHub.exe силой, он не погибнет вместе с ним.
-    /AUTOUPDATE=1 — после установки установщик сам запустит новый клиент (в трее)."""
+    /AUTOUPDATE=1 — после установки установщик сам запустит новый клиент (в трее). Свой журнал установщик
+    кладёт в logs\\setup.log (RetixHub.iss)."""
     subprocess.Popen(["cmd", "/c", "start", "", str(path), "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART",
                       "/AUTOUPDATE=1"], creationflags=CREATE_NO_WINDOW)
+    if getattr(sys, "frozen", False):
+        restart_watchdog(Path(sys.executable))
+
+
+def restart_watchdog(exe: Path, delay: int = RESTART_AFTER) -> None:
+    """Страховка: установщик не запустил программу после обновления (или установка не удалась) — через
+    несколько минут её запустит отдельный cmd, иначе ПК остаётся без программы до перезагрузки. Программа уже
+    работает — ничего не делает (а лишний запуск с --minimized окно не открывает)."""
+    name = ntpath.basename(str(exe))
+    script = (f'ping -n {delay + 1} 127.0.0.1 >nul & tasklist /NH /FI "IMAGENAME eq {name}" | find /I "{name}" >nul'
+              f' || start "" "{exe}" --minimized')
+    subprocess.Popen(f'cmd /s /c "{script}"', creationflags=CREATE_NO_WINDOW)
 
 
 class Updater(threading.Thread):
@@ -1649,6 +1671,9 @@ class Updater(threading.Thread):
             self._cleanup()
         elif time.time() - attempt.get("at", 0) > INSTALL_GRACE:
             log.warning("обновление до %s не установилось (работает %s)", ver, VERSION)
+            tail = _tail(setup_log_path(), 3_000).decode("utf-8", "replace").replace("\r", "").strip()
+            if tail:
+                log.warning("журнал установщика (конец):\n%s", tail)
             self._set_state(f"failed:{ver}")
 
     def check(self) -> str | None:
@@ -2053,6 +2078,10 @@ class Worker(threading.Thread):
         crash = _tail(log_dir() / "crash.log", 64_000)
         if crash.strip():
             lines += ["", "--- crash.log (конец)", crash.decode("utf-8", "replace").rstrip()]
+        setup = _tail(setup_log_path(), 16_000)
+        if setup.strip():
+            lines += ["", "--- журнал последней установки (setup.log, конец)",
+                      setup.decode("utf-8", "replace").replace("\r", "").rstrip()]
         return "\n".join(lines + ["", "--- client.log", ""])
 
     def _log_step(self, now: float):
@@ -5061,15 +5090,16 @@ def _k32():
     return k
 
 
-def signal_running_instance() -> bool:
-    """Программа уже запущена? Тогда показать её окно и выйти (без лишнего окна UAC)."""
+def signal_running_instance(show: bool = True) -> bool:
+    """Программа уже запущена? Тогда показать её окно (show) и выйти (без лишнего окна UAC)."""
     if not WINDOWS:
         return False
     k = _k32()
     h = k.OpenEventW(0x0002 | 0x00100000, False, SHOW_EVENT)   # EVENT_MODIFY_STATE | SYNCHRONIZE
     if not h:
         return False
-    k.SetEvent(h)
+    if show:
+        k.SetEvent(h)
     k.CloseHandle(h)
     return True
 
@@ -5218,8 +5248,10 @@ def main():
     if "--selftest" in sys.argv:
         sys.exit(selftest())
     uninstall = "--uninstall" in sys.argv
-    # уже запущена — показать окно; до UAC, чтобы не спрашивать права зря
-    if not uninstall and signal_running_instance():
+    # уже запущена — показать окно; до UAC, чтобы не спрашивать права зря. С --minimized (автозапуск,
+    # перезапуск после обновления) — окно не открывать
+    show = "--minimized" not in sys.argv
+    if not uninstall and signal_running_instance(show):
         return
     if WINDOWS and not is_admin():
         relaunch_as_admin()
@@ -5230,7 +5262,7 @@ def main():
         log.info("удаление программы: очистка")
         sys.exit(uninstall_cleanup())
     if not single_instance():
-        signal_running_instance()
+        signal_running_instance(show)
         return
     log.info("старт %s (%s)", VERSION, " ".join(sys.argv[1:]) or "без параметров")
     show_event = create_show_event() if WINDOWS else None

@@ -933,6 +933,13 @@ def test_launch_installer_detached(monkeypatch):
     rc.launch_installer(Path("C:/ProgramData/RetixHub/update/RetixHub_Setup_1.0.6.exe"))
     args = calls[0]
     assert args[:4] == ["cmd", "/c", "start", ""] and "/VERYSILENT" in args and args[-1] == "/AUTOUPDATE=1"
+    assert len(calls) == 1                                       # из исходников страховочный перезапуск не нужен
+    monkeypatch.setattr(rc.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(rc.sys, "executable", r"C:\Program Files\RetixHub\RetixHub.exe")
+    rc.launch_installer(Path("C:/ProgramData/RetixHub/update/RetixHub_Setup_1.0.6.exe"))
+    watchdog = calls[-1]
+    assert watchdog.startswith('cmd /s /c "ping -n 241 127.0.0.1') and 'find /I "RetixHub.exe"' in watchdog
+    assert watchdog.endswith('|| start "" "C:\\Program Files\\RetixHub\\RetixHub.exe" --minimized"')
 
 
 def test_hidden_peers_in_client(make_client, company):
