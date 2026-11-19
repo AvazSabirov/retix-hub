@@ -56,6 +56,7 @@ def index(request: Request, ctx=Depends(current_company), msg: str = "", err: in
     return templates.TemplateResponse(request, "cabinet.html", {
         "title": company["name"] or company["login"], "company": company,
         "subnet": services.subnet(company), "devices": devices,
+        "roles": services.list_roles(conn, company["id"]), "role_prefix": "/cabinet/roles/",
         "remote_modes": services.REMOTE_MODES, "remote_access": services.REMOTE_ACCESS,
         "remote_mode": services.remote_mode(company), "remote_log": remote_log,
         "online": sum(d["online"] for d in devices),
@@ -121,6 +122,27 @@ def device_action(device_id: int, action: str, value: str = Form(""), ctx=Depend
     except (LookupError, ValueError) as e:
         return redirect("/cabinet", str(e), err=True)
     return redirect("/cabinet", msg)
+
+
+@router.post("/roles/add")
+def role_add(value: str = Form(""), ctx=Depends(current_company)):
+    conn, company = ctx
+    return role_redirect("/cabinet", conn, company["id"], "add", 0, value, "кабинет")
+
+
+@router.post("/roles/{role_id}/{action}")
+def role_change(role_id: int, action: str, value: str = Form(""), ctx=Depends(current_company)):
+    conn, company = ctx
+    return role_redirect("/cabinet", conn, company["id"], action, role_id, value, "кабинет")
+
+
+def role_redirect(url: str, conn, company_id: int, action: str, role_id: int, value: str, actor: str):
+    """Роли компании (кабинет и суперадмин): действие и возврат к блоку «Роли»."""
+    try:
+        msg = services.role_action(conn, company_id, action, role_id, value, actor=actor)
+    except (LookupError, ValueError) as e:
+        return redirect(url + "#roles", str(e), err=True)
+    return redirect(url + "#roles", msg)
 
 
 @router.post("/settings")

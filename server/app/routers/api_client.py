@@ -235,6 +235,9 @@ def peers(ctx=Depends(current_device)):
             # выключен, но его можно включить по сети (этому ПК разрешено управлять)
             "wake": me_controls and not d["online"] and d["wol_ready"] and d["id"] != dev["id"],
             "is_me": d["id"] == dev["id"],
+            # роль (группа) из кабинета: в программе список разбит на группы по ролям, по порядку role_pos
+            "role": d["role"],
+            "role_pos": d["role_pos"],
         })
     return {"company": company["name"] or company["login"], "peers": result, "peers_hidden": hidden}
 

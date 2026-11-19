@@ -1,6 +1,6 @@
 {% extends "base.html" %}
 {% from "_devices.html" import devices_table %}
-{% from "_extras.html" import telegram_card, logs_card %}
+{% from "_extras.html" import telegram_card, logs_card, roles_card %}
 {% block content %}
 <p><a href="/admin">← Все компании</a></p>
 <div class="card">
@@ -16,8 +16,9 @@
 </div>
 <div class="card">
   <h2>Компьютеры</h2>
-  {{ devices_table(devices, action_prefix, remote_mode != 'off', remote_access) }}
+  {{ devices_table(devices, action_prefix, remote_mode != 'off', remote_access, roles) }}
 </div>
+{{ roles_card(roles, role_prefix) }}
 {{ logs_card(logs, devices, log_prefix) }}
 <div class="grid">
   <div class="card">

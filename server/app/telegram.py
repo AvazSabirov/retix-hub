@@ -35,7 +35,7 @@ TOKEN_RE = re.compile(r"^\d{5,15}:[A-Za-z0-9_-]{30,64}$")
 LINK_TTL = 900          # сек — код из кабинета действует 15 минут
 POLL_TIMEOUT = 25       # сек — long polling getUpdates
 ALLOWED_UPDATES = ["message", "callback_query", "my_chat_member"]
-CALLBACK_RE = re.compile(r"^(ap|bl):(\d{1,10})$")
+CALLBACK_RE = re.compile(r"^(ap|bl):(\d{1,10})(?::(\d{1,10}))?$")   # ap:ПК[:роль]
 CODE_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
 
 bot_username = ""       # из getMe: для ссылки и команд в кабинете
@@ -173,9 +173,20 @@ def _who(user: dict) -> str:
     return name[:100]
 
 
-def request_buttons(device_id: int) -> list:
-    return [[{"text": "✅ Одобрить", "callback_data": f"ap:{device_id}"},
-             {"text": "⛔ Заблокировать", "callback_data": f"bl:{device_id}"}]]
+ROLE_BUTTONS_MAX = 12   # больше ролей — одобрить с ролью можно в кабинете
+
+
+def request_buttons(device_id: int, roles: list | None = None) -> list:
+    """Кнопки под запросом. Есть роли в компании — «Одобрить» для каждой роли (по две в ряд) и без роли."""
+    roles = (roles or [])[:ROLE_BUTTONS_MAX]
+    if not roles:
+        return [[{"text": "✅ Одобрить", "callback_data": f"ap:{device_id}"},
+                 {"text": "⛔ Заблокировать", "callback_data": f"bl:{device_id}"}]]
+    keys = [{"text": f"✅ {r['name']}", "callback_data": f"ap:{device_id}:{r['id']}"} for r in roles]
+    rows = [keys[i:i + 2] for i in range(0, len(keys), 2)]
+    rows.append([{"text": "✅ Без роли", "callback_data": f"ap:{device_id}:0"},
+                 {"text": "⛔ Заблокировать", "callback_data": f"bl:{device_id}"}])
+    return rows
 
 
 def request_text(company, dev, reason: str = "new", from_ip: str = "") -> str:
@@ -204,7 +215,8 @@ def notify_pending(conn, device_id: int, reason: str = "new", from_ip: str = "")
     company = conn.execute("SELECT * FROM companies WHERE id=?", (dev["company_id"],)).fetchone() if dev else None
     if not company or not company["tg_chat_id"] or services.device_status(dev) != "pending":
         return
-    send(company["tg_chat_id"], request_text(company, dev, reason, from_ip), request_buttons(dev["id"]))
+    send(company["tg_chat_id"], request_text(company, dev, reason, from_ip),
+         request_buttons(dev["id"], services.list_roles(conn, company["id"])))
 
 
 # ---------- привязка группы (кабинет) ----------
@@ -294,7 +306,7 @@ def _on_pending(conn, chat: dict, quiet: bool = False) -> None:
     for c in companies:
         for d in conn.execute("SELECT * FROM devices WHERE company_id=? AND is_approved=0 AND is_blocked=0 "
                               "ORDER BY id LIMIT 20", (c["id"],)).fetchall():
-            send(chat_id, request_text(c, d, "pending"), request_buttons(d["id"]))
+            send(chat_id, request_text(c, d, "pending"), request_buttons(d["id"], services.list_roles(conn, c["id"])))
             sent += 1
     if not sent and not quiet:
         _reply(chat_id, "Никто не ждёт одобрения.")
@@ -334,14 +346,18 @@ def _on_callback(conn, cq: dict) -> None:
         close(f"— уже {done}")
         return
     action = "approve" if m.group(1) == "ap" else "block"
+    role = m.group(3) if action == "approve" else None   # None — кнопка без роли из старых сообщений
     who = _who(user)
     try:
-        services.device_action(conn, dev["company_id"], dev["id"], action, actor=f"Telegram: {who}")
-    except (LookupError, ValueError) as e:
-        answer(str(e), alert=True)
+        msg_text = services.device_action(conn, dev["company_id"], dev["id"], action, role or "",
+                                          actor=f"Telegram: {who}")
+    except (LookupError, ValueError) as e:   # роль успели удалить в кабинете — сообщение с кнопками остаётся
+        answer(f"{e}. Выберите другую роль или одобрите в кабинете" if role else str(e), alert=True)
         return
-    answer("Одобрено" if action == "approve" else "Заблокировано")
-    close(("✅ Одобрил: " if action == "approve" else "⛔ Заблокировал: ") + _esc(who))
+    named = msg_text.partition(", роль ")[2]   # «…одобрено, роль «Склад»»
+    answer(("Одобрено" + (f", роль {named}" if named else "")) if action == "approve" else "Заблокировано")
+    close(("✅ Одобрил: " if action == "approve" else "⛔ Заблокировал: ") + _esc(who)
+          + (f" · роль {_esc(named)}" if named else ""))
 
 
 def _on_member(conn, upd: dict) -> None:

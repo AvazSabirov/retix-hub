@@ -95,15 +95,97 @@ def list_devices(conn, company_id: int) -> list[dict]:
     names = {r["id"]: r["name"] for r in rows}
     company = conn.execute("SELECT * FROM companies WHERE id=?", (company_id,)).fetchone()
     full_lan = bool(company and company["full_lan"])
+    roles = {r["id"]: (i, r["name"]) for i, r in enumerate(list_roles(conn, company_id))}
     out = []
     for r in rows:
         online = is_online(r)
         direct = [names[i] for i in _json_ints(r["direct_ids"]) if i in names] \
             if full_lan and online and time.time() - r["lan_at"] < LAN_FRESH_SECONDS else []
+        pos, role = roles.get(r["role_id"], (len(roles), ""))
         out.append(dict(r, online=online, status=device_status(r), direct_peers=direct,
                         remote_effective=effective_remote_mode(r, company) if company else "off",
-                        wol_ready=bool(_nics(r))))
+                        wol_ready=bool(_nics(r)), role_id=r["role_id"] if role else 0, role=role, role_pos=pos))
     return out
+
+
+# ---------- роли (группы) компьютеров ----------
+# Роли создаёт администратор компании в кабинете («Склад», «Администраторы» …) и назначает ПК — при одобрении
+# или в списке компьютеров. В программе список ПК разбит на группы по ролям. На сеть роль не влияет.
+
+ROLE_NAME_MAX = 40
+ROLES_MAX = 30
+
+
+def clean_role_name(value) -> str:
+    return " ".join("".join(ch for ch in str(value or "") if ch.isprintable()).split())[:ROLE_NAME_MAX]
+
+
+def list_roles(conn, company_id: int) -> list[dict]:
+    """Роли компании по порядку групп, с числом ПК в каждой."""
+    rows = conn.execute("SELECT r.*, (SELECT COUNT(*) FROM devices d WHERE d.role_id=r.id AND d.company_id=r.company_id)"
+                        " AS devices FROM roles r WHERE r.company_id=? ORDER BY r.position, r.id",
+                        (company_id,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def role_id_value(conn, company_id: int, value) -> int:
+    """id роли из формы: '' или 0 — без роли; чужая или несуществующая роль — ошибка."""
+    value = str(value or "").strip()
+    if value in ("", "0"):
+        return 0
+    if not value.isdigit() or not conn.execute("SELECT 1 FROM roles WHERE id=? AND company_id=?",
+                                               (int(value), company_id)).fetchone():
+        raise ValueError("Роль не найдена")
+    return int(value)
+
+
+def role_action(conn, company_id: int, action: str, role_id: int = 0, value: str = "", actor: str = "") -> str:
+    """Роли компании: add (value — имя), rename, delete, up, down. Возвращает сообщение для пользователя."""
+    with db.write_lock:
+        roles = list_roles(conn, company_id)
+        if action == "add":
+            name = clean_role_name(value)
+            if not name:
+                raise ValueError("Введите название роли")
+            if len(roles) >= ROLES_MAX:
+                raise ValueError(f"Не больше {ROLES_MAX} ролей")
+            if any(r["name"].lower() == name.lower() for r in roles):
+                raise ValueError(f"Роль «{name}» уже есть")
+            conn.execute("INSERT INTO roles(company_id, name, position) VALUES (?,?,?)",
+                         (company_id, name, max([r["position"] for r in roles] or [0]) + 1))
+            msg = f"Роль «{name}» создана"
+        else:
+            role = next((r for r in roles if r["id"] == role_id), None)
+            if not role:
+                raise LookupError("Роль не найдена")
+            name = role["name"]
+            if action == "rename":
+                new = clean_role_name(value)
+                if not new:
+                    raise ValueError("Введите название роли")
+                if any(r["name"].lower() == new.lower() and r["id"] != role_id for r in roles):
+                    raise ValueError(f"Роль «{new}» уже есть")
+                conn.execute("UPDATE roles SET name=? WHERE id=?", (new, role_id))
+                msg, value = f"Роль «{name}» теперь «{new}»", new
+            elif action == "delete":
+                conn.execute("UPDATE devices SET role_id=0 WHERE role_id=? AND company_id=?", (role_id, company_id))
+                conn.execute("DELETE FROM roles WHERE id=?", (role_id,))
+                msg = f"Роль «{name}» удалена, её компьютеры — без роли"
+            elif action in ("up", "down"):
+                i = roles.index(role)
+                j = i - 1 if action == "up" else i + 1
+                if not 0 <= j < len(roles):
+                    return f"Роль «{name}» уже {'первая' if action == 'up' else 'последняя'}"
+                roles[i], roles[j] = roles[j], roles[i]
+                for pos, r in enumerate(roles, 1):   # порядок 1..N без пропусков
+                    conn.execute("UPDATE roles SET position=? WHERE id=?", (pos, r["id"]))
+                msg = f"Роль «{name}» — {'выше' if action == 'up' else 'ниже'}"
+            else:
+                raise ValueError("Неизвестное действие")
+        audit(conn, company_id, f"role_{action}", f"{name} {value if action == 'rename' else ''}".strip()
+              + (f" ({actor})" if actor else ""))
+        conn.commit()
+    return msg
 
 
 def share_host(conn, company_id: int):
@@ -655,8 +737,17 @@ def device_action(conn, company_id: int, device_id: int, action: str, value: str
 
     with db.write_lock:
         if action == "approve":
-            conn.execute("UPDATE devices SET is_approved=1 WHERE id=?", (device_id,))
-            msg = "Устройство одобрено"
+            role_id = role_id_value(conn, company_id, value) if value else dev["role_id"]
+            conn.execute("UPDATE devices SET is_approved=1, role_id=? WHERE id=?", (role_id, device_id))
+            role = conn.execute("SELECT name FROM roles WHERE id=?", (role_id,)).fetchone()
+            msg = "Устройство одобрено" + (f", роль «{role['name']}»" if role else "")
+            value = role["name"] if role else ""
+        elif action == "role":
+            role_id = role_id_value(conn, company_id, value)
+            conn.execute("UPDATE devices SET role_id=? WHERE id=?", (role_id, device_id))
+            role = conn.execute("SELECT name FROM roles WHERE id=?", (role_id,)).fetchone()
+            msg = f"{dev['name']}: " + (f"роль «{role['name']}»" if role else "без роли")
+            value = role["name"] if role else "без роли"
         elif action == "block":
             conn.execute("UPDATE devices SET is_blocked=1 WHERE id=?", (device_id,))
             msg = "Устройство заблокировано"

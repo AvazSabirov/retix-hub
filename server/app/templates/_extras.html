@@ -38,3 +38,39 @@
 </div>
 {% endif %}
 {% endmacro %}
+
+{% macro roles_card(roles, prefix) %}
+<div class="card" id="roles">
+  <h2>Роли компьютеров</h2>
+  <p class="muted">Роли делят список компьютеров в программе Retix Hub на группы: «Склад» — компьютеры склада, «Администраторы» — компьютеры администраторов и т. д. Роль выбирается при одобрении ПК (и в Telegram) или в списке компьютеров. Порядок групп в программе — как здесь. На доступ в сети роль не влияет.</p>
+  {% if roles %}
+  <table class="log roles">
+    {% for r in roles %}
+    <tr>
+      <td>
+        <form class="rename" method="post" action="{{ prefix }}{{ r.id }}/rename">
+          <input type="text" name="value" value="{{ r.name }}" maxlength="40" required><button class="small" title="Переименовать">✓</button>
+        </form>
+      </td>
+      <td class="muted nowrap">{{ r.devices }} ПК</td>
+      <td class="actions">
+        <form method="post" action="{{ prefix }}{{ r.id }}/up"><button class="small" title="Выше в списке программы" {{ 'disabled' if loop.first }}>↑</button></form>
+        <form method="post" action="{{ prefix }}{{ r.id }}/down"><button class="small" title="Ниже в списке программы" {{ 'disabled' if loop.last }}>↓</button></form>
+        <form method="post" action="{{ prefix }}{{ r.id }}/delete" data-confirm="Удалить роль {{ r.name }}? Её компьютеры останутся в сети, но без роли."><button class="small danger">Удалить</button></form>
+      </td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% endif %}
+  <form class="rename role-add" method="post" action="{{ prefix }}add">
+    <input type="text" name="value" maxlength="40" placeholder="Новая роль, например Склад" required><button class="small primary">Добавить роль</button>
+  </form>
+</div>
+{% endmacro %}
+
+{% macro role_select(roles, selected=0, title="Роль компьютера") %}
+<select name="value" title="{{ title }}">
+  <option value="0" {{ 'selected' if not selected }}>без роли</option>
+  {% for r in roles %}<option value="{{ r.id }}" {{ 'selected' if r.id == selected }}>{{ r.name }}</option>{% endfor %}
+</select>
+{% endmacro %}

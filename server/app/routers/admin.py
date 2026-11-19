@@ -8,7 +8,7 @@ from .. import db, services, telegram
 from ..auth import client_ip, hash_pw, limiter
 from ..config import SUPERADMIN_LOGIN, SUPERADMIN_PASSWORD
 from ..web import LoginRequired, csrf_ok, csrf_token, redirect, templates
-from .cabinet import log_response, tg_view
+from .cabinet import log_response, role_redirect, tg_view
 
 router = APIRouter(prefix="/admin", include_in_schema=False)
 
@@ -103,6 +103,7 @@ def company_page(request: Request, company_id: int, conn=Depends(require_admin),
     log = conn.execute("SELECT * FROM audit_log WHERE company_id=? ORDER BY id DESC LIMIT 30", (c["id"],)).fetchall()
     return templates.TemplateResponse(request, "admin_company.html", {
         "title": c["login"], "company": c, "subnet": services.subnet(c), "devices": devices,
+        "roles": services.list_roles(conn, c["id"]), "role_prefix": f"/admin/companies/{c['id']}/roles/",
         "remote_modes": services.REMOTE_MODES, "remote_access": services.REMOTE_ACCESS,
         "remote_mode": services.remote_mode(c),
         "online": sum(d["online"] for d in devices), "log": log,
@@ -167,6 +168,18 @@ def delete_company(company_id: int, confirm: str = Form(""), conn=Depends(requir
         conn.commit()
         services.reconcile(conn)
     return redirect("/admin", f"Компания {c['login']} удалена")
+
+
+@router.post("/companies/{company_id}/roles/add")
+def role_add(company_id: int, value: str = Form(""), conn=Depends(require_admin)):
+    c = get_company(conn, company_id)
+    return role_redirect(f"/admin/companies/{c['id']}", conn, c["id"], "add", 0, value, "суперадмин")
+
+
+@router.post("/companies/{company_id}/roles/{role_id}/{action}")
+def role_change(company_id: int, role_id: int, action: str, value: str = Form(""), conn=Depends(require_admin)):
+    c = get_company(conn, company_id)
+    return role_redirect(f"/admin/companies/{c['id']}", conn, c["id"], action, role_id, value, "суперадмин")
 
 
 @router.post("/companies/{company_id}/devices/{device_id}/{action}")
