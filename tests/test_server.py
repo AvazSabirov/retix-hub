@@ -2286,3 +2286,111 @@ class TestBotToken:
         finally:
             telegram.apply("")
         assert not telegram.enabled() and started[1][0].is_set()
+
+
+# ---------------------------------------------------------------- роли (группы) компьютеров
+
+def _role_ids(login):
+    from app import db
+    conn = db.connect()
+    rows = conn.execute("SELECT r.name, r.id FROM roles r JOIN companies c ON c.id=r.company_id WHERE c.login=? "
+                        "ORDER BY r.position, r.id", (login,)).fetchall()
+    conn.close()
+    return {name: rid for name, rid in rows}
+
+
+class TestRoles:
+    def test_create_rename_order_delete(self, ctx):
+        ctx.company("firma1")
+        cab = ctx.cabinet("firma1")
+        for name in ("Склад", "  Администраторы  ", "Кассы"):
+            assert "создана" in cab.post("/cabinet/roles/add", data={"value": name}).text
+        assert "уже есть" in cab.post("/cabinet/roles/add", data={"value": "склад"}).text
+        assert "Введите название" in cab.post("/cabinet/roles/add", data={"value": "   "}).text
+        roles = _role_ids("firma1")
+        assert list(roles) == ["Склад", "Администраторы", "Кассы"]
+        page = cab.get("/cabinet").text
+        assert "Роли компьютеров" in page and "Администраторы" in page
+        cab.post(f"/cabinet/roles/{roles['Кассы']}/up")
+        assert list(_role_ids("firma1")) == ["Склад", "Кассы", "Администраторы"]
+        assert "уже первая" in cab.post(f"/cabinet/roles/{roles['Склад']}/up").text
+        cab.post(f"/cabinet/roles/{roles['Склад']}/rename", data={"value": "Склад №1"})
+        assert "уже есть" in cab.post(f"/cabinet/roles/{roles['Кассы']}/rename", data={"value": "склад №1"}).text
+        cab.post(f"/cabinet/roles/{roles['Администраторы']}/delete")
+        assert list(_role_ids("firma1")) == ["Склад №1", "Кассы"]
+
+    def test_role_of_other_company_untouchable(self, ctx):
+        ctx.company("firma1"); ctx.company("firma2")
+        ctx.cabinet("firma2").post("/cabinet/roles/add", data={"value": "Чужая"})
+        rid = _role_ids("firma2")["Чужая"]
+        cab = ctx.cabinet("firma1")
+        assert "Роль не найдена" in cab.post(f"/cabinet/roles/{rid}/delete").text
+        assert "Роль не найдена" in cab.post(f"/cabinet/roles/{rid}/rename", data={"value": "Моя"}).text
+        d = ctx.register("firma1")
+        assert "Роль не найдена" in cab.post(f"/cabinet/devices/{d['device_id']}/role", data={"value": rid}).text
+        assert _role_ids("firma2") == {"Чужая": rid}
+
+    def test_approve_with_role_and_peers_grouping(self, ctx):
+        ctx.company("firma1", approval=True)
+        cab = ctx.cabinet("firma1")
+        cab.post("/cabinet/roles/add", data={"value": "Администраторы"})
+        cab.post("/cabinet/roles/add", data={"value": "Склад"})
+        roles = _role_ids("firma1")
+        a = ctx.register("firma1", "Склад 1")
+        b = ctx.register("firma1", "Админ")
+        c = ctx.register("firma1", "Касса")
+        page = cab.get("/cabinet").text
+        assert "Роль, с которой ПК войдёт в сеть" in page
+        r = cab.post(f"/cabinet/devices/{a['device_id']}/approve", data={"value": roles["Склад"]})
+        assert "одобрено, роль «Склад»" in r.text
+        cab.post(f"/cabinet/devices/{b['device_id']}/approve", data={"value": roles["Администраторы"]})
+        cab.post(f"/cabinet/devices/{c['device_id']}/approve")
+        peers = {p["name"]: p for p in ctx.api.get("/api/peers", headers=ctx.h(a["token"])).json()["peers"]}
+        assert (peers["Склад 1"]["role"], peers["Админ"]["role"], peers["Касса"]["role"]) == ("Склад", "Администраторы", "")
+        assert peers["Админ"]["role_pos"] < peers["Склад 1"]["role_pos"] < peers["Касса"]["role_pos"]
+        # смена роли в списке и удаление роли
+        cab.post(f"/cabinet/devices/{c['device_id']}/role", data={"value": roles["Склад"]})
+        cab.post(f"/cabinet/roles/{roles['Администраторы']}/delete")
+        peers = {p["name"]: p for p in ctx.api.get("/api/peers", headers=ctx.h(a["token"])).json()["peers"]}
+        assert (peers["Склад 1"]["role"], peers["Админ"]["role"], peers["Касса"]["role"]) == ("Склад", "", "Склад")
+        cab.post(f"/cabinet/devices/{c['device_id']}/role", data={"value": "0"})
+        peers = {p["name"]: p for p in ctx.api.get("/api/peers", headers=ctx.h(a["token"])).json()["peers"]}
+        assert peers["Касса"]["role"] == ""
+
+    def test_admin_manages_roles(self, ctx):
+        cid = ctx.company("firma1")
+        assert "создана" in ctx.admin.post(f"/admin/companies/{cid}/roles/add", data={"value": "Склад"}).text
+        rid = _role_ids("firma1")["Склад"]
+        d = ctx.register("firma1")
+        ctx.admin.post(f"/admin/companies/{cid}/devices/{d['device_id']}/role", data={"value": rid})
+        page = ctx.admin.get(f"/admin/companies/{cid}").text
+        assert "Роли компьютеров" in page and f'value="{rid}" selected' in page
+        ctx.admin.post(f"/admin/companies/{cid}/roles/{rid}/delete")
+        assert _role_ids("firma1") == {}
+
+    def test_telegram_approve_with_role(self, ctx, tg):
+        ctx.company("firma1", approval=True)
+        cab, _ = _link_group(ctx, tg)
+        cab.post("/cabinet/roles/add", data={"value": "Склад"})
+        cab.post("/cabinet/roles/add", data={"value": "Администраторы"})
+        roles = _role_ids("firma1")
+        pc = ctx.register("firma1", "Склад 2")
+        msg = tg[1]()[0][1]
+        data = [b["callback_data"] for row in msg["reply_markup"]["inline_keyboard"] for b in row]
+        did = pc["device_id"]
+        assert data == [f"ap:{did}:{roles['Склад']}", f"ap:{did}:{roles['Администраторы']}", f"ap:{did}:0", f"bl:{did}"]
+        out = _press(tg, f"ap:{did}:{roles['Склад']}")
+        assert any(m == "answerCallbackQuery" and p["text"] == "Одобрено, роль «Склад»" for m, p in out)
+        edit = next(p for m, p in out if m == "editMessageText")
+        assert "роль «Склад»" in edit["text"]
+        peers = ctx.api.get("/api/peers", headers=ctx.h(pc["token"])).json()["peers"]
+        assert peers[0]["role"] == "Склад"
+        # роль удалили, пока сообщение висело в группе — ПК не одобряется, сообщение остаётся
+        pc2 = ctx.register("firma1", "Ещё")
+        tg[1]()
+        cab.post(f"/cabinet/roles/{roles['Администраторы']}/delete")
+        out = _press(tg, f"ap:{pc2['device_id']}:{roles['Администраторы']}")
+        assert any(m == "answerCallbackQuery" and p["show_alert"] for m, p in out)
+        assert ctx.api.get("/api/me", headers=ctx.h(pc2["token"])).json()["status"] == "pending"
+        _press(tg, f"ap:{pc2['device_id']}:0")
+        assert ctx.api.get("/api/me", headers=ctx.h(pc2["token"])).json()["status"] == "active"

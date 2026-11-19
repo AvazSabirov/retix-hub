@@ -39,7 +39,7 @@ import requests
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
 
-VERSION = "1.0.22"
+VERSION = "1.0.23"
 APP_NAME = "RetixHub"          # служебное имя: папки, задачи, мьютекс
 APP_TITLE = "Retix Hub"        # то, что видит пользователь
 TUNNEL = "retixhub"
@@ -2670,6 +2670,8 @@ C = {
     "on": "#1e854f", "on_hover": "#25a062",
     "off": "#3a4555", "green": "#22c55e", "orange": "#f59e0b", "red": "#ef4444",
     "entry": "#0a0e13",
+    # выпадающие меню — светлее окна, чтобы сразу отличались от списка под ними; разделитель — чуть светлее меню
+    "menu": "#212c3b", "menu_line": "#323f51",
 }
 
 
@@ -2685,11 +2687,408 @@ def work_area(win) -> tuple[int, int, int, int]:
     return 0, 0, win.winfo_screenwidth(), win.winfo_screenheight() - 48
 
 
-def dark_menu(parent) -> "tk.Menu":
+def monitor_area(win, x: int, y: int) -> tuple[int, int, int, int]:
+    """Рабочая область монитора, на котором точка (x, y): меню не должно уезжать на соседний монитор."""
+    if WINDOWS:
+        try:
+            class MONITORINFO(ctypes.Structure):
+                _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", wintypes.RECT), ("rcWork", wintypes.RECT),
+                            ("dwFlags", wintypes.DWORD)]
+            u = ctypes.windll.user32
+            u.MonitorFromPoint.restype = ctypes.c_void_p
+            u.MonitorFromPoint.argtypes = [wintypes.POINT, wintypes.DWORD]
+            u.GetMonitorInfoW.argtypes = [ctypes.c_void_p, ctypes.POINTER(MONITORINFO)]
+            mon = u.MonitorFromPoint(wintypes.POINT(x, y), 2)   # MONITOR_DEFAULTTONEAREST
+            info = MONITORINFO()
+            info.cbSize = ctypes.sizeof(info)
+            if mon and u.GetMonitorInfoW(mon, ctypes.byref(info)):
+                r = info.rcWork
+                return r.left, r.top, r.right, r.bottom
+        except Exception:  # noqa: BLE001
+            log.debug("монитор у точки не определён", exc_info=True)
+    return work_area(win)
+
+
+def round_corners(win, radius: int = 8) -> None:
+    """Скруглить углы окна без рамки (меню). Windows 11 — средствами DWM (сглаженно, без светлой рамки),
+    Windows 10 / 8.1 — областью окна."""
+    if not WINDOWS:
+        return
+    try:
+        win.update_idletasks()
+        hwnd = ctypes.windll.user32.GetParent(win.winfo_id())
+    except Exception:  # noqa: BLE001
+        return
+    try:
+        pref = ctypes.c_int(2)   # DWMWA_WINDOW_CORNER_PREFERENCE = DWMWCP_ROUND
+        if ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 33, ctypes.byref(pref), ctypes.sizeof(pref)) == 0:
+            none = ctypes.c_uint(0xFFFFFFFE)   # DWMWA_BORDER_COLOR = DWMWA_COLOR_NONE: без рамки по краю
+            ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 34, ctypes.byref(none), ctypes.sizeof(none))
+            return
+    except Exception:  # noqa: BLE001 — Windows 10 и 8.1: DWM углы не скругляет
+        pass
+    try:
+        w, h = win.winfo_width(), win.winfo_height()
+        rgn = ctypes.windll.gdi32.CreateRoundRectRgn(0, 0, w + 1, h + 1, 2 * radius, 2 * radius)
+        ctypes.windll.user32.SetWindowRgn(hwnd, rgn, True)   # область теперь принадлежит окну
+    except Exception:  # noqa: BLE001
+        log.debug("углы меню не скруглены", exc_info=True)
+
+
+class HubMenu:
+    """Выпадающее меню программы вместо tk.Menu: у меню Windows по краю белая рамка, её не перекрасить.
+    Своё — оттенка светлее окна, без рамки, со скруглёнными углами. Вызовы — как у tk.Menu."""
+
+    FONT = ("Segoe UI", 9)
+    PAD = 5
+    MIN_WIDTH = 190
+    KEYS = ("<Escape>", "<Up>", "<Down>", "<Left>", "<Right>", "<Return>")
+    open_menu: "HubMenu | None" = None   # открытое меню верхнего уровня — одно на программу
+
+    def __init__(self, parent, postcommand=None):
+        self.parent = parent.parent if isinstance(parent, HubMenu) else parent
+        self.items: list[dict] = []
+        self.postcommand = postcommand
+        self.win: tk.Toplevel | None = None
+        self.rows: list[tuple[tuple, dict]] = []   # (виджеты строки, пункт)
+        self.active = -1
+        self.sub: HubMenu | None = None            # открытое подменю
+        self.sub_index = -1
+        self.owner: HubMenu | None = None          # у подменю — меню, из которого оно открыто
+        self._watch_job = None
+
+    # --- как у tk.Menu
+    def configure(self, **kw):
+        if "postcommand" in kw:
+            self.postcommand = kw["postcommand"]
+
+    config = configure
+
+    def add_command(self, label: str, command=None, font=None, **_):
+        self.items.append({"kind": "command", "label": label, "command": command, "font": font})
+
+    def add_radiobutton(self, label: str, variable=None, value=None, command=None, **_):
+        self.items.append({"kind": "radio", "label": label, "command": command, "variable": variable,
+                           "value": value})
+
+    def add_cascade(self, label: str, menu: "HubMenu", **_):
+        self.items.append({"kind": "cascade", "label": label, "menu": menu})
+
+    def add_separator(self):
+        self.items.append({"kind": "sep"})
+
+    def delete(self, *_):
+        self.items = []
+
+    def destroy(self):
+        self.unpost()
+
+    def grab_release(self):
+        pass
+
+    def tk_popup(self, x: int, y: int):
+        self.post(x, y)
+
+    @property
+    def posted(self) -> bool:
+        return self.win is not None
+
+    # --- показ
+    def post(self, x: int, y: int, owner: "HubMenu | None" = None):
+        if owner is None and HubMenu.open_menu is not None:
+            HubMenu.open_menu.unpost()
+        self.unpost()
+        if self.postcommand:
+            self.postcommand()
+        self.owner, self.active = owner, -1
+        win = tk.Toplevel(self.parent, bg=C["menu"])
+        win.withdraw()
+        win.overrideredirect(True)
+        try:
+            win.attributes("-topmost", True)
+        except tk.TclError:
+            pass
+        self.win = win
+        self._root_pos = (self.parent.winfo_rootx(), self.parent.winfo_rooty())
+        body = tk.Frame(win, bg=C["menu"], pady=self.PAD)
+        body.pack(fill="both", expand=True)
+        self.rows = []
+        for item in self.items:
+            if item["kind"] == "sep":
+                tk.Frame(body, bg=C["menu_line"], height=1).pack(fill="x", padx=10, pady=4)
+                continue
+            row = tk.Frame(body, bg=C["menu"])
+            row.pack(fill="x", padx=self.PAD)
+            checked = item["kind"] == "radio" and item["variable"] is not None \
+                and item["variable"].get() == item["value"]
+            mark = tk.Label(row, text="●" if checked else "", width=2, bg=C["menu"], fg=C["green"],
+                            font=("Segoe UI", 7))
+            mark.pack(side="left")
+            label = tk.Label(row, text=item["label"], bg=C["menu"], fg=C["text"], font=item.get("font") or self.FONT,
+                             anchor="w", pady=4)
+            label.pack(side="left", fill="x", expand=True)
+            arrow = tk.Label(row, text="›" if item["kind"] == "cascade" else "", width=2, bg=C["menu"],
+                             fg=C["muted"], font=self.FONT)
+            arrow.pack(side="right")
+            i = len(self.rows)
+            for w in (row, mark, label, arrow):
+                w.bind("<Enter>", lambda _e, n=i: self._hover(n))
+                w.bind("<Button-1>", lambda _e, n=i: self._invoke(n))
+            self.rows.append(((row, mark, label, arrow), item))
+        win.bind("<Leave>", lambda _e: self._leave())
+        win.update_idletasks()
+        w, h = max(win.winfo_reqwidth(), self.MIN_WIDTH), win.winfo_reqheight()
+        left, top, right, bottom = monitor_area(self.parent, x, y)
+        if x + w > right:   # не помещается справа: подменю — слева от меню, остальное — сдвинуть
+            x = owner.win.winfo_rootx() - w + 2 if owner and owner.win else right - w
+        if y + h > bottom:
+            y = y - h if owner is None and y - h >= top else bottom - h
+        x, y = max(left, x), max(top, y)
+        win.geometry(f"{w}x{h}+{x}+{y}")
+        win.deiconify()
+        win.lift()
+        round_corners(win)
+        if owner is None:
+            HubMenu.open_menu = self
+            self.parent.after_idle(self._grab_global)   # после текущего щелчка — иначе он сразу закроет меню
+            self._watch_job = self.parent.after(200, self._watch)
+
+    def unpost(self):
+        if self.sub:
+            self.sub.unpost()
+        self.sub, self.sub_index = None, -1
+        if self.win is not None:
+            try:
+                self.win.destroy()
+            except tk.TclError:
+                pass
+        self.win, self.rows, self.active = None, [], -1
+        if self.owner is None and HubMenu.open_menu is self:
+            HubMenu.open_menu = None
+            if self._watch_job:
+                self.parent.after_cancel(self._watch_job)
+                self._watch_job = None
+            for seq in ("<ButtonPress>",) + self.KEYS:
+                self.parent.unbind_all(seq)
+
+    def _windows(self) -> list:
+        out, m = [], self
+        while m is not None and m.win is not None:
+            out.append(m.win)
+            m = m.sub
+        return out
+
+    def _grab_global(self):
+        """Щелчок в окне программы мимо меню — закрыть меню; стрелки, Enter и Esc — управление меню."""
+        if HubMenu.open_menu is not self or self.win is None:
+            return
+        self.parent.bind_all("<ButtonPress>", self._outside_click)
+        for seq in self.KEYS:
+            self.parent.bind_all(seq, self._key)
+
+    def _outside_click(self, event):
+        try:
+            top = event.widget.winfo_toplevel()
+        except (AttributeError, KeyError, tk.TclError):
+            top = None
+        if top not in self._windows():
+            self.unpost()
+
+    def _watch(self):
+        """Щёлкнули в другой программе или на рабочем столе — меню закрывается, как обычное меню Windows."""
+        self._watch_job = None
+        if self.win is None:
+            return
+        try:   # окно спрятали в трей или передвинули за заголовок — меню больше не у своего места
+            if not self.parent.winfo_viewable() or \
+                    (self.parent.winfo_rootx(), self.parent.winfo_rooty()) != self._root_pos:
+                self.unpost()
+                return
+        except tk.TclError:
+            return
+        if WINDOWS:
+            try:   # активно окно другой программы (или рабочий стол)
+                u = ctypes.windll.user32
+                u.GetForegroundWindow.restype = ctypes.c_void_p
+                fg = u.GetForegroundWindow()
+                pid = wintypes.DWORD()
+                if fg:
+                    u.GetWindowThreadProcessId(ctypes.c_void_p(fg), ctypes.byref(pid))
+                    if pid.value and pid.value != os.getpid():
+                        self.unpost()
+                        return
+            except Exception:  # noqa: BLE001
+                log.debug("активное окно не определено", exc_info=True)
+        self._watch_job = self.parent.after(200, self._watch)
+
+    # --- пункты
+    def _paint(self, i: int, on: bool):
+        if not 0 <= i < len(self.rows):
+            return
+        widgets, item = self.rows[i]
+        for w in widgets:
+            w.configure(bg=C["sel"] if on else C["menu"])
+        widgets[2].configure(fg="white" if on else C["text"])
+
+    def _hover(self, i: int):
+        if i != self.active:
+            self._paint(self.active, False)
+            self.active = i
+            self._paint(i, True)
+        if self.sub and self.sub_index != i:
+            self.sub.unpost()
+            self.sub, self.sub_index = None, -1
+        if self.rows[i][1]["kind"] == "cascade" and not self.sub:
+            self._open_sub(i)
+
+    def _leave(self):
+        if self.win is None or self.sub:
+            return
+        x, y = self.win.winfo_pointerxy()
+        try:
+            under = self.win.winfo_containing(x, y)
+            inside = under is not None and under.winfo_toplevel() is self.win
+        except (KeyError, tk.TclError):
+            inside = False
+        if not inside:
+            self._paint(self.active, False)
+            self.active = -1
+
+    def _open_sub(self, i: int):
+        row = self.rows[i][0][0]
+        menu = self.rows[i][1]["menu"]
+        menu.post(self.win.winfo_rootx() + self.win.winfo_width() - 2, row.winfo_rooty() - self.PAD, owner=self)
+        self.sub, self.sub_index = menu, i
+
+    def _invoke(self, i: int):
+        if not 0 <= i < len(self.rows):
+            return
+        item = self.rows[i][1]
+        if item["kind"] == "cascade":
+            if not self.sub:
+                self._open_sub(i)
+            return
+        root = self
+        while root.owner is not None:
+            root = root.owner
+        root.unpost()
+        if item["kind"] == "radio" and item["variable"] is not None:
+            item["variable"].set(item["value"])
+        if item["command"]:
+            self.parent.after_idle(item["command"])
+
+    def _move(self, step: int):
+        if not self.rows:
+            return
+        i = self.active if self.active >= 0 else (-1 if step > 0 else len(self.rows))
+        self._hover((i + step) % len(self.rows))
+
+    def _key(self, event):
+        m = self
+        while m.sub is not None and m.sub.win is not None:
+            m = m.sub
+        key = event.keysym
+        if key == "Escape" or (key == "Left" and m.owner is None):
+            if m.owner is not None:
+                m.owner.sub.unpost()
+                m.owner.sub, m.owner.sub_index = None, -1
+            else:
+                m.unpost()
+        elif key == "Left":
+            m.owner.sub.unpost()
+            m.owner.sub, m.owner.sub_index = None, -1
+        elif key in ("Down", "Up"):
+            m._move(1 if key == "Down" else -1)
+        elif key == "Right" and m.active >= 0 and m.rows[m.active][1]["kind"] == "cascade":
+            m._invoke(m.active)
+            if m.sub:
+                m.sub._move(1)
+        elif key == "Return" and m.active >= 0:
+            m._invoke(m.active)
+        return "break"
+
+
+def dark_menu(parent) -> HubMenu:
     """Выпадающее меню в цветах приложения."""
-    return tk.Menu(parent, tearoff=0, bg=C["head"], fg=C["text"], activebackground=C["sel"],
-                   activeforeground="white", disabledforeground=C["muted"], bd=0, relief="flat",
-                   font=("Segoe UI", 9))
+    return HubMenu(parent)
+
+
+_CORNERS: dict = {}   # скруглённые углы панелей (Pillow, со сглаживанием): (радиус, цвет, фон) → картинки
+
+
+def corner_images(r: int, fill: str, bg: str) -> dict:
+    key = (r, fill, bg)
+    if key not in _CORNERS:
+        from PIL import Image, ImageDraw, ImageTk
+        k = 4
+        big = Image.new("RGB", (2 * r * k, 2 * r * k), bg)
+        ImageDraw.Draw(big).ellipse((0, 0, 2 * r * k - 1, 2 * r * k - 1), fill=fill)
+        img = big.resize((2 * r, 2 * r), Image.LANCZOS)
+        boxes = {"nw": (0, 0, r, r), "ne": (r, 0, 2 * r, r), "sw": (0, r, r, 2 * r), "se": (r, r, 2 * r, 2 * r)}
+        _CORNERS[key] = {name: ImageTk.PhotoImage(img.crop(box)) for name, box in boxes.items()}
+    return _CORNERS[key]
+
+
+def round_rect(cv: "tk.Canvas", x0: int, y0: int, x1: int, y1: int, r: int, fill: str, bg: str, tag: str) -> None:
+    """Прямоугольник со скруглёнными углами на холсте (под остальным содержимым холста)."""
+    cv.delete(tag)
+    r = max(0, min(r, (x1 - x0) // 2, (y1 - y0) // 2))
+    cv.create_rectangle(x0 + r, y0, x1 - r, y1, fill=fill, outline="", tags=tag)
+    cv.create_rectangle(x0, y0 + r, x1, y1 - r, fill=fill, outline="", tags=tag)
+    if r:
+        try:
+            imgs = corner_images(r, fill, bg)
+            for name, x, y in (("nw", x0, y0), ("ne", x1, y0), ("sw", x0, y1), ("se", x1, y1)):
+                cv.create_image(x, y, image=imgs[name], anchor=name, tags=tag)
+        except Exception:  # noqa: BLE001 — без Pillow: углы кругами, без сглаживания
+            for x, y in ((x0, y0), (x1 - 2 * r, y0), (x0, y1 - 2 * r), (x1 - 2 * r, y1 - 2 * r)):
+                cv.create_oval(x, y, x + 2 * r, y + 2 * r, fill=fill, outline="", tags=tag)
+    cv.tag_lower(tag)
+
+
+class RoundPanel(tk.Canvas):
+    """Панель окна со скруглёнными углами и без рамки: фон рисуется на холсте, содержимое — в self.body.
+    stretch — тянется по месту в окне (список), иначе высота — по содержимому (шапка)."""
+
+    def __init__(self, master, radius: int = 10, pad: int = 5, stretch: bool = False,
+                 fill: str = C["panel"], bg: str = C["bg"]):
+        super().__init__(master, bg=bg, highlightthickness=0, bd=0, height=1)
+        self.radius, self.pad, self.stretch, self.fill, self.bg_ = radius, pad, stretch, fill, bg
+        self.body = tk.Frame(self, bg=fill)
+        self._item = self.create_window(pad, pad, window=self.body, anchor="nw")
+        self.bind("<Configure>", self._layout)
+        if not stretch:
+            self.body.bind("<Configure>", lambda _e: self.fit())
+
+    def fit(self):
+        """Высота панели — по содержимому."""
+        if not self.stretch:
+            self.configure(height=self.body.winfo_reqheight() + 2 * self.pad)
+
+    def _layout(self, e):
+        kw = {"width": max(1, e.width - 2 * self.pad)}
+        if self.stretch:
+            kw["height"] = max(1, e.height - 2 * self.pad)
+        self.itemconfigure(self._item, **kw)
+        round_rect(self, 0, 0, e.width, e.height, self.radius, self.fill, self.bg_, "panel")
+
+
+class Pill(tk.Canvas):
+    """Плашка статуса со скруглёнными краями."""
+
+    FONT = ("Segoe UI", 8, "bold")
+
+    def __init__(self, master, bg: str):
+        super().__init__(master, bg=bg, highlightthickness=0, bd=0, height=20, width=10)
+        self.bg_ = bg
+
+    def show(self, text: str, color: str):
+        import tkinter.font as tkfont
+        w, h = tkfont.Font(font=self.FONT).measure(text) + 18, 20
+        self.configure(width=w, height=h)
+        self.delete("all")
+        round_rect(self, 0, 0, w, h, h // 2, color, self.bg_, "pill")
+        self.create_text(w // 2, h // 2, text=text, fill="white", font=self.FONT)
 
 
 def dark_titlebar(win) -> None:
@@ -2787,6 +3186,26 @@ def sort_peers(peers) -> list[dict]:
     """Список компьютеров — по имени (Касса 2 раньше Касса 10). ПК, который выключился, остаётся на своём
     месте: список не прыгает, и нужный компьютер легко найти."""
     return sorted(peers, key=lambda p: natural_key(p["name"]))
+
+
+NO_ROLE = "Без роли"
+
+
+def group_peers(peers) -> list[tuple[str, list[dict]]]:
+    """Список компьютеров по группам — ролям из кабинета («Склад», «Администраторы» …), по порядку ролей
+    в кабинете; ПК без роли — последней группой. Ролей нет ни у одного ПК — одна группа без заголовка ('')."""
+    peers = sort_peers(peers)
+    if not any(p.get("role") for p in peers):
+        return [("", peers)] if peers else []
+    groups: dict[str, list[dict]] = {}
+    for p in peers:
+        groups.setdefault(p.get("role") or NO_ROLE, []).append(p)
+
+    def order(name):
+        if name == NO_ROLE and not any(p.get("role") for p in groups[name]):
+            return (1, 0, "")
+        return (0, min(int(p.get("role_pos") or 0) for p in groups[name]), name.lower())
+    return [(name, groups[name]) for name in sorted(groups, key=order)]
 
 
 def natural_key(text: str):
@@ -3359,7 +3778,6 @@ class App(tk.Tk):
         self.access_dialog: AccessDialog | None = None
         self.last_status = None
         self.status_now = None
-        self.collapsed = False
         self.chats: dict[int, MessageWindow] = {}
 
         self.title(APP_TITLE)
@@ -3429,20 +3847,21 @@ class App(tk.Tk):
             b.pack(side="left")
             b.bind("<Enter>", lambda _e, w=b: w.config(bg=C["hover"]))
             b.bind("<Leave>", lambda _e, w=b: w.config(bg=C["bg"]))
-            b.bind("<Button-1>", lambda _e, w=b, mm=menu: mm.tk_popup(w.winfo_rootx(), w.winfo_rooty() + w.winfo_height()))
+            b.bind("<Button-1>", lambda _e, w=b, mm=menu: mm.unpost() if mm.posted else
+                   mm.tk_popup(w.winfo_rootx(), w.winfo_rooty() + w.winfo_height() + 2))
 
-        # шапка: кнопка ON/OFF, имя ПК, IP, статус
-        top = tk.Frame(self, bg=C["panel"], highlightthickness=1, highlightbackground=C["line"])
-        top.pack(fill="x", padx=8, pady=(8, 6))
-        self.top_frame = top
+        # шапка: кнопка ON/OFF, имя ПК, IP, компания; панели — со скруглёнными углами, без рамки
+        self.top_frame = RoundPanel(self)
+        self.top_frame.pack(fill="x", padx=8, pady=(8, 6))
+        top = self.top_frame.body
         self.power = tk.Canvas(top, width=76, height=76, bg=C["panel"], highlightthickness=0, cursor="hand2")
-        self.power.pack(side="left", padx=8, pady=8)
+        self.power.pack(side="left", padx=(6, 8), pady=4)
         self.power.bind("<Button-1>", lambda _e: self.toggle())
         self.power_on, self.power_hover = False, False
         self.power.bind("<Enter>", lambda _e: self._hover_power(True))
         self.power.bind("<Leave>", lambda _e: self._hover_power(False))
         info = tk.Frame(top, bg=C["panel"])
-        info.pack(side="left", fill="x", expand=True, pady=10)
+        info.pack(side="left", fill="x", expand=True, pady=6)
         self.name_lbl = tk.Label(info, text=self.state_.get("device_name") or socket.gethostname(), bg=C["panel"],
                                  fg=C["name"], font=("Segoe UI", 12, "bold"), anchor="w", cursor="hand2")
         self.name_lbl.pack(fill="x")
@@ -3450,33 +3869,31 @@ class App(tk.Tk):
         self.ip_lbl = tk.Label(info, text="—", bg=C["panel"], fg=C["text"], font=("Segoe UI", 11, "bold"),
                                anchor="w")
         self.ip_lbl.pack(fill="x")
-        self.badge = tk.Label(info, text="Запуск…", bg=C["off"], fg="white", font=("Segoe UI", 9, "bold"),
-                              padx=8, pady=2)
-        self.badge.pack(anchor="w", pady=(4, 0))
+        # третья строка: компания и сколько ПК в сети; плашка статуса — только когда не «в сети»
+        line = tk.Frame(info, bg=C["panel"])
+        line.pack(fill="x", pady=(4, 0))
+        self.badge = Pill(line, bg=C["panel"])
+        self.badge_text = ""
+        self.company_lbl = tk.Label(line, text="", bg=C["panel"], fg=C["muted"], font=("Segoe UI", 9), anchor="w",
+                                    justify="left", wraplength=230)
+        self.company_lbl.pack(side="left", fill="x", expand=True)
+        self._set_badge("Запуск…", C["off"])
         self._draw_power(False)
 
-        # сеть компании: заголовок группы + список компьютеров
-        box = tk.Frame(self, bg=C["panel"], highlightthickness=1, highlightbackground=C["line"])
-        box.pack(fill="both", expand=True, padx=8, pady=(0, 4))
-        self.list_box = box
+        # компьютеры компании: группы по ролям из кабинета (Склад, Администраторы …), каждую можно свернуть
+        self.list_box = RoundPanel(self, stretch=True)
+        self.list_box.pack(fill="both", expand=True, padx=8, pady=(0, 4))
         self.compact = False   # список другим ПК скрыт администратором — окно только с шапкой
-        self.group = tk.Frame(box, bg=C["head"], cursor="hand2")
-        self.group.pack(fill="x")
-        self.group_lbl = tk.Label(self.group, text="▼  —", bg=C["head"], fg=C["text"],
-                                  font=("Segoe UI", 10, "bold"), anchor="w", padx=8, pady=4)
-        self.group_lbl.pack(side="left", fill="x", expand=True)
-        self.count_lbl = tk.Label(self.group, text="", bg=C["head"], fg=C["muted"], padx=8)
-        self.count_lbl.pack(side="right")
-        for w in (self.group, self.group_lbl, self.count_lbl):
-            w.bind("<Button-1>", lambda _e: self.toggle_group())
-
-        self.list_frame = tk.Frame(box, bg=C["panel"])
+        self.collapsed_groups = set(self.state_.get("collapsed_groups") or [])
+        self.group_rows: dict[str, str] = {}
+        self.list_frame = tk.Frame(self.list_box.body, bg=C["panel"])
         self.list_frame.pack(fill="both", expand=True)
         self.tree = ttk.Treeview(self.list_frame, columns=("ip",), show="tree", style="Hub.Treeview",
                                  selectmode="browse")
         self.tree.column("#0", width=200, stretch=True)
         self.tree.column("ip", width=84, stretch=False, anchor="e")
         self.tree.tag_configure("off", foreground=C["muted"])
+        self.tree.tag_configure("group", foreground=C["name"], font=("Segoe UI", 9, "bold"))
         sb = ttk.Scrollbar(self.list_frame, orient="vertical", command=self.tree.yview,
                            style="Hub.Vertical.TScrollbar")
 
@@ -3488,9 +3905,10 @@ class App(tk.Tk):
             sb.set(first, last)
         self.tree.configure(yscrollcommand=autohide)
         self.tree.pack(side="left", fill="both", expand=True)
-        self.tree.bind("<Double-1>", lambda _e: self.open_shares())
-        self.tree.bind("<Return>", lambda _e: self.open_shares())
+        self.tree.bind("<Double-1>", lambda e: self._tree_click(e) or self.open_shares())
+        self.tree.bind("<Return>", lambda _e: None if HubMenu.open_menu else self.open_shares())   # Enter — пункт меню
         self.tree.bind("<Button-3>", self.peer_menu)
+        self.tree.bind("<Button-1>", self._tree_click)
         self.tip = Tooltip(self)
         self.tree.bind("<Motion>", self._tree_hover)
         self.tree.bind("<Leave>", lambda _e: self.tip.hide())
@@ -3506,6 +3924,32 @@ class App(tk.Tk):
         self.msg_lbl.pack(fill="x", pady=(0, 6))
         self.bind("<Configure>", lambda e: self.msg_lbl.config(wraplength=max(200, e.width - 20))
                   if e.widget is self else None)
+
+    def _set_badge(self, text: str, color: str = ""):
+        """Плашка статуса под IP. «В сети» не показываем: это и так видно по зелёной кнопке ON."""
+        self.badge_text = text
+        if not text:
+            self.badge.pack_forget()
+            return
+        self.badge.show(text, color)
+        if not self.badge.winfo_manager():
+            self.badge.pack(side="left", padx=(0, 8), before=self.company_lbl)
+
+    def _company_line(self):
+        """Компания и сколько её компьютеров в сети: «Zoo Planeta · 5 / 8»."""
+        c = self.cfg or {}
+        if self.status_now == Status.NEED_LOGIN or not c:
+            self.company_lbl.config(text="")
+            return
+        text = c.get("company") or ""
+        if c.get("show_peers") is False:
+            text += "  · список скрыт администратором"
+        else:
+            others = [p for p in self.peers if not p.get("is_me")]
+            if others:
+                online = sum(1 for p in others if self._peer_online(p))
+                text += f"  · {online} / {len(others)}"
+        self.company_lbl.config(text=text)
 
     def _hover_power(self, hover: bool):
         self.power_hover = hover
@@ -3622,7 +4066,7 @@ class App(tk.Tk):
         if cfg:
             self.cfg = cfg
         label, color = STATUS_VIEW.get(status, ("—", C["off"]))
-        self.badge.config(text=label, bg=color)
+        self._set_badge("" if status == Status.ONLINE else label, color)
         enabled = self.state_.get("enabled") is not False and status not in (Status.NEED_LOGIN, Status.OFF)
         self._draw_power(enabled)
         c = self.cfg
@@ -3631,18 +4075,18 @@ class App(tk.Tk):
             self.ip_lbl.config(text=c.get("ip") or "—")
             hidden = c.get("show_peers") is False   # администратор скрыл список (сеть при этом та же)
             self.set_compact(hidden)
-            self.group_lbl.config(text=("▶  " if self.collapsed else "▼  ") + (c.get("company") or "—")
-                                  + ("  · список скрыт администратором" if hidden else ""))
         elif status == Status.NEED_LOGIN:
             self.ip_lbl.config(text="—")
-            self.group_lbl.config(text="▼  —")
             self.set_compact(False)
+        self._company_line()
         self.msg_lbl.config(text="" if status == Status.ONLINE else (text or ""))
         if self.compact:   # окно по содержимому: пустую строку сообщения не показываем, длинную — целиком
             if self.msg_lbl.cget("text"):
                 self.msg_lbl.pack(fill="x", pady=(0, 6))
             else:
                 self.msg_lbl.pack_forget()
+            self.update_idletasks()
+            self.top_frame.fit()
             self.update_idletasks()
             self._size = (max(self.winfo_width(), 320), self.winfo_reqheight())
             self.geometry(f"{self._size[0]}x{self._size[1]}")
@@ -3656,25 +4100,56 @@ class App(tk.Tk):
         self.tray.update(tray_color, f"{APP_TITLE} — {label}" + (f" · {ip}" if ip and status == Status.ONLINE else ""))
         if status == Status.NEED_LOGIN and self.last_status != Status.NEED_LOGIN and not self.login_dialog:
             self.show_login(text)
-        if status in (Status.SERVER_DOWN, Status.BLOCKED):
-            for i in self.tree.get_children():
-                self.tree.item(i, image=self.link_img["off"], tags=("off",))
+        if status in (Status.SERVER_DOWN, Status.BLOCKED) or (self.last_status in (Status.SERVER_DOWN, Status.BLOCKED)
+                                                              and status != self.last_status):
+            self._render_peers()
         self.last_status = status
+
+    def _peer_online(self, p: dict) -> bool:
+        return bool(p.get("online")) and self.status_now not in (Status.SERVER_DOWN, Status.BLOCKED, Status.OFF)
 
     def _on_peers(self, peers):
         self.peers = peers
+        self._render_peers()
+        self._company_line()
+
+    def _render_peers(self):
+        """Список: заголовок группы (роль, сколько в сети) и её компьютеры; свёрнутая группа — только заголовок."""
         sel = self.tree.selection()
+        top = self.tree.yview()[0]
         self.tree.delete(*self.tree.get_children())
-        others = sort_peers(p for p in peers if not p.get("is_me"))
-        for p in others:
-            online = p["online"] and self.status_now not in (Status.SERVER_DOWN, Status.BLOCKED, Status.OFF)
-            self.tree.insert("", "end", iid=str(p["id"]), text=" " + p["name"],
-                             image=self.link_img[peer_link(p, online)], values=(p["ip"],),
-                             tags=() if online else ("off",))
+        groups = group_peers(p for p in self.peers if not p.get("is_me"))
+        self.group_rows = {}   # строка заголовка → имя группы (имя роли может быть любым — в id строки его нет)
+        for i, (name, group) in enumerate(groups):
+            if name:
+                closed = name in self.collapsed_groups
+                online = sum(1 for p in group if self._peer_online(p))
+                self.group_rows[f"g:{i}"] = name
+                self.tree.insert("", "end", iid=f"g:{i}", text=("▶  " if closed else "▼  ") + name,
+                                 values=(f"{online} / {len(group)}",), tags=("group",))
+                if closed:
+                    continue
+            for p in group:
+                online = self._peer_online(p)
+                self.tree.insert("", "end", iid=str(p["id"]), text=" " + p["name"],
+                                 image=self.link_img[peer_link(p, online)], values=(p["ip"],),
+                                 tags=() if online else ("off",))
         if sel and self.tree.exists(sel[0]):
             self.tree.selection_set(sel[0])
-        online = sum(1 for p in others if p["online"])
-        self.count_lbl.config(text=f"{online} / {len(others)}" if others else "")
+        self.tree.yview_moveto(top)
+
+    def _tree_click(self, event):
+        """Щелчок по заголовку группы — свернуть / развернуть её."""
+        row = self.tree.identify_row(event.y)
+        if row in self.group_rows:
+            self.toggle_role_group(self.group_rows[row])
+            return "break"
+        return None
+
+    def toggle_role_group(self, name: str):
+        self.collapsed_groups ^= {name}
+        self.state_.set(collapsed_groups=sorted(self.collapsed_groups))   # запомнить до следующего запуска
+        self._render_peers()
 
     def _tree_hover(self, event):
         """Подсказка над значком: как связан ПК (через сервер, по локальной сети, через интернет)."""
@@ -3758,15 +4233,6 @@ class App(tk.Tk):
         else:
             self.iconify()
 
-    def toggle_group(self):
-        self.collapsed = not self.collapsed
-        if self.collapsed:
-            self.list_frame.pack_forget()
-        else:
-            self.list_frame.pack(fill="both", expand=True)
-        txt = self.group_lbl.cget("text")[3:]
-        self.group_lbl.config(text=("▶  " if self.collapsed else "▼  ") + txt)
-
     # --- действия
     def toggle(self):
         if self.status_now == Status.NEED_LOGIN:
@@ -3774,7 +4240,7 @@ class App(tk.Tk):
             return
         enabled = self.state_.get("enabled") is not False
         self._draw_power(not enabled)
-        self.badge.config(text="Отключение…" if enabled else "Подключение…", bg=C["orange"])
+        self._set_badge("Отключение…" if enabled else "Подключение…", C["orange"])
         threading.Thread(target=self.worker.set_enabled, args=(not enabled,), daemon=True, name="toggle").start()
 
     def show_login(self, error: str = "", add: bool = False):
@@ -3871,7 +4337,7 @@ class App(tk.Tk):
 
     def peer_menu(self, event):
         row = self.tree.identify_row(event.y)
-        if not row:
+        if not row or row.startswith("g:"):   # заголовок группы — без меню
             return
         self.tree.selection_set(row)
         viewer = find_radmin_viewer(self.state_.get("radmin_path") or "")

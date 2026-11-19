@@ -17,7 +17,7 @@ from conftest import ROOT, fake_setup, new_pubkey
 try:
     import tkinter  # noqa: F401
 except ImportError:
-    tk = types.ModuleType("tkinter"); tk.Tk = tk.Toplevel = object
+    tk = types.ModuleType("tkinter"); tk.Tk = tk.Toplevel = tk.Canvas = object
     sys.modules["tkinter"] = tk
     for sub in ("messagebox", "simpledialog", "ttk"):
         sys.modules[f"tkinter.{sub}"] = types.ModuleType(sub)
@@ -576,6 +576,19 @@ def test_messages_between_pcs(make_client, company):
 def test_natural_sort():
     names = ["10 zoo kassa", "2 zoo kassa", "01 zoo kassa", "ALPHA"]
     assert sorted(names, key=rc.natural_key) == ["01 zoo kassa", "2 zoo kassa", "10 zoo kassa", "ALPHA"]
+
+
+def test_group_peers_by_role():
+    """Список в окне: группы по ролям из кабинета, по их порядку; без роли — последней группой."""
+    peers = [{"name": "Касса 10", "role": "", "role_pos": 2}, {"name": "Склад 2", "role": "Склад", "role_pos": 1},
+             {"name": "Админ", "role": "Администраторы", "role_pos": 0}, {"name": "Касса 2", "role": "", "role_pos": 2},
+             {"name": "Склад 1", "role": "Склад", "role_pos": 1}]
+    groups = rc.group_peers(peers)
+    assert [(g, [p["name"] for p in ps]) for g, ps in groups] == [
+        ("Администраторы", ["Админ"]), ("Склад", ["Склад 1", "Склад 2"]), (rc.NO_ROLE, ["Касса 2", "Касса 10"])]
+    # ролей нет (или старый сервер без ролей) — один список без заголовков
+    assert rc.group_peers([{"name": "B"}, {"name": "A"}]) == [("", [{"name": "A"}, {"name": "B"}])]
+    assert rc.group_peers([]) == []
 
 
 def test_wireguard_missing(make_client, company, monkeypatch):

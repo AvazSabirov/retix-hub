@@ -65,12 +65,23 @@ CREATE TABLE IF NOT EXISTS devices (
     log_requested_at INTEGER NOT NULL DEFAULT 0, -- администратор запросил журнал программы: ПК пришлёт его (/api/log)
     nics            TEXT NOT NULL DEFAULT '',   -- JSON [{addr, mac}]: сетевые карты ПК (включение по сети, клиент 1.0.21+)
     nics_at         INTEGER NOT NULL DEFAULT 0, -- когда ПК последний раз сообщил nics
+    role_id         INTEGER NOT NULL DEFAULT 0, -- роль (группа) ПК в компании: roles.id, 0 — без роли
     last_seen       TEXT,
     update_state    TEXT NOT NULL DEFAULT '',   -- что ПК сообщает об обновлении: downloading:1.0.6 …
     update_state_at TEXT,
     created_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS ix_devices_company ON devices(company_id);
+
+-- роли (группы) компьютеров компании: «Склад», «Администраторы» … — по ним группируется список в программе
+CREATE TABLE IF NOT EXISTS roles (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    company_id  INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+    name        TEXT NOT NULL,
+    position    INTEGER NOT NULL DEFAULT 0,      -- порядок групп в программе
+    created_at  TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (company_id, name COLLATE NOCASE)
+);
 
 -- версии клиента, загруженные суперадмином (/admin/updates)
 CREATE TABLE IF NOT EXISTS app_releases (
@@ -186,6 +197,7 @@ MIGRATIONS = [
     ("devices", "log_requested_at", "INTEGER NOT NULL DEFAULT 0"),
     ("devices", "nics", "TEXT NOT NULL DEFAULT ''"),
     ("devices", "nics_at", "INTEGER NOT NULL DEFAULT 0"),
+    ("devices", "role_id", "INTEGER NOT NULL DEFAULT 0"),
     ("companies", "speed_limit", "INTEGER NOT NULL DEFAULT 0"),
     ("companies", "remote_mode", "TEXT NOT NULL DEFAULT 'off'"),
     ("companies", "tg_chat_id", "TEXT NOT NULL DEFAULT ''"),
