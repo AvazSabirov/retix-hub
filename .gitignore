@@ -17,6 +17,10 @@ devdata/
 client/build/
 client/dist/
 client/wireguard/
+client/wireguard81/
+client/build81/
+client/dist81/
+client/.venv81/
 client/rustdesk/
 *.exe
 *.msi

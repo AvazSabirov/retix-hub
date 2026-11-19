@@ -11,6 +11,10 @@
 ;     сразу (taskkill /F): VPN держит служба WireGuard, а не окно клиента,
 ;     связь при обновлении не рвётся;
 ;   - старые файлы программы (_internal) удаляются, копируется новая сборка;
+;   - Windows 8.1, 10 и 11 (x64) — одним установщиком. Внутри две сборки программы и два WireGuard:
+;     Windows 10/11 — dist\RetixHub и свежий WireGuard; Windows 8.1 — dist81\RetixHub (Python 3.11,
+;     cryptography 42.0.5) и WireGuard 0.5.3: более новые на 8.1 не работают. Ставится только нужное,
+;     обновления — тем же установщиком для всех. На 8.1 нужен Universal C Runtime (KB2999226);
 ;   - WireGuard ставится из вложенного MSI, если его ещё нет;
 ;   - официальный RustDesk (rustdesk-<версия>-x86_64.exe) кладётся рядом с программой — его ставит
 ;     и настраивает клиент, когда в кабинете компании включено удалённое управление;
@@ -38,6 +42,7 @@
 #define AppExe   "RetixHub.exe"
 #define AppGuid  "{AB5A7EE4-CA22-47B0-8BE1-A5707FE2F67D}"
 #define DistDir  "dist\RetixHub"
+#define Dist81Dir "dist81\RetixHub"
 
 #ifndef AppVer
   #define AppVer GetVersionNumbersString(AddBackslash(AddBackslash(SourcePath) + DistDir) + AppExe)
@@ -63,7 +68,8 @@ PrivilegesRequired=admin
 ; WireGuard в установщике — 64-битный (amd64)
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
-MinVersion=10.0
+; Windows 8.1 и новее: для 8.1 — своя сборка программы и WireGuard (IsWin81)
+MinVersion=6.3.9600
 
 DisableWelcomePage=yes
 DisableDirPage=yes
@@ -91,12 +97,17 @@ Name: "ru"; MessagesFile: "compiler:Languages\Russian.isl"
 Type: filesandordirs; Name: "{app}\_internal"
 ; прежняя версия RustDesk — клиент берёт самую новую, но старые файлы ни к чему
 Type: files; Name: "{app}\rustdesk-*.exe"
+; MSI WireGuard — тот, что подходит этой Windows (после обновления 8.1 до 10 — уже свежий)
+Type: files; Name: "{app}\wireguard-amd64-*.msi"
 
 [Files]
-Source: "{#DistDir}\*"; DestDir: "{app}"; Excludes: "retixhub_selftest.txt"; Flags: ignoreversion recursesubdirs createallsubdirs
+; программа: сборка для Windows 10/11 или для Windows 8.1
+Source: "{#DistDir}\*"; DestDir: "{app}"; Excludes: "retixhub_selftest.txt"; Flags: ignoreversion recursesubdirs createallsubdirs; Check: not IsWin81
+Source: "{#Dist81Dir}\*"; DestDir: "{app}"; Excludes: "retixhub_selftest.txt"; Flags: ignoreversion recursesubdirs createallsubdirs; Check: IsWin81
 Source: "client_config.json"; DestDir: "{app}"; Flags: ignoreversion
 ; клиент сам поставит WireGuard из MSI рядом с exe, если его удалят
-Source: "wireguard\wireguard-amd64-*.msi"; DestDir: "{app}"; Flags: ignoreversion
+Source: "wireguard\wireguard-amd64-*.msi"; DestDir: "{app}"; Flags: ignoreversion; Check: not IsWin81
+Source: "wireguard81\wireguard-amd64-*.msi"; DestDir: "{app}"; Flags: ignoreversion; Check: IsWin81
 ; удалённое управление: официальный RustDesk, ставит клиент (rustdesk.exe --silent-install), когда его включат
 Source: "rustdesk\rustdesk-*-x86_64.exe"; DestDir: "{app}"; Flags: ignoreversion
 
@@ -169,6 +180,12 @@ begin
   Log('ОШИБКА: RetixHub.exe не завершился');
 end;
 
+{ Windows 8.1 (6.3): своя сборка программы и WireGuard 0.5.3. Windows 10/11 — 10.0 }
+function IsWin81: Boolean;
+begin
+  Result := GetWindowsVersion < $0A000000;
+end;
+
 { Установщик запущен автообновлением клиента: /AUTOUPDATE=1 }
 function IsAutoUpdate: Boolean;
 begin
@@ -190,6 +207,14 @@ var
   OldVer: String;
 begin
   Result := False;
+  { Python 3.11 программы для 8.1 работает на Universal C Runtime: на 8.1 он приходит обновлением Windows }
+  if IsWin81 and not FileExists(ExpandConstant('{sys}\ucrtbase.dll')) then
+  begin
+    SuppressibleMsgBox('Для Retix Hub на Windows 8.1 нужно обновление Windows KB2999226' + #13#10 +
+      '(Universal C Runtime). Установите обновления через Центр обновления Windows' + #13#10 +
+      'или KB2999226 с сайта Microsoft и запустите установку снова.', mbError, MB_OK, IDOK);
+    Exit;
+  end;
   if IsDowngrade(OldVer) then
   begin
     SuppressibleMsgBox('Установлена более новая версия Retix Hub (' + OldVer + ').' + #13#10 +
