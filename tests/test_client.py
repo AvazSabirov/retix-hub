@@ -17,7 +17,7 @@ from conftest import ROOT, fake_setup, new_pubkey
 try:
     import tkinter  # noqa: F401
 except ImportError:
-    tk = types.ModuleType("tkinter"); tk.Tk = tk.Toplevel = tk.Canvas = object
+    tk = types.ModuleType("tkinter"); tk.Tk = tk.Toplevel = tk.Canvas = tk.Label = object
     sys.modules["tkinter"] = tk
     for sub in ("messagebox", "simpledialog", "ttk"):
         sys.modules[f"tkinter.{sub}"] = types.ModuleType(sub)
@@ -2196,3 +2196,50 @@ def test_win81_build_config():
     assert "Get-WireGuard 'wireguard81'" in wg and "'0.5.3'" in wg
     wf = (ROOT / ".github/workflows/client.yml").read_text(encoding="utf-8")
     assert "python-version: '3.11'" in wf and "PY81: ${{ steps.py311.outputs.python-path }}" in wf
+
+
+# ================================================================== блокировка программы паролем этого ПК
+
+def test_lock_password_hash():
+    stored = rc.hash_lock_pw("1234", rounds=1000)
+    assert "1234" not in stored and stored.startswith("pbkdf2$1000$")
+    assert rc.check_lock_pw("1234", stored) and not rc.check_lock_pw("12345", stored)
+    assert rc.hash_lock_pw("1234", rounds=1000) != stored            # своя соль каждый раз
+    assert not rc.check_lock_pw("1234", "") and not rc.check_lock_pw("1234", "pbkdf2$x$y$z")
+
+
+def test_lock_settings(make_client):
+    c = make_client()
+    w = c.w
+    assert not w.lock_ready()
+    assert c.state.get("lock_minutes") == rc.LOCK_DEFAULT_MINUTES == 10
+    assert w.set_lock(True, 10).startswith("Придумайте пароль")      # без пароля блокировать нечем
+    assert w.set_lock(True, 7, "1234").startswith("Выберите")
+    assert w.set_lock(True, 10, "12 3").startswith("Пароль")          # пробелы нельзя
+    assert w.set_lock(True, 10, "ключ1") is None and w.lock_ready()
+    assert w.check_unlock("ключ1") and not w.check_unlock("ключ2")
+    assert "ключ1" not in c.state.path.read_text("utf-8")           # на диске — только хэш
+    assert w.set_lock(False, 5) is None and not w.lock_ready() and c.state.get("lock_minutes") == 5
+    assert w.check_unlock("ключ1")                                    # пароль остался — включить можно без него
+    assert w.set_lock(True, 5) is None and w.lock_ready()
+
+
+def test_own_access_password_locks_program(make_client, company):
+    """Пароль доступа «по моему паролю» — он же пароль блокировки программы."""
+    c = make_client(); login(c, company); c.step(2)
+    assert c.w.set_remote_access("own", "My-Secret#2026") is None
+    assert c.w.lock_ready() and c.w.check_unlock("My-Secret#2026")
+
+
+def test_forgotten_lock_reset_by_company_password(make_client, company):
+    a = make_client("PC-A"); login(a, company, remember=True); a.step(2)
+    a.w.set_lock(True, 10, "1111")
+    assert a.w.reset_lock("wrong-pass") == "Неверный пароль подключения компании."
+    assert a.w.lock_ready()
+    assert a.w.reset_lock("join123") is None and not a.w.lock_ready()
+    # пароль подключения не сохранён — его проверяет сервер (повторный вход тем же ключом)
+    b = make_client("PC-B"); login(b, company, remember=False, name="Склад"); b.step(2)
+    b.w.set_lock(True, 10, "2222")
+    assert b.w.reset_lock("wrong-pass") and b.w.lock_ready()
+    assert b.w.reset_lock("join123") is None and not b.w.lock_ready()
+    assert b.step(2)["status"] == rc.Status.ONLINE   # вход переподключил туннель — сеть снова работает

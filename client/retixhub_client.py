@@ -17,6 +17,7 @@ import faulthandler
 import ctypes
 import gzip
 import hashlib
+import hmac
 import ipaddress
 import json
 import logging
@@ -192,7 +193,10 @@ class State:
               "remote_applied": "", "remote_pw_pending": "", "rustdesk_by_retix": False,
               # доступ к ЭТОМУ ПК, который выбрал его пользователь ('' — как разрешил администратор, ask, own, off)
               # и его собственный пароль для режима own (DPAPI; сервер его не знает)
-              "remote_local": "", "remote_own_pw": ""}
+              "remote_local": "", "remote_own_pw": "",
+              # блокировка программы паролем этого компьютера (хэш PBKDF2; тот же пароль — «доступ по моему паролю»):
+              # включена ли, через сколько минут без действий; показано ли окно «Настройки этого компьютера»
+              "lock_hash": "", "lock_on": False, "lock_minutes": 10, "setup_done": False}
     PROFILE_FIELDS = ("server_url", "company_login", "company_name", "device_name", "token", "private_key",
                       "join_password", "direct_cache")
 
@@ -1180,6 +1184,29 @@ REMOTE_REAPPLY = 1800        # сек — настройки RustDesk повто
 REMOTE_MODES = ("ask", "auto")
 REMOTE_PW_RE = re.compile(r"^[A-Za-z0-9]{12,64}$")
 OWN_PW_RE = re.compile(r"^[\x21-\x7e]{8,64}$")   # свой пароль пользователя: 8–64 латинских символа без пробелов
+LOCK_PW_RE = re.compile(r"^\S{4,64}$")             # пароль только для блокировки программы: от 4 символов
+LOCK_MINUTES = (1, 5, 10, 15, 30, 60)              # через сколько минут без действий программа блокируется
+LOCK_DEFAULT_MINUTES = 10
+LOCK_TRIES = 5          # неверных паролей подряд — и пауза
+LOCK_PAUSE = 30         # сек, растёт с каждой следующей серией
+
+
+def hash_lock_pw(password: str, salt: bytes | None = None, rounds: int = 200_000) -> str:
+    """Пароль блокировки хранится только хэшем: из state.json его не прочитать."""
+    salt = salt or os.urandom(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, rounds)
+    return f"pbkdf2${rounds}${base64.b64encode(salt).decode()}${base64.b64encode(digest).decode()}"
+
+
+def check_lock_pw(password: str, stored: str) -> bool:
+    try:
+        kind, rounds, salt, digest = (stored or "").split("$")
+        if kind != "pbkdf2":
+            return False
+        got = hashlib.pbkdf2_hmac("sha256", (password or "").encode("utf-8"), base64.b64decode(salt), int(rounds))
+        return hmac.compare_digest(got, base64.b64decode(digest))
+    except (ValueError, TypeError):
+        return False
 REMOTE_LOCAL_CHOICES = {"": "Как разрешил администратор компании", "ask": "Только с моего согласия (нажать «Принять»)",
                         "own": "По моему паролю (его знаю только я)", "off": "Запретить управление этим компьютером"}
 
@@ -2200,7 +2227,8 @@ class Worker(threading.Thread):
             if password:
                 if not OWN_PW_RE.match(password):
                     return "Пароль: от 8 до 64 латинских букв, цифр и знаков, без пробелов."
-                self.state.set(remote_own_pw=protect(password))
+                # тот же пароль блокирует и саму программу: чужой человек за этим ПК без него ничего не сделает
+                self.state.set(remote_own_pw=protect(password), lock_hash=hash_lock_pw(password), lock_on=True)
             elif not self.state.get("remote_own_pw"):
                 return "Придумайте пароль."
         self.state.set(remote_local=local)
@@ -2208,6 +2236,47 @@ class Worker(threading.Thread):
         log.info("доступ к этому компьютеру: %s", REMOTE_LOCAL_CHOICES[local])
         self.reported = None    # сразу сообщить серверу
         self.wake.set()
+        return None
+
+    # --- блокировка программы паролем этого компьютера
+    def lock_ready(self) -> bool:
+        return bool(self.state.get("lock_on") and self.state.get("lock_hash"))
+
+    def check_unlock(self, password: str) -> bool:
+        return check_lock_pw(password, self.state.get("lock_hash") or "")
+
+    def set_lock(self, on: bool, minutes: int, password: str = "") -> str | None:
+        """Включить / выключить блокировку и задать её пароль. None — сохранено, иначе текст ошибки."""
+        if minutes not in LOCK_MINUTES:
+            return "Выберите, через сколько минут блокировать программу."
+        if password:
+            if not LOCK_PW_RE.match(password):
+                return "Пароль: от 4 до 64 символов, без пробелов."
+            self.state.set(lock_hash=hash_lock_pw(password))
+        if on and not self.state.get("lock_hash"):
+            return "Придумайте пароль — им программа будет разблокироваться."
+        self.state.set(lock_on=bool(on), lock_minutes=minutes)
+        log.info("блокировка программы: %s", f"через {minutes} мин без действий" if on else "выключена")
+        return None
+
+    def reset_lock(self, join_password: str) -> str | None:
+        """Забыли пароль блокировки: подтвердить паролем подключения компании (его знает администратор) —
+        блокировка снимается, пароль задаётся заново. Пароль не сохранён — проверяет сервер (повторный вход)."""
+        if not join_password:
+            return "Введите пароль подключения компании."
+        saved = self.state.get("join_password") or ""
+        if saved:
+            if not hmac.compare_digest(saved.encode("utf-8"), join_password.encode("utf-8")):
+                return "Неверный пароль подключения компании."
+        else:
+            if not (self.state.get("company_login") and self.state.get("token")):
+                return "Этот компьютер не подключён к компании — пароль подключения проверить нечем."
+            err = self.login(self.state.get("server_url"), self.state.get("company_login"), join_password,
+                             self.state.get("device_name") or socket.gethostname(), remember=False)
+            if err:
+                return err
+        self.state.set(lock_on=False, lock_hash="")
+        log.warning("блокировка программы снята паролем подключения компании")
         return None
 
     def _remote_password(self, exe: Path, rotate: bool, port: int, now: float):
@@ -2735,6 +2804,17 @@ def round_corners(win, radius: int = 8) -> None:
         log.debug("углы меню не скруглены", exc_info=True)
 
 
+def unbind_all_func(widget, seq: str, funcid: str) -> None:
+    """Снять одну свою привязку bind_all(..., add="+"), не трогая остальные (unbind_all сняла бы все)."""
+    try:
+        script = widget.tk.call("bind", "all", seq)
+        keep = "\n".join(line for line in str(script).split("\n") if funcid not in line)
+        widget.tk.call("bind", "all", seq, keep)
+        widget.deletecommand(funcid)
+    except tk.TclError:
+        pass
+
+
 class HubMenu:
     """Выпадающее меню программы вместо tk.Menu: у меню Windows по краю белая рамка, её не перекрасить.
     Своё — оттенка светлее окна, без рамки, со скруглёнными углами. Вызовы — как у tk.Menu."""
@@ -2756,6 +2836,7 @@ class HubMenu:
         self.sub_index = -1
         self.owner: HubMenu | None = None          # у подменю — меню, из которого оно открыто
         self._watch_job = None
+        self._binds: list[tuple[str, str]] = []   # глобальные привязки открытого меню: (событие, id)
 
     # --- как у tk.Menu
     def configure(self, **kw):
@@ -2868,8 +2949,9 @@ class HubMenu:
             if self._watch_job:
                 self.parent.after_cancel(self._watch_job)
                 self._watch_job = None
-            for seq in ("<ButtonPress>",) + self.KEYS:
-                self.parent.unbind_all(seq)
+            for seq, funcid in self._binds:
+                unbind_all_func(self.parent, seq, funcid)
+            self._binds = []
 
     def _windows(self) -> list:
         out, m = [], self
@@ -2882,9 +2964,9 @@ class HubMenu:
         """Щелчок в окне программы мимо меню — закрыть меню; стрелки, Enter и Esc — управление меню."""
         if HubMenu.open_menu is not self or self.win is None:
             return
-        self.parent.bind_all("<ButtonPress>", self._outside_click)
+        self._binds = [("<ButtonPress>", self.parent.bind_all("<ButtonPress>", self._outside_click, add="+"))]
         for seq in self.KEYS:
-            self.parent.bind_all(seq, self._key)
+            self._binds.append((seq, self.parent.bind_all(seq, self._key, add="+")))
 
     def _outside_click(self, event):
         try:
@@ -3511,14 +3593,44 @@ class RenameDialog(tk.Toplevel):
             self.close()
 
 
-class AccessDialog(tk.Toplevel):
-    """Доступ к этому компьютеру: как другие ПК компании могут им управлять (RustDesk). Только строже того,
-    что разрешил администратор компании; свой пароль хранится только здесь и в RustDesk."""
+class Dropdown(tk.Label):
+    """Выбор из списка в цветах программы (выпадает своё меню HubMenu, а не белый список ttk.Combobox)."""
 
-    def __init__(self, app: "App"):
+    def __init__(self, master, options: dict, value, command=None):
+        super().__init__(master, bg=C["entry"], fg=C["text"], font=("Segoe UI", 9), anchor="w", padx=8, pady=3,
+                         cursor="hand2", highlightthickness=1, highlightbackground=C["line"])
+        self.options, self.value, self.command = options, value, command
+        self.menu = HubMenu(master)
+        for key, title in options.items():
+            self.menu.add_command(label=title, command=lambda k=key: self.set(k))
+        self.bind("<Button-1>", lambda _e: self.menu.unpost() if self.menu.posted else
+                  self.menu.tk_popup(self.winfo_rootx(), self.winfo_rooty() + self.winfo_height() + 2))
+        self.set(value, quiet=True)
+
+    def set(self, value, quiet: bool = False):
+        self.value = value
+        self.configure(text=f"{self.options.get(value, value)}   ▾")
+        if self.command and not quiet:
+            self.command()
+
+    def enable(self, on: bool):
+        self.configure(fg=C["text"] if on else C["muted"], cursor="hand2" if on else "arrow")
+        self.bind("<Button-1>", (lambda _e: self.menu.unpost() if self.menu.posted else
+                                 self.menu.tk_popup(self.winfo_rootx(), self.winfo_rooty() + self.winfo_height() + 2))
+                  if on else (lambda _e: "break"))
+
+
+class SettingsDialog(tk.Toplevel):
+    """Настройки этого компьютера — то, что касается только его: имя в сети компании, как им можно управлять
+    (RustDesk; только строже, чем разрешил администратор), пароль этого компьютера и блокировка программы.
+    Пароль один: им разблокируется программа, и по нему подключаются, если выбран доступ «по моему паролю».
+    При первом запуске окно открывается само."""
+
+    def __init__(self, app: "App", first: bool = False):
         super().__init__(app)
-        self.app = app
-        self.title("Доступ к этому компьютеру")
+        self.app, self.first = app, first
+        st = app.state_
+        self.title("Настройка этого компьютера" if first else "Настройки этого компьютера")
         self.configure(bg=C["bg"])
         self.resizable(False, False)
         self.transient(app)
@@ -3528,65 +3640,143 @@ class AccessDialog(tk.Toplevel):
             pass
         frm = ttk.Frame(self, padding=16)
         frm.pack(fill="both")
+        row = 0
+
+        def put(widget, pady=(0, 0), sticky="w"):
+            nonlocal row
+            widget.grid(row=row, column=0, sticky=sticky, pady=pady)
+            row += 1
+            return widget
+
+        def head(text):
+            put(tk.Label(frm, text=text, bg=C["bg"], fg=C["name"], font=("Segoe UI", 10, "bold")),
+                pady=(12 if row else 0, 4))
+
+        def muted(text):
+            put(ttk.Label(frm, text=text, style="Muted.TLabel", wraplength=340, justify="left"), pady=(0, 4))
+
+        if first:
+            muted("Эти настройки касаются только этого компьютера. Их можно изменить позже: "
+                  "«Система → Настройки этого компьютера…».")
+        # имя
+        head("Имя компьютера")
+        self.name0 = (app.cfg or {}).get("device_name") or st.get("device_name") or socket.gethostname()
+        self.name = tk.StringVar(value=self.name0)
+        put(ttk.Entry(frm, textvariable=self.name, width=40), sticky="ew")
+        muted("Так его видят другие компьютеры и кабинет компании.")
+        # доступ
+        head("Доступ к этому компьютеру")
         remote = (app.cfg or {}).get("remote") if isinstance((app.cfg or {}).get("remote"), dict) else {}
         admin = remote.get("mode") if remote.get("mode") in REMOTE_MODES else "off"
-        admin_text = {"off": "Администратор компании не разрешил управлять этим компьютером — к нему никто "
-                             "не подключится, что бы вы ни выбрали.",
-                      "ask": "Администратор компании разрешил управление этим компьютером только с вашего согласия.",
-                      "auto": "Администратор компании разрешил подключаться к этому компьютеру без вашего согласия "
-                              "(по одноразовому паролю от сервера Retix Hub)."}[admin]
-        ttk.Label(frm, text="Кто и как может управлять этим компьютером").grid(row=0, column=0, sticky="w")
-        ttk.Label(frm, text=admin_text, style="Muted.TLabel", wraplength=330, justify="left")\
-            .grid(row=1, column=0, sticky="w", pady=(2, 8))
-        self.var = tk.StringVar(value=app.state_.get("remote_local") or "")
-        for i, (key, title) in enumerate(REMOTE_LOCAL_CHOICES.items()):
-            ttk.Radiobutton(frm, text=title, value=key, variable=self.var, command=self._toggle)\
-                .grid(row=2 + i, column=0, sticky="w", pady=1)
-        row = 2 + len(REMOTE_LOCAL_CHOICES)
-        has_pw = bool(app.state_.get("remote_own_pw"))
-        ttk.Label(frm, text="Новый пароль" + (" (пусто — оставить прежний)" if has_pw else ""),
-                  style="Muted.TLabel").grid(row=row, column=0, sticky="w", pady=(8, 0))
-        self.pw1, self.pw2 = tk.StringVar(), tk.StringVar()
-        self.e1 = ttk.Entry(frm, textvariable=self.pw1, show="•", width=36)
-        self.e1.grid(row=row + 1, column=0, sticky="ew")
-        ttk.Label(frm, text="Повторите пароль", style="Muted.TLabel").grid(row=row + 2, column=0, sticky="w")
-        self.e2 = ttk.Entry(frm, textvariable=self.pw2, show="•", width=36)
-        self.e2.grid(row=row + 3, column=0, sticky="ew")
-        ttk.Label(frm, text="Свой пароль знаете только вы: сервер Retix Hub его не хранит. Сообщите его тому, "
-                            "кто будет подключаться.", style="Muted.TLabel", wraplength=330, justify="left")\
-            .grid(row=row + 4, column=0, sticky="w", pady=(2, 0))
-        self.err = ttk.Label(frm, text="", style="Err.TLabel", wraplength=330)
-        self.err.grid(row=row + 5, column=0, sticky="w", pady=(4, 0))
-        self.btn = ttk.Button(frm, text="Сохранить", command=self.submit)
-        self.btn.grid(row=row + 6, column=0, pady=(8, 0), sticky="ew")
+        muted({"off": "Сейчас администратор компании не разрешил управлять этим компьютером — к нему никто "
+                      "не подключится, что бы вы ни выбрали.",
+               "ask": "Администратор компании разрешил управление этим компьютером только с вашего согласия.",
+               "auto": "Администратор компании разрешил подключаться к этому компьютеру без вашего согласия "
+                       "(по одноразовому паролю от сервера Retix Hub)."}[admin])
+        self.local = tk.StringVar(value=st.get("remote_local") or "")
+        for key, title in REMOTE_LOCAL_CHOICES.items():
+            put(ttk.Radiobutton(frm, text=title, value=key, variable=self.local, command=self._toggle), pady=1)
+        # пароль
+        head("Пароль этого компьютера")
+        self.has_lock = bool(st.get("lock_hash"))
+        self.has_own = bool(st.get("remote_own_pw"))
+        muted("Им разблокируется программа Retix Hub, и по нему подключаются к этому компьютеру, если выбран "
+              "доступ «по моему паролю». Сервер Retix Hub его не знает."
+              + (" Пусто — оставить прежний." if self.has_lock or self.has_own else ""))
+        self.pw1, self.pw2, self.pw0 = tk.StringVar(), tk.StringVar(), tk.StringVar()
+        put(ttk.Label(frm, text="Новый пароль", style="Muted.TLabel"))
+        self.e1 = put(ttk.Entry(frm, textvariable=self.pw1, show="•", width=40), sticky="ew")
+        put(ttk.Label(frm, text="Повторите пароль", style="Muted.TLabel"), pady=(4, 0))
+        put(ttk.Entry(frm, textvariable=self.pw2, show="•", width=40), sticky="ew")
+        # блокировка
+        head("Блокировка программы")
+        self.lock_on = tk.BooleanVar(value=bool(st.get("lock_on")) if st.get("setup_done") else True)
+        put(ttk.Checkbutton(frm, text="Блокировать программу паролем этого компьютера", variable=self.lock_on,
+                            command=self._toggle))
+        line = ttk.Frame(frm)
+        put(line, pady=(4, 0))
+        ttk.Label(line, text="через", style="Muted.TLabel").pack(side="left")
+        minutes = st.get("lock_minutes") if st.get("lock_minutes") in LOCK_MINUTES else LOCK_DEFAULT_MINUTES
+        self.minutes = Dropdown(line, {m: f"{m} мин" for m in LOCK_MINUTES}, minutes)
+        self.minutes.pack(side="left", padx=6)
+        ttk.Label(line, text="без действий в программе и после запуска Windows", style="Muted.TLabel")\
+            .pack(side="left")
+        muted("Заблокированную программу нельзя открыть, отключить или закрыть, не зная пароля: так чужой "
+              "человек за этим компьютером не воспользуется сетью компании. Сеть при этом работает.")
+        if self.has_lock:   # менять пароль и снимать блокировку — только зная прежний
+            put(ttk.Label(frm, text="Текущий пароль (чтобы сменить пароль или выключить блокировку)",
+                          style="Muted.TLabel"), pady=(6, 0))
+            put(ttk.Entry(frm, textvariable=self.pw0, show="•", width=40), sticky="ew")
+        self.err = put(ttk.Label(frm, text="", style="Err.TLabel", wraplength=340), pady=(6, 0))
+        self.btn = put(ttk.Button(frm, text="Сохранить", command=self.submit), pady=(8, 0), sticky="ew")
         self._toggle()
+        self.bind("<Return>", lambda _e: self.submit())
         self.bind("<Escape>", lambda _e: self.close())
         self.protocol("WM_DELETE_WINDOW", self.close)
         self.update_idletasks()
-        ax, ay, aw, _ = app.frame_box()
-        self.geometry(f"+{max(0, ax + (aw - self.winfo_reqwidth()) // 2)}+{max(0, ay + 40)}")
+        ax, ay, aw, ah = app.frame_box()
+        y = max(0, min(ay + 20, ay + ah - self.winfo_reqheight()))
+        self.geometry(f"+{max(0, ax + (aw - self.winfo_reqwidth()) // 2)}+{y}")
         dark_titlebar(self)
         self.grab_set()
 
     def _toggle(self):
-        state = "normal" if self.var.get() == "own" else "disabled"
-        self.e1.config(state=state)
-        self.e2.config(state=state)
+        self.minutes.enable(self.lock_on.get())
 
     def close(self):
-        self.app.access_dialog = None
+        if self.first:   # закрыли без сохранения — больше не навязываемся (есть пункт в меню «Система»)
+            self.app.state_.set(setup_done=True)
+        self.app.settings_dialog = None
         self.destroy()
 
     def submit(self):
-        local, pw1, pw2 = self.var.get(), self.pw1.get(), self.pw2.get()
-        if local == "own" and pw1 != pw2:
-            self.err.config(text="Пароли не совпадают")
-            return
-        err = self.app.worker.set_remote_access(local, pw1 if local == "own" else "")
+        name = clean_device_name(self.name.get())
+        local, pw1, pw2, pw0 = self.local.get(), self.pw1.get(), self.pw2.get(), self.pw0.get()
+        lock_on, minutes = self.lock_on.get(), self.minutes.value
+        if not name:
+            return self.err.config(text="Введите имя компьютера.")
+        if pw1 != pw2:
+            return self.err.config(text="Пароли не совпадают.")
+        if local == "own" and not (pw1 or self.has_own):
+            return self.err.config(text="Для доступа «по моему паролю» придумайте пароль.")
+        if local == "own" and pw1 and not OWN_PW_RE.match(pw1):
+            return self.err.config(text="Для доступа по паролю: от 8 до 64 латинских букв, цифр и знаков, "
+                                        "без пробелов.")
+        if lock_on and not (pw1 or self.has_lock or (local == "own" and self.has_own)):
+            return self.err.config(text="Придумайте пароль — им программа будет разблокироваться. "
+                                        "Или снимите галочку «Блокировать программу».")
+        if pw1 and not LOCK_PW_RE.match(pw1):
+            return self.err.config(text="Пароль: от 4 до 64 символов, без пробелов.")
+        if self.has_lock and (pw1 or not lock_on) and not self.app.worker.check_unlock(pw0):
+            return self.err.config(text="Неверный текущий пароль." if pw0 else "Введите текущий пароль.")
+        self.btn.config(state="disabled", text="Сохранение…")
+        worker = self.app.worker
+
+        def work():
+            err = None
+            if name != self.name0:
+                err = worker.rename(name)
+                if not err:
+                    self.app.ui_q.put(("rename_done", (name, None)))
+            if not err:   # пароль «по моему паролю» — он же пароль блокировки (set_remote_access)
+                err = worker.set_remote_access(local, pw1 if local == "own" else "")
+            if not err and lock_on and not pw1 and local == "own" and not self.has_lock:
+                # блокировку включили, а пароль уже есть только у доступа «по моему паролю» — он и блокирует
+                worker.state.set(lock_hash=hash_lock_pw(unprotect(worker.state.get("remote_own_pw") or "")))
+            if not err:
+                err = worker.set_lock(lock_on, minutes, pw1)
+            if not err:
+                worker.state.set(setup_done=True)
+            self.app.ui_q.put(("settings_done", err))
+        threading.Thread(target=work, daemon=True, name="settings").start()
+
+    def done(self, err):
         if err:
             self.err.config(text=err)
-            return
-        self.close()
+            self.btn.config(state="normal", text="Сохранить")
+        else:
+            self.first = False
+            self.close()
 
 
 class MessageWindow(tk.Toplevel):
@@ -3775,7 +3965,13 @@ class App(tk.Tk):
         self.peers: list[dict] = []
         self.login_dialog: LoginDialog | None = None
         self.rename_dialog: RenameDialog | None = None
-        self.access_dialog: AccessDialog | None = None
+        self.settings_dialog: SettingsDialog | None = None
+        # блокировка программы паролем этого компьютера: через N минут без действий и после запуска
+        self.locked = False
+        self.last_activity = time.monotonic()
+        self._lock_pending = None            # действие из трея, которое выполнить после разблокировки
+        self._lock_fails, self._lock_until = 0, 0.0
+        self._lock_chats: list = []          # окна переписки, спрятанные на время блокировки
         self.last_status = None
         self.status_now = None
         self.chats: dict[int, MessageWindow] = {}
@@ -3801,6 +3997,10 @@ class App(tk.Tk):
             self.after(0, lambda: (self.place_corner(), self.iconify()))
         dark_titlebar(self)
         no_maximize_button(self)
+        for seq in ("<Motion>", "<KeyPress>", "<ButtonPress>"):   # любое действие в окнах программы
+            self.bind_all(seq, self._activity, add="+")
+        if self.worker.lock_ready():   # после запуска Windows — сразу заблокирована
+            self.lock()
         self.worker.start()
         self.updater = Updater(state, self.worker.api, on_update=lambda ver: self.ui_q.put(("update", ver)))
         self.worker.api.on_hint = self.updater.note_hint
@@ -3820,7 +4020,9 @@ class App(tk.Tk):
         m.add_command(label="Подключить / отключить", command=self.toggle)
         m.add_command(label="Переподключить", command=self.worker.force_reconnect)
         m.add_separator()
+        m.add_command(label="Настройки этого компьютера…", command=self.settings)
         m.add_command(label="Имя компьютера…", command=self.rename)
+        m.add_command(label="Заблокировать программу", command=self.lock_now)
         m.add_command(label="Добавить компанию…", command=lambda: self.show_login(add=True))
         m.add_command(label="Выйти из сети компании", command=self.logout)
         m.add_separator()
@@ -3924,6 +4126,7 @@ class App(tk.Tk):
         self.msg_lbl.pack(fill="x", pady=(0, 6))
         self.bind("<Configure>", lambda e: self.msg_lbl.config(wraplength=max(200, e.width - 20))
                   if e.widget is self else None)
+        self._build_lock()
 
     def _set_badge(self, text: str, color: str = ""):
         """Плашка статуса под IP. «В сети» не показываем: это и так видно по зелёной кнопке ON."""
@@ -3992,9 +4195,23 @@ class App(tk.Tk):
                 self._on_ui(kind, data)
         except queue.Empty:
             pass
+        if not self.locked and self.worker.lock_ready():
+            minutes = self.state_.get("lock_minutes") if self.state_.get("lock_minutes") in LOCK_MINUTES \
+                else LOCK_DEFAULT_MINUTES
+            if time.monotonic() - self.last_activity >= minutes * 60:
+                log.info("программа заблокирована: %d мин без действий", minutes)
+                self.lock()
         self.after(250, self._poll)
 
+    LOCKED_ACTIONS = {"toggle": "подключить или отключить сеть", "reconnect": "переподключить сеть",
+                      "ask_quit": "закрыть программу"}
+
     def _on_ui(self, kind, data):
+        if self.locked and kind in self.LOCKED_ACTIONS:   # из трея — только после пароля
+            self._lock_pending = kind
+            self.show()
+            self.lock_hint.config(text=f"Чтобы {self.LOCKED_ACTIONS[kind]}, введите пароль этого компьютера.")
+            return
         if kind == "show":
             self.show()
         elif kind == "toggle":
@@ -4020,6 +4237,13 @@ class App(tk.Tk):
         elif kind == "login_done":
             if self.login_dialog:
                 self.login_dialog.done(data)
+            if not data and not self.state_.get("setup_done"):   # первый вход — настройки этого компьютера
+                self.after(300, lambda: self.settings(first=True))
+        elif kind == "settings_done":
+            if self.settings_dialog:
+                self.settings_dialog.done(data)
+        elif kind == "lock_reset":
+            self._lock_reset_done(data)
         elif kind == "info":
             messagebox.showinfo(APP_TITLE, data, parent=self)
         elif kind == "error":
@@ -4080,30 +4304,35 @@ class App(tk.Tk):
             self.set_compact(False)
         self._company_line()
         self.msg_lbl.config(text="" if status == Status.ONLINE else (text or ""))
-        if self.compact:   # окно по содержимому: пустую строку сообщения не показываем, длинную — целиком
-            if self.msg_lbl.cget("text"):
-                self.msg_lbl.pack(fill="x", pady=(0, 6))
-            else:
-                self.msg_lbl.pack_forget()
-            self.update_idletasks()
-            self.top_frame.fit()
-            self.update_idletasks()
-            self._size = (max(self.winfo_width(), 320), self.winfo_reqheight())
-            self.geometry(f"{self._size[0]}x{self._size[1]}")
-            if self.state() == "normal":
-                self.place_corner()
+        if self.compact and not self.locked:
+            self._fit_compact()
         # значок в трее: зелёный — в сети, жёлтый — подключается, красный — VPN не работает (выключен, нет входа,
         # сервер недоступен, блок, ошибка)
         self._net_notify(status)
         tray_color = {C["green"]: "green", C["orange"]: "orange"}.get(color, "red")
         ip = (c or {}).get("ip", "")
         self.tray.update(tray_color, f"{APP_TITLE} — {label}" + (f" · {ip}" if ip and status == Status.ONLINE else ""))
-        if status == Status.NEED_LOGIN and self.last_status != Status.NEED_LOGIN and not self.login_dialog:
+        if status == Status.NEED_LOGIN and self.last_status != Status.NEED_LOGIN and not self.login_dialog \
+                and not self.locked:
             self.show_login(text)
         if status in (Status.SERVER_DOWN, Status.BLOCKED) or (self.last_status in (Status.SERVER_DOWN, Status.BLOCKED)
                                                               and status != self.last_status):
             self._render_peers()
         self.last_status = status
+
+    def _fit_compact(self):
+        """Окно по содержимому: пустую строку сообщения не показываем, длинную — целиком."""
+        if self.msg_lbl.cget("text"):
+            self.msg_lbl.pack(fill="x", pady=(0, 6))
+        else:
+            self.msg_lbl.pack_forget()
+        self.update_idletasks()
+        self.top_frame.fit()
+        self.update_idletasks()
+        self._size = (max(self.winfo_width(), 320), self.winfo_reqheight())
+        self.geometry(f"{self._size[0]}x{self._size[1]}")
+        if self.state() == "normal":
+            self.place_corner()
 
     def _peer_online(self, p: dict) -> bool:
         return bool(p.get("online")) and self.status_now not in (Status.SERVER_DOWN, Status.BLOCKED, Status.OFF)
@@ -4174,6 +4403,163 @@ class App(tk.Tk):
             self.focus_force()
         except tk.TclError:
             pass
+        if self.locked:
+            self.after(60, self.lock_entry.focus_force)
+        elif not self.state_.get("setup_done") and self.state_.get("token") and not self.login_dialog:
+            self.after(300, lambda: self.settings(first=True))   # обновились с прежней версии — один раз
+
+    # --- блокировка программы
+    def _activity(self, _event=None):
+        if not self.locked:
+            self.last_activity = time.monotonic()
+
+    def _build_lock(self):
+        """Экран блокировки — поверх всего окна (меню, список, кнопка ON/OFF под ним недоступны)."""
+        f = tk.Frame(self, bg=C["bg"])
+        panel = RoundPanel(f)
+        panel.pack(expand=True, fill="x", padx=8)
+        b = panel.body
+        try:
+            from PIL import ImageTk
+            self._lock_logo = ImageTk.PhotoImage(tray_image(C["green"], 56, original=True))
+            tk.Label(b, image=self._lock_logo, bg=C["panel"]).pack(pady=(14, 6))
+        except Exception:  # noqa: BLE001
+            log.debug("значок на экране блокировки не нарисован", exc_info=True)
+        tk.Label(b, text="Программа заблокирована", bg=C["panel"], fg=C["text"],
+                 font=("Segoe UI", 12, "bold")).pack()
+        self.lock_net = tk.Label(b, text="", bg=C["panel"], fg=C["muted"], font=("Segoe UI", 9))
+        self.lock_net.pack(pady=(2, 0))
+        self.lock_hint = tk.Label(b, text="", bg=C["panel"], fg=C["muted"], font=("Segoe UI", 9), wraplength=280,
+                                  justify="center")
+        self.lock_hint.pack(pady=(10, 4), padx=12)
+        self.lock_var = tk.StringVar()
+        self.lock_entry = ttk.Entry(b, textvariable=self.lock_var, show="•", width=30, justify="center")
+        self.lock_entry.pack(padx=24, fill="x")
+        self.lock_entry.bind("<Return>", lambda _e: self._lock_submit())
+        self.lock_err = tk.Label(b, text="", bg=C["panel"], fg=C["red"], font=("Segoe UI", 9), wraplength=280)
+        self.lock_err.pack(pady=(4, 0))
+        self.lock_btn = ttk.Button(b, text="Разблокировать", command=self._lock_submit)
+        self.lock_btn.pack(padx=24, fill="x", pady=(2, 6))
+        self.lock_forgot = tk.Label(b, text="Забыли пароль?", bg=C["panel"], fg=C["muted"], cursor="hand2",
+                                    font=("Segoe UI", 8, "underline"))
+        self.lock_forgot.pack(pady=(0, 12))
+        self.lock_forgot.bind("<Button-1>", lambda _e: self._lock_mode(not self._lock_reset))
+        self._lock_reset = False
+        self.lock_frame = f
+
+    def _lock_mode(self, reset: bool):
+        """Обычный вход паролем этого компьютера или сброс забытого пароля паролем подключения компании."""
+        self._lock_reset = reset
+        self.lock_var.set("")
+        self.lock_err.config(text="")
+        if reset:
+            self.lock_hint.config(text="Введите пароль подключения компании (его знает администратор компании). "
+                                       "Блокировка снимется, новый пароль можно будет задать в настройках.")
+            self.lock_btn.config(text="Снять блокировку")
+            self.lock_forgot.config(text="Вспомнил пароль")
+        else:
+            self.lock_hint.config(text="Введите пароль этого компьютера.")
+            self.lock_btn.config(text="Разблокировать")
+            self.lock_forgot.config(text="Забыли пароль?")
+        self.lock_entry.focus_set()
+
+    def lock_now(self):
+        if not self.worker.lock_ready():
+            messagebox.showinfo(APP_TITLE, "Сначала задайте пароль этого компьютера и включите блокировку.",
+                                parent=self)
+            self.settings()
+            return
+        self.lock()
+
+    def lock(self):
+        if self.locked:
+            return
+        self.locked = True
+        if HubMenu.open_menu:
+            HubMenu.open_menu.unpost()
+        self.tip.hide()
+        for dlg in (self.rename_dialog, self.settings_dialog):
+            if dlg is not None and dlg.winfo_exists():
+                dlg.close()
+        self._lock_chats = []
+        for win in list(self.chats.values()):   # переписку чужой человек не увидит
+            if win.winfo_exists() and win.state() != "withdrawn":
+                win.withdraw()
+                self._lock_chats.append(win)
+        self.tree.configure(takefocus=0)
+        c = self.cfg or {}
+        self.lock_net.config(text=" · ".join(x for x in (c.get("device_name") or self.state_.get("device_name"),
+                                                        c.get("ip")) if x))
+        self._lock_pending = None
+        self._lock_mode(False)
+        self.lock_frame.place(x=0, y=0, relwidth=1, relheight=1)
+        self.lock_frame.lift()
+        if self.compact:   # окно без списка низкое — экрану блокировки нужно место
+            self.geometry(f"{self._size[0]}x{max(self._size[1], 330)}")
+            if self.state() == "normal":
+                self.place_corner()
+
+    def unlock(self):
+        self.locked = False
+        self.last_activity = time.monotonic()
+        self._lock_fails = 0
+        self.lock_frame.place_forget()
+        self.lock_var.set("")
+        self.tree.configure(takefocus=1)
+        for win in self._lock_chats:
+            if win.winfo_exists():
+                win.deiconify()
+        self._lock_chats = []
+        if self.compact:
+            self._fit_compact()
+        pending, self._lock_pending = self._lock_pending, None
+        if pending:
+            self.after(50, lambda: self._on_ui(pending, None))
+
+    def _lock_submit(self):
+        now = time.monotonic()
+        if now < self._lock_until:
+            self.lock_err.config(text=f"Слишком много попыток. Подождите {int(self._lock_until - now) + 1} с.")
+            return
+        password = self.lock_var.get()
+        if self._lock_reset:
+            self.lock_btn.config(state="disabled")
+            threading.Thread(target=lambda: self.ui_q.put(("lock_reset", self.worker.reset_lock(password))),
+                             daemon=True, name="lock-reset").start()
+            return
+        if self.worker.check_unlock(password):
+            log.info("программа разблокирована")
+            self.unlock()
+            return
+        self._lock_failed("Неверный пароль.")
+
+    def _lock_failed(self, text: str):
+        self._lock_fails += 1
+        self.lock_var.set("")
+        if self._lock_fails % LOCK_TRIES == 0:
+            self._lock_until = time.monotonic() + LOCK_PAUSE * (self._lock_fails // LOCK_TRIES)
+            text += f" Слишком много попыток — подождите {int(self._lock_until - time.monotonic())} с."
+            log.warning("блокировка: %d неверных паролей подряд", self._lock_fails)
+        self.lock_err.config(text=text)
+
+    def _lock_reset_done(self, err):
+        self.lock_btn.config(state="normal")
+        if err:
+            self._lock_failed(err)
+            return
+        self.unlock()
+        self.after(200, self.settings)   # задать новый пароль
+
+    def settings(self, first: bool = False):
+        if self.locked:
+            return
+        if self.settings_dialog and self.settings_dialog.winfo_exists():
+            self.settings_dialog.lift()
+            return
+        if first and self.state_.get("setup_done"):
+            return
+        self.show()
+        self.settings_dialog = SettingsDialog(self, first=first)
 
     def place_corner(self):
         """Окно — в правый нижний угол рабочей области (над панелью задач), как у программ из трея."""
@@ -4220,6 +4606,8 @@ class App(tk.Tk):
             self.resizable(False, True)
             self._size = (width, 620)
             self.geometry(f"{width}x620")
+        if self.locked and compact:   # экрану блокировки нужно место
+            self.geometry(f"{width}x{max(self._size[1], 330)}")
         if self.state() == "normal":
             self.place_corner()
 
@@ -4394,7 +4782,13 @@ class App(tk.Tk):
                 {"id": m["from_id"] or -m["id"], "name": m["from_name"], "ip": m["from_ip"]}
             win = self.open_chat(peer)
             win.add(peer["name"], m["text"], m["time"])
-        if msgs:
+            if self.locked:   # покажем после разблокировки; текст чужому человеку не виден
+                win.withdraw()
+                if win not in self._lock_chats:
+                    self._lock_chats.append(win)
+        if msgs and self.locked:
+            self.tray.notify(f"Сообщение от {msgs[-1]['from_name']}", "Разблокируйте Retix Hub, чтобы прочитать.")
+        elif msgs:
             # окно сообщения — поверх всех, чтобы его увидели (даже если программа в трее)
             last = msgs[-1]
             win = self.chats.get(last["from_id"])
@@ -4603,11 +4997,7 @@ class App(tk.Tk):
         threading.Thread(target=work, daemon=True, name="rd-repair").start()
 
     def access(self):
-        if self.access_dialog and self.access_dialog.winfo_exists():
-            self.access_dialog.lift()
-            return
-        self.show()
-        self.access_dialog = AccessDialog(self)
+        self.settings()
 
     def rename(self):
         if self.rename_dialog and self.rename_dialog.winfo_exists():
