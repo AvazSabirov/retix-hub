@@ -167,7 +167,14 @@ sqlite3 /root/hub/data/vpn.db 'select login, subnet_index from companies'
 > `downloads/`); другая папка — `HUB_DATA` в `.env`.
 > Бэкап — это папка `/root/hub/data`. Без `server.key` всем клиентам придётся
 > переподключаться, без `update_sign.key` ПК не примут новые обновления (клиент придётся поставить вручную).
->
+> Базу на работающем сервере копируйте через SQLite, а не `cp` (журнал WAL):
+> `sqlite3 /root/hub/data/vpn.db ".backup /root/backup/vpn-$(date +%F).db"`, ключи — обычным копированием.
+> Журнал действий в базе хранится 365 дней (`AUDIT_KEEP_DAYS`, 0 — всегда).
+
+Безопасность суперадмина: вход в `/admin` даёт право выпустить обновление на все ПК всех компаний. Пароль
+`SUPERADMIN_PASSWORD` — длинный случайный (сервер предупреждает в журнале, если он короче 12 символов). Неудачные входы
+ограничены (по логину и адресу, по адресу и общим счётчиком суперадмина), но лучше ещё закрыть `/admin` в nginx
+списком своих адресов (`location /admin { allow …; deny all; … }`).
 
 ### Адреса на hub.retix.uz
 
@@ -381,12 +388,14 @@ cd /root/hub/server && ./publish.sh            # последний Release: с�
 
 ```bash
 pip install -r server/requirements.txt -r client/requirements.txt pytest httpx
-python -m pytest tests/test_server.py tests/test_client.py -q   # 245 тестов, ~5 мин
+python -m pytest tests/test_server.py tests/test_client.py tests/test_security.py -q   # ~360 тестов, ~6 мин
 sudo python3 tests/e2e_network.py                               # 103 проверки на настоящей сети
 ```
 
 * `test_server.py` — суперадмин, регистрация, лимиты, изоляция компаний, кабинет, блок/одобрение,
   смена паролей, правила iptables, XSS/SQL-инъекции, параллельная регистрация (60 ПК одновременно).
+* `test_security.py` — исправления аудита 1.0.26: счётчики попыток входа, подтверждение ключа при повторной
+  регистрации, сессии, проверка Origin, заголовки, iptables рядом с Docker, восстановление `wg0`, журнал.
 * `test_client.py` — логика клиента против живого сервера: вход, падение/возврат сервера, потеря связи,
   удаление/блокировка/одобрение ПК, смена пароля, firewall, кнопка ON/OFF, выход.
 * `e2e_network.py` — стенд из Linux network namespaces: настоящий сервер управляет WireGuard и iptables,

@@ -515,11 +515,19 @@ class TestWg:
     def test_sync_peers_removes_stale(self, monkeypatch):
         from app import wg
         calls = []
-        monkeypatch.setattr(wg, "current_peers", lambda: {"old=", "keep="})
+        monkeypatch.setattr(wg, "current_peers", lambda: {"old=": "10.66.1.9/32", "keep=": "10.66.1.2/32",
+                                                          "moved=": "10.66.1.5/32"})
         monkeypatch.setattr(wg, "run", lambda args, **k: calls.append(" ".join(args)) or "")
-        wg.sync_peers({"keep=": "10.66.1.2", "new=": "10.66.1.3"})
+        wg.sync_peers({"keep=": "10.66.1.2", "new=": "10.66.1.3", "moved=": "10.66.1.6"})
         assert "wg set wg0 peer old= remove" in calls
         assert "wg set wg0 peer new= allowed-ips 10.66.1.3/32" in calls
+        assert "wg set wg0 peer moved= allowed-ips 10.66.1.6/32" in calls
+        assert not any("keep=" in c for c in calls)          # не изменился — wg не запускается
+
+    def test_current_peers_parsing(self, monkeypatch):
+        from app import wg
+        monkeypatch.setattr(wg, "run", lambda *a, **k: "A=\t10.66.1.2/32\nB=\t(none)\n")
+        assert wg.current_peers() == {"A=": "10.66.1.2/32", "B=": ""}
 
     def test_firewall_script(self, monkeypatch):
         from app import wg

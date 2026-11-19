@@ -9,6 +9,7 @@ from . import db, monitor, services, telegram, wg
 from .config import (APP_NAME, APP_VERSION, API_HOST, API_PORT, COOKIE_SECURE, DRY_RUN, LOG_LEVEL, SECRET_KEY,
                      SUPERADMIN_PASSWORD)
 from .routers import admin, api_client, cabinet, public, updates
+from .web import SecurityMiddleware
 
 # минимальный журнал: ошибки и предупреждения; строка о запуске — всегда (логгер retixhub на INFO)
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -21,6 +22,8 @@ async def lifespan(app: FastAPI):
     db.init()
     if not SUPERADMIN_PASSWORD:
         log.warning("SUPERADMIN_PASSWORD не задан — вход в /admin отключён")
+    elif len(SUPERADMIN_PASSWORD) < 12:
+        log.warning("SUPERADMIN_PASSWORD короче 12 символов — задайте длинный случайный пароль в .env")
     if DRY_RUN:
         log.warning("WG_DRY_RUN=1: wg и iptables не изменяются")
     wg.setup_interface()
@@ -36,6 +39,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title=APP_NAME, version=APP_VERSION, lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
 app.add_middleware(SessionMiddleware, secret_key=SECRET_KEY, session_cookie="retix_session",
                    same_site="strict", https_only=COOKIE_SECURE, max_age=12 * 3600)
+app.add_middleware(SecurityMiddleware, hsts=COOKIE_SECURE)   # снаружи: проверка до разбора тела формы
 app.include_router(api_client.router)
 app.include_router(cabinet.router)
 app.include_router(admin.router)

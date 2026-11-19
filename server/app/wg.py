@@ -1,11 +1,13 @@
 """Тонкая обёртка над ip / wg / iptables."""
 import base64
+import hashlib
+import hmac
 import logging
 import os
 import subprocess
 
 from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
 
 from .config import (DRY_RUN, IPTABLES, NET_PREFIX, SERVER_CIDR, SERVER_KEY_FILE, TC,
                      WG_IF, WG_PORT)
@@ -65,6 +67,23 @@ def server_public_key() -> str:
     return _server_pub
 
 
+_server_priv: X25519PrivateKey | None = None
+
+
+def key_proof(public_key: str, ts: int) -> str:
+    """Подтверждение, что у ПК есть закрытый ключ WireGuard к public_key (повторная регистрация):
+    HMAC-SHA256 от X25519(ключ сервера, ключ ПК) — то же самое ПК считает своим закрытым ключом и ключом сервера.
+    '' — ключ ПК не годится для обмена (нулевая точка и т. п.)."""
+    global _server_priv
+    if _server_priv is None:
+        _server_priv = _ensure_server_key()
+    try:
+        shared = _server_priv.exchange(X25519PublicKey.from_public_bytes(base64.b64decode(public_key)))
+    except Exception:  # noqa: BLE001 — ключ малого порядка, не 32 байта
+        return ""
+    return hmac.new(shared, f"retixhub-register|{public_key}|{int(ts)}".encode(), hashlib.sha256).hexdigest()
+
+
 # ---------- интерфейс ----------
 
 def setup_interface() -> None:
@@ -85,17 +104,31 @@ def setup_interface() -> None:
                     "включите на хосте: sysctl -w net.ipv4.ip_forward=1", e)
 
 
-def current_peers() -> set[str]:
-    out = run(["wg", "show", WG_IF, "peers"], check=False)
-    return {line.strip() for line in out.splitlines() if line.strip()}
+def interface_exists() -> bool:
+    return ok(["ip", "link", "show", WG_IF])
+
+
+def current_peers() -> dict[str, str]:
+    """Пиры wg0: public_key -> allowed-ips (как их печатает wg, '(none)' — пусто)."""
+    out = run(["wg", "show", WG_IF, "allowed-ips"], check=False)
+    peers = {}
+    for line in out.splitlines():
+        key, _, ips = line.strip().partition("\t")
+        if key:
+            ips = ips.strip()
+            peers[key] = "" if ips == "(none)" else " ".join(sorted(ips.split()))
+    return peers
 
 
 def sync_peers(desired: dict[str, str]) -> None:
-    """desired: public_key -> ip. Приводит wg0 к этому состоянию."""
-    for pub in current_peers() - desired.keys():
+    """desired: public_key -> ip. Приводит wg0 к этому состоянию. Меняется только разница: на сервере с сотнями
+    ПК раньше каждый вызов запускал wg на каждого пира (секунды под общим локом базы)."""
+    have = current_peers()
+    for pub in have.keys() - desired.keys():
         run(["wg", "set", WG_IF, "peer", pub, "remove"])
     for pub, ip in desired.items():
-        run(["wg", "set", WG_IF, "peer", pub, "allowed-ips", f"{ip}/32"])
+        if have.get(pub) != f"{ip}/32":
+            run(["wg", "set", WG_IF, "peer", pub, "allowed-ips", f"{ip}/32"])
 
 
 def dump() -> list[dict]:
@@ -138,10 +171,30 @@ def apply_firewall(forward_rules: list[str]) -> None:
         "",
     ]
     run([f"{IPTABLES}-restore", "-w", "--noflush"], input="\n".join(lines))
-    for chain, target in (("FORWARD", "RETIX_FWD"), ("INPUT", "RETIX_IN")):
-        rule = [chain, "-i", WG_IF, "-j", target]
-        if DRY_RUN or not ok([IPTABLES, "-w", "-C", *rule]):
-            run([IPTABLES, "-w", "-I", *rule[:1], "1", *rule[1:]])
+    jumps = [("FORWARD", "RETIX_FWD"), ("INPUT", "RETIX_IN")]
+    # Docker при перезапуске ставит свои цепочки в начало FORWARD — трафик из VPN к портам контейнеров прошёл бы
+    # раньше RETIX_FWD. DOCKER-USER Docker не трогает и проходит первой — переход есть и там.
+    if not DRY_RUN and ok([IPTABLES, "-w", "-S", "DOCKER-USER"]):
+        jumps.append(("DOCKER-USER", "RETIX_FWD"))
+    for chain, target in jumps:
+        _ensure_first(chain, target)
+
+
+def _ensure_first(chain: str, target: str) -> None:
+    """Переход «-i wg0 -j target» — первым правилом цепочки и ровно один раз. Сначала вставляем новый, потом
+    убираем лишние: без окна, когда трафик из wg0 шёл бы мимо своих правил."""
+    rule = ["-i", WG_IF, "-j", target]
+    want = f"-A {chain} -i {WG_IF} -j {target}"
+    if not DRY_RUN:
+        rules = [r for r in run([IPTABLES, "-w", "-S", chain], check=False).splitlines() if r.startswith("-A ")]
+        if rules and rules[0] == want and rules.count(want) == 1:
+            return
+    run([IPTABLES, "-w", "-I", chain, "1", *rule])
+    if DRY_RUN:
+        return
+    rules = [r for r in run([IPTABLES, "-w", "-S", chain], check=False).splitlines() if r.startswith("-A ")]
+    for num in sorted((i for i, r in enumerate(rules, 1) if r == want and i > 1), reverse=True):
+        run([IPTABLES, "-w", "-D", chain, str(num)], check=False)
 
 
 # ---------- скорость через сервер (tc) ----------

@@ -10,7 +10,7 @@ from starlette.datastructures import UploadFile
 from .. import db, services, updates
 from ..config import TZ
 from ..web import csrf_ok, csrf_token, redirect, templates
-from .admin import require_admin
+from .admin import is_admin_session, require_admin
 from .api_client import current_device
 
 router = APIRouter(include_in_schema=False)
@@ -139,7 +139,7 @@ def admin_updates(request: Request, conn=Depends(require_admin), msg: str = "", 
 @router.post("/admin/updates")
 async def admin_update_upload(request: Request):
     """Загрузка установщика. Тело (до сотен МБ) разбирается только ПОСЛЕ проверки входа суперадмина."""
-    if request.session.get("role") != "admin":
+    if not is_admin_session(request):
         return redirect("/admin/login")
     form = await request.form(max_files=1, max_fields=200)
     try:

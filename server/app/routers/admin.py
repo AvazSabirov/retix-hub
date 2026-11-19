@@ -1,20 +1,55 @@
 """Кабинет суперадмина: все компании."""
+import hashlib
 import hmac
+import threading
 from urllib.parse import urlencode
 
 from fastapi import APIRouter, Depends, Form, Request
 
 from .. import db, services, telegram
-from ..auth import client_ip, hash_pw, limiter
-from ..config import SUPERADMIN_LOGIN, SUPERADMIN_PASSWORD
+from ..auth import check_pw, client_ip, hash_pw, login_check, login_failed, login_ok
+from ..config import SECRET_KEY, SUPERADMIN_LOGIN, SUPERADMIN_PASSWORD
 from ..web import LoginRequired, csrf_ok, csrf_token, redirect, templates
 from .cabinet import log_response, role_redirect, tg_view
 
 router = APIRouter(prefix="/admin", include_in_schema=False)
 
 
+_admin_hash = ""
+_admin_hash_lock = threading.Lock()
+
+
+def _superadmin_hash() -> str:
+    """bcrypt пароля суперадмина (считается один раз): каждая попытка входа стоит как bcrypt, а не как
+    сравнение строк — перебор в тысячи раз медленнее."""
+    global _admin_hash
+    with _admin_hash_lock:
+        if not _admin_hash and SUPERADMIN_PASSWORD:
+            _admin_hash = hash_pw(SUPERADMIN_PASSWORD)
+        return _admin_hash
+
+
+def superadmin_ok(login: str, password: str) -> bool:
+    if not SUPERADMIN_PASSWORD:
+        return False
+    same_login = hmac.compare_digest(login.encode(), SUPERADMIN_LOGIN.encode())
+    good_pw = check_pw(password, _superadmin_hash())     # всегда, чтобы по времени не было видно, верен ли логин
+    # bcrypt видит только первые 72 байта — точное совпадение проверяем отдельно
+    return same_login and good_pw and hmac.compare_digest(password.encode(), SUPERADMIN_PASSWORD.encode())
+
+
+def admin_session_mark() -> str:
+    """Отметка в сессии суперадмина: сменили логин или пароль в .env — прежние сессии больше не действуют."""
+    return hashlib.sha256(f"admin|{SUPERADMIN_LOGIN}|{SUPERADMIN_PASSWORD}|{SECRET_KEY}".encode()).hexdigest()[:24]
+
+
+def is_admin_session(request: Request) -> bool:
+    return (bool(SUPERADMIN_PASSWORD) and request.session.get("role") == "admin"
+            and hmac.compare_digest(str(request.session.get("pv") or ""), admin_session_mark()))
+
+
 def require_admin(request: Request, conn=Depends(db.get_db)):
-    if request.session.get("role") != "admin" or not SUPERADMIN_PASSWORD:
+    if not is_admin_session(request):
         raise LoginRequired("/admin/login")
     return conn
 
@@ -36,16 +71,13 @@ def login_page(request: Request, msg: str = "", err: int = 0):
 @router.post("/login")
 def login(request: Request, login: str = Form(...), password: str = Form(...)):
     ip = client_ip(request)
-    limiter.check(ip)
-    good = bool(SUPERADMIN_PASSWORD) \
-        and hmac.compare_digest(login.encode(), SUPERADMIN_LOGIN.encode()) \
-        and hmac.compare_digest(password.encode(), SUPERADMIN_PASSWORD.encode())
-    if not good:
-        limiter.fail(ip)
+    login_check("admin", login, ip)
+    if not superadmin_ok(login, password):
+        login_failed("admin", login, ip)
         return redirect("/admin/login", "Неверный логин или пароль", err=True)
-    limiter.reset(ip)
+    login_ok("admin", login, ip)
     request.session.clear()
-    request.session["role"] = "admin"
+    request.session.update({"role": "admin", "pv": admin_session_mark()})
     return redirect("/admin")
 
 

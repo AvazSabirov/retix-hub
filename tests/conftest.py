@@ -66,7 +66,7 @@ def clean(app, net):
     """Чистая база и счётчики попыток перед каждым тестом."""
     from fastapi.testclient import TestClient
     from app import db
-    from app.auth import limiter
+    from app.auth import reset_limiters
     with TestClient(app):  # lifespan: db.init()
         pass
     conn = db.connect()
@@ -78,7 +78,7 @@ def clean(app, net):
     shutil.rmtree(os.path.join(DATA_DIR, "updates"), ignore_errors=True)
     conn.commit()
     conn.close()
-    limiter._fails.clear()
+    reset_limiters()
     from app.routers.api_client import remote_limiter
     remote_limiter._fails.clear()
     yield

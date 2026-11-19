@@ -1,13 +1,15 @@
 """API для Windows-клиента."""
+import hmac
 import json
 import time
 import zlib
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
 
 from .. import db, services, telegram, updates, wg
-from ..auth import RateLimiter, check_pw, client_ip, limiter, new_token, sha256
+from ..auth import RateLimiter, check_pw, client_ip, login_check, login_failed, login_ok, new_token, sha256
 from ..config import REMOTE_PORT, TOKEN_ROTATE_SECONDS
 
 # Новый токен сервер отдаёт в этом заголовке. Клиент переходит на него сразу; старый действует,
@@ -25,6 +27,23 @@ class RegisterIn(BaseModel):
     hostname: str = Field(default="", max_length=64)
     public_key: str = Field(min_length=44, max_length=44)
     client_version: str = Field(default="", max_length=32)
+    # клиент 1.0.26+: подтверждение, что у него есть закрытый ключ (wg.key_proof), ts — время сервера из /api/ping
+    proof: str = Field(default="", max_length=64)
+    proof_ts: int = 0
+
+
+# С этой версии клиент подтверждает ключ при регистрации. ПК, который уже сообщил такую версию, повторно
+# регистрируется только с подтверждением: иначе его вход мог бы получить любой, кто знает пароль компании
+# и ОТКРЫТЫЙ ключ ПК (его видят соседи по прямому пути).
+PROOF_VERSION = (1, 0, 26, 0)
+PROOF_MAX_AGE = 300   # сек — расхождение со временем сервера
+
+
+def key_proved(data: "RegisterIn") -> bool:
+    if not data.proof or abs(time.time() - data.proof_ts) > PROOF_MAX_AGE:
+        return False
+    expected = wg.key_proof(data.public_key, data.proof_ts)
+    return bool(expected) and hmac.compare_digest(expected, data.proof.lower())
 
 
 class RenameIn(BaseModel):
@@ -138,24 +157,25 @@ def current_device(request: Request, response: Response, conn=Depends(db.get_db)
 
 @router.get("/ping")
 def ping():
-    return {"ok": True, "time": int(time.time())}
+    # server_public_key — для подтверждения ключа при регистрации (клиент 1.0.26+); он и так есть в /api/me
+    return {"ok": True, "time": int(time.time()), "server_public_key": wg.server_public_key()}
 
 
 @router.post("/register")
 def register(data: RegisterIn, request: Request, conn=Depends(db.get_db)):
     ip = client_ip(request)
-    limiter.check(ip)
+    login_check("register", data.company_login, ip)
 
     if not wg.valid_pubkey(data.public_key):
         raise HTTPException(400, "Неверный публичный ключ")
 
     company = conn.execute("SELECT * FROM companies WHERE login=?", (data.company_login.strip(),)).fetchone()
     if not company or not check_pw(data.join_password, company["join_pass_hash"]):
-        limiter.fail(ip)
+        login_failed("register", data.company_login, ip)
         raise HTTPException(401, "Неверный логин или пароль компании")
     if not company["is_active"]:
         raise HTTPException(403, "Компания отключена")
-    limiter.reset(ip)
+    login_ok("register", data.company_login, ip)
 
     name = services.clean_device_name(data.device_name)
     if not name:
@@ -167,6 +187,13 @@ def register(data: RegisterIn, request: Request, conn=Depends(db.get_db)):
         existing = conn.execute("SELECT * FROM devices WHERE public_key=?", (data.public_key,)).fetchone()
         if existing and existing["company_id"] != company["id"]:
             raise HTTPException(409, "Этот ключ уже зарегистрирован в другой компании")
+        if existing and not key_proved(data) and (updates.vkey(existing["client_version"]) or (0,)) >= PROOF_VERSION:
+            login_failed("register", data.company_login, ip)
+            services.audit(conn, company["id"], "device_reregister_denied",
+                           f"{existing['name']} {existing['ip']}: ключ не подтверждён, с {ip}")
+            conn.commit()
+            raise HTTPException(403, "Вход этого компьютера не подтверждён его ключом. Обновите Retix Hub до последней "
+                                     "версии или попросите администратора удалить ПК в кабинете и подключитесь заново")
 
         now = int(time.time())
         if existing:  # повторная регистрация того же ПК — новый токен, тот же IP
@@ -437,7 +464,19 @@ async def upload_log(request: Request, ctx=Depends(current_device)):
         raise HTTPException(409, "Журнал не запрашивали")
     if int(request.headers.get("content-length") or 0) > services.LOG_UPLOAD_MAX:
         raise HTTPException(413, "Журнал слишком большой")
-    body = await request.body()
+    body = bytearray()
+    async for chunk in request.stream():   # без Content-Length (chunked) — тоже не больше LOG_UPLOAD_MAX
+        body += chunk
+        if len(body) > services.LOG_UPLOAD_MAX:
+            raise HTTPException(413, "Журнал слишком большой")
+    body = bytes(body)
+    # распаковка и запись — в пуле потоков: здесь же db.write_lock и SQLite (до 15 с ожидания), в цикле
+    # событий они остановили бы весь сервер
+    await run_in_threadpool(_store_log, conn, dev, body)
+    return {"ok": True}
+
+
+def _store_log(conn, dev, body: bytes) -> None:
     if not body or len(body) > services.LOG_UPLOAD_MAX:
         raise HTTPException(413 if body else 400, "Журнал слишком большой" if body else "Пустой журнал")
     unzip = zlib.decompressobj(16 + zlib.MAX_WBITS)
@@ -450,4 +489,3 @@ async def upload_log(request: Request, ctx=Depends(current_device)):
     if not unzip.eof:
         raise HTTPException(400, "Журнал передан не полностью")
     services.save_log(conn, dev, body, len(text))
-    return {"ok": True}

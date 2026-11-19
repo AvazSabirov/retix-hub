@@ -2,7 +2,7 @@ import os
 import secrets
 
 APP_NAME = "Retix Hub"
-APP_VERSION = "1.0.25"   # версия сервера — та же, что у клиента (client VERSION), поднимается вместе с ней
+APP_VERSION = "1.0.26"   # версия сервера — та же, что у клиента (client VERSION), поднимается вместе с ней
 PUBLIC_URL = os.getenv("PUBLIC_URL", "https://hub.retix.uz")
 
 DATA_DIR = os.getenv("DATA_DIR", "/data")
