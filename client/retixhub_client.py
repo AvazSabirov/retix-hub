@@ -40,7 +40,7 @@ import requests
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
 
-VERSION = "1.0.23"
+VERSION = "1.0.24"
 APP_NAME = "RetixHub"          # служебное имя: папки, задачи, мьютекс
 APP_TITLE = "Retix Hub"        # то, что видит пользователь
 TUNNEL = "retixhub"
@@ -3128,31 +3128,27 @@ def round_rect(cv: "tk.Canvas", x0: int, y0: int, x1: int, y1: int, r: int, fill
     cv.tag_lower(tag)
 
 
-class RoundPanel(tk.Canvas):
-    """Панель окна со скруглёнными углами и без рамки: фон рисуется на холсте, содержимое — в self.body.
-    stretch — тянется по месту в окне (список), иначе высота — по содержимому (шапка)."""
+class RoundPanel(tk.Frame):
+    """Панель окна со скруглёнными углами и без рамки: содержимое — в self.body, фон со скруглёнными углами
+    рисуется на холсте под ним. Размер — как у обычной рамки: по содержимому (stretch — тянется по месту)."""
 
     def __init__(self, master, radius: int = 10, pad: int = 5, stretch: bool = False,
                  fill: str = C["panel"], bg: str = C["bg"]):
-        super().__init__(master, bg=bg, highlightthickness=0, bd=0, height=1)
+        super().__init__(master, bg=bg)
         self.radius, self.pad, self.stretch, self.fill, self.bg_ = radius, pad, stretch, fill, bg
+        # холст — под содержимым и на размер не влияет (place); размер панели задаёт self.body
+        self.canvas = tk.Canvas(self, bg=bg, highlightthickness=0, bd=0, width=1, height=1)
+        self.canvas.place(x=0, y=0, relwidth=1, relheight=1)
         self.body = tk.Frame(self, bg=fill)
-        self._item = self.create_window(pad, pad, window=self.body, anchor="nw")
+        self.body.pack(fill="both", expand=True, padx=pad, pady=pad)
         self.bind("<Configure>", self._layout)
-        if not stretch:
-            self.body.bind("<Configure>", lambda _e: self.fit())
 
     def fit(self):
-        """Высота панели — по содержимому."""
-        if not self.stretch:
-            self.configure(height=self.body.winfo_reqheight() + 2 * self.pad)
+        """Совместимость: высота и так по содержимому."""
 
     def _layout(self, e):
-        kw = {"width": max(1, e.width - 2 * self.pad)}
-        if self.stretch:
-            kw["height"] = max(1, e.height - 2 * self.pad)
-        self.itemconfigure(self._item, **kw)
-        round_rect(self, 0, 0, e.width, e.height, self.radius, self.fill, self.bg_, "panel")
+        if e.widget is self:
+            round_rect(self.canvas, 0, 0, e.width, e.height, self.radius, self.fill, self.bg_, "panel")
 
 
 class Pill(tk.Canvas):
