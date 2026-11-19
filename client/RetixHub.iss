@@ -30,7 +30,11 @@
 ;   - при удалении: туннель, правила firewall и автозапуск
 ;     снимаются (RetixHub.exe --uninstall). WireGuard остаётся; RustDesk удаляется,
 ;     если его поставил Retix Hub;
-;   - установка более старой версии поверх новой запрещена.
+;   - установка более старой версии поверх новой запрещена;
+;   - перед заменой файлов папка _internal должна быть свободна: её библиотеки не держит ни один процесс.
+;     Иначе часть файлов осталась бы старой, и программа не запустилась бы («ошибка библиотеки Python»).
+;     Не освободилась за 30 с — установка отменяется, прежняя версия остаётся рабочей;
+;   - журнал установки — всегда; копия — {app}\logs\setup.log (её присылает кнопка «Журнал» в кабинете).
 ;
 ;  Тихая установка на много ПК:  RetixHub_Setup_<версия>.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART
 ;
@@ -79,6 +83,8 @@ DisableFinishedPage=yes
 CloseApplications=no
 RestartApplications=no
 SetupMutex=RetixHubSetupMutex
+; журнал установки (в %TEMP%), в конце копируется в {app}\logs\setup.log
+SetupLogging=yes
 
 SetupIconFile=app_icon.ico
 UninstallDisplayIcon={app}\{#AppExe}
@@ -129,6 +135,7 @@ Filename: "{app}\{#AppExe}"; Parameters: "--uninstall"; WorkingDir: "{app}"; Fla
 
 [UninstallDelete]
 Type: files; Name: "{app}\retixhub_selftest.txt"
+Type: filesandordirs; Name: "{app}\_internal.old"
 Type: filesandordirs; Name: "{app}\logs"
 
 [Code]
@@ -231,12 +238,84 @@ begin
     PostMessage(WizardForm.NextButton.Handle, $00F5 { BM_CLICK }, 0, 0);
 end;
 
-{ Перед копированием файлов: клиента быть не должно }
+{ В журнал установки: какие процессы держат библиотеку Python программы }
+procedure LogBusyProcesses;
+var
+  OutFile: String;
+  Output: AnsiString;
+  RC: Integer;
+begin
+  OutFile := AddBackslash(GetTempDir) + 'retixhub_busy.txt';
+  DeleteFile(OutFile);
+  if Exec(ExpandConstant('{cmd}'), '/C tasklist /M python3*.dll > "' + OutFile + '"', '', SW_HIDE,
+          ewWaitUntilTerminated, RC) then
+    if LoadStringFromFile(OutFile, Output) then
+      Log('Процессы с библиотекой Python:' + #13#10 + String(Output));
+  DeleteFile(OutFile);
+end;
+
+{ Папка _internal (библиотеки программы) свободна: её удаётся переименовать — значит, ни один процесс не держит
+  её файлы. Занятую папку установщик заменил бы лишь частично: старые и новые библиотеки вперемешку, и программа
+  не запускается («ошибка библиотеки Python»). Ждём до 30 с, добивая RetixHub.exe. True — папки больше нет. }
+function FreeInternalDir: Boolean;
+var
+  Dir, Old: String;
+  I, RC: Integer;
+begin
+  Dir := ExpandConstant('{app}\_internal');
+  Old := Dir + '.old';
+  if DirExists(Old) then
+    DelTree(Old, True, True, True);
+  Result := not DirExists(Dir);
+  if Result then
+    Exit;
+  for I := 1 to 30 do
+  begin
+    if RenameFile(Dir, Old) then
+    begin
+      Log('_internal свободна (попытка ' + IntToStr(I) + ')');
+      DelTree(Old, True, True, True);   { что не удалилось — удалит следующая установка }
+      Result := True;
+      Exit;
+    end;
+    if I = 1 then
+    begin
+      Log('_internal занята — ждём');
+      LogBusyProcesses;
+    end;
+    Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /IM {#AppExe}', '', SW_HIDE, ewWaitUntilTerminated, RC);
+    Sleep(1000);
+  end;
+  LogBusyProcesses;
+  Log('ОШИБКА: _internal так и не освободилась — установка отменена, прежняя версия не тронута');
+end;
+
+{ Перед копированием файлов: клиента быть не должно, и его библиотеки никто не держит }
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 begin
   Result := '';
   if not CloseClient then
-    Result := 'Не удалось закрыть Retix Hub (RetixHub.exe). Закройте его и запустите установку снова.';
+    Result := 'Не удалось закрыть Retix Hub (RetixHub.exe). Закройте его и запустите установку снова.'
+  else if not FreeInternalDir then
+    Result := 'Файлы Retix Hub заняты другим процессом. Перезагрузите компьютер и запустите установку снова.';
+end;
+
+{ В конце (и при отмене): копия журнала установки рядом с журналом программы }
+procedure DeinitializeSetup;
+var
+  Src, Dest: String;
+begin
+  try
+    Src := ExpandConstant('{log}');
+    Dest := ExpandConstant('{app}\logs');
+    if (Src <> '') and DirExists(ExpandConstant('{app}')) then
+    begin
+      ForceDirectories(Dest);
+      FileCopy(Src, Dest + '\setup.log', False);
+    end;
+  except
+    // папка программы ещё не известна (установку отменили в самом начале) — копировать нечего
+  end;
 end;
 
 function WireGuardInstalled: Boolean;
