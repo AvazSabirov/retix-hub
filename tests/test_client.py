@@ -2250,3 +2250,71 @@ def test_forgotten_lock_reset_by_company_password(make_client, company):
     assert b.w.reset_lock("wrong-pass") and b.w.lock_ready()
     assert b.w.reset_lock("join123") is None and not b.w.lock_ready()
     assert b.step(2)["status"] == rc.Status.ONLINE   # вход переподключил туннель — сеть снова работает
+
+
+# ================================================================== исправления аудита 1.0.26
+
+def test_server_url_https_only():
+    assert rc.normalize_server_url("hub.retix.uz/") == "https://hub.retix.uz"
+    assert rc.normalize_server_url(" https://hub.retix.uz ") == "https://hub.retix.uz"
+    assert rc.normalize_server_url("http://127.0.0.1:8100") == "http://127.0.0.1:8100"
+    for bad in ("http://hub.retix.uz", "ftp://hub.retix.uz", "https://", ""):
+        with pytest.raises(ValueError):
+            rc.normalize_server_url(bad)
+
+
+def test_login_refuses_plain_http(make_client, company):
+    c = make_client()
+    assert "https://" in c.w.login("http://hub.example.uz", company.login, "join123", "PC", True)
+    assert not c.state.get("token")
+
+
+def test_reregister_with_key_proof(make_client, company, server):
+    """Клиент 1.0.26 подтверждает ключ: повторный вход тем же ключом работает, вход чужим ключом без
+    закрытого — нет (сервер это проверяет)."""
+    c = make_client(); login(c, company, remember=True); c.step(2)
+    _, pub = c.state.keypair()
+    c.state.set(token="")                                 # вход потерян — регистрация заново с сохранённым паролем
+    assert c.step(2)["status"] == rc.Status.ONLINE
+    r = requests.post(BASE + "/api/register", json={"company_login": company.login, "join_password": "join123",
+                                                     "device_name": "X", "public_key": pub, "client_version": "1.0.26"})
+    assert r.status_code == 403
+
+
+def test_state_survives_corrupted_file(tmp_path):
+    st = rc.State(tmp_path / "state.json")
+    st.set(company_login="firma", token="tok-1")
+    assert (tmp_path / "state.json.bak").exists()
+    (tmp_path / "state.json").write_text("", "utf-8")     # питание выключили посреди записи
+    again = rc.State(tmp_path / "state.json")
+    assert again.get("company_login") == "firma" and again.get("token") == "tok-1"
+
+
+def test_state_write_failure_keeps_old_value(tmp_path, monkeypatch):
+    st = rc.State(tmp_path / "state.json")
+    st.set(token="old")
+
+    def broken(self):
+        raise PermissionError("файл занят")
+
+    monkeypatch.setattr(rc.State, "_write", broken)
+    with pytest.raises(OSError):
+        st.set(token="new", company_login="x")
+    assert st.get("token") == "old" and st.get("company_login") == ""   # в памяти — то же, что на диске
+
+
+def test_new_token_not_saved_keeps_working(make_client, company, monkeypatch):
+    """Новый токен не записался на диск — программа остаётся на прежнем, сервер не считает её копией."""
+    c = make_client(); login(c, company); c.step(2)
+    real = rc.State._write
+    fail = {"on": True}
+
+    def flaky(self):
+        if fail["on"]:
+            raise PermissionError("антивирус держит файл")
+        return real(self)
+
+    monkeypatch.setattr(rc.State, "_write", flaky)
+    c.w.api.me()                                          # сервер прислал новый токен (ротация на каждом запросе)
+    fail["on"] = False
+    assert c.step(2)["status"] == rc.Status.ONLINE

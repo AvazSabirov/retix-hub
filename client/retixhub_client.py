@@ -39,9 +39,9 @@ from urllib.parse import urlparse
 
 import requests
 from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
 
-VERSION = "1.0.25"
+VERSION = "1.0.26"
 APP_NAME = "RetixHub"          # служебное имя: папки, задачи, мьютекс
 APP_TITLE = "Retix Hub"        # то, что видит пользователь
 TUNNEL = "retixhub"
@@ -205,11 +205,19 @@ class State:
         self.path = path or STATE_FILE
         self.data = dict(self.FIELDS)
         self.lock = threading.Lock()
-        if self.path.exists():
+        for path in (self.path, self.backup_path):   # основной файл испорчен (выключили питание) — запасная копия
+            if not path.exists():
+                continue
             try:
-                self.data.update(json.loads(self.path.read_text("utf-8")))
+                loaded = json.loads(path.read_text("utf-8"))
+                if not isinstance(loaded, dict):
+                    raise ValueError("не объект")
+                self.data.update(loaded)
+                if path != self.path:
+                    log.warning("state.json повреждён — взята запасная копия %s", path.name)
+                break
             except Exception:
-                log.exception("state.json повреждён — начинаем заново")
+                log.exception("%s повреждён", path.name)
         if not self.data["server_url"]:
             self.data["server_url"] = self._default_server()
 
@@ -223,6 +231,10 @@ class State:
                 pass
         return DEFAULT_SERVER
 
+    @property
+    def backup_path(self) -> Path:
+        return self.path.with_name(self.path.name + ".bak")
+
     def get(self, key):
         with self.lock:
             v = self.data.get(key)
@@ -230,9 +242,20 @@ class State:
 
     def set(self, **kw):
         with self.lock:
+            old = {k: self.data[k] for k in kw if k in self.data}
             for k, v in kw.items():
                 self.data[k] = protect(v) if k in ("token", "private_key", "join_password") else v
-            self._write()
+            try:
+                self._write()
+            except OSError:
+                # на диск не легло — и в памяти остаётся прежнее: иначе после перезапуска программа взяла бы
+                # с диска старый токен, а сервер счёл бы его копией входа на другом ПК
+                for k in kw:
+                    if k in old:
+                        self.data[k] = old[k]
+                    else:
+                        self.data.pop(k, None)
+                raise
 
     # --- компании (профили)
     @staticmethod
@@ -301,17 +324,27 @@ class State:
         return {**p, "token": unprotect(p.get("token", ""))}
 
     def _write(self) -> None:
-        """Записать на диск (вызывать под self.lock)."""
-        tmp = self.path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(self.data, ensure_ascii=False, indent=2), "utf-8")
-        for attempt in range(5):  # антивирус может на миг держать файл
-            try:
-                tmp.replace(self.path)
-                break
-            except PermissionError:
-                if attempt == 4:
-                    raise
-                time.sleep(0.2)
+        """Записать на диск (вызывать под self.lock). Сначала во временный файл с fsync, потом замена: выключение
+        питания (кассы!) не оставит пустой или обрезанный state.json. Следом — та же запись в state.json.bak:
+        если основной файл всё же испортится, программа возьмёт копию, а не начнёт с нуля (новый ключ, вход заново)."""
+        text = json.dumps(self.data, ensure_ascii=False, indent=2)
+        for target in (self.path, self.backup_path):
+            tmp = target.with_name(target.name + ".tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(text)
+                f.flush()
+                os.fsync(f.fileno())
+            for attempt in range(5):  # антивирус может на миг держать файл
+                try:
+                    tmp.replace(target)
+                    break
+                except PermissionError:
+                    if attempt == 4:
+                        if target == self.path:
+                            raise
+                        log.warning("запасная копия %s не записана", target.name)
+                    else:
+                        time.sleep(0.2)
 
     def keypair(self) -> tuple[str, str]:
         priv_b64 = self.get("private_key")
@@ -373,7 +406,12 @@ class Api:
             raise ServerUnreachable(str(e)) from e
         new_token = r.headers.get(TOKEN_HEADER)
         if auth and new_token and r.status_code < 400:
-            self.state.set(token=new_token)   # сразу на диск: после перезапуска — уже новый
+            try:
+                self.state.set(token=new_token)   # сразу на диск: после перезапуска — уже новый
+            except OSError as e:
+                # не записался — остаёмся на прежнем токене (он действует, пока новый не использован);
+                # сервер выдаст новый ещё раз через 30 с
+                log.warning("новый токен не сохранён (%s) — остаюсь на прежнем", e)
         hint = r.headers.get("X-Retix-Update")
         if hint and self.on_hint:
             self.on_hint(hint)
@@ -387,10 +425,26 @@ class Api:
             raise ApiError(r.status_code, str(detail))
         return r.json()
 
-    def register(self, company_login: str, password: str, device_name: str, public_key: str):
-        return self._req("POST", "/api/register", auth=False, json={
-            "company_login": company_login, "join_password": password, "device_name": device_name,
-            "hostname": socket.gethostname(), "public_key": public_key, "client_version": VERSION})
+    def register(self, company_login: str, password: str, device_name: str, public_key: str,
+                 private_key: str = ""):
+        body = {"company_login": company_login, "join_password": password, "device_name": device_name,
+                "hostname": socket.gethostname(), "public_key": public_key, "client_version": VERSION}
+        if private_key:
+            body.update(self.key_proof(public_key, private_key))
+        return self._req("POST", "/api/register", auth=False, json=body)
+
+    def key_proof(self, public_key: str, private_key: str) -> dict:
+        """Подтверждение, что этот ПК владеет закрытым ключом (сервер 1.0.26+): HMAC от X25519(свой ключ,
+        ключ сервера) по времени сервера из /api/ping. Без него повторную регистрацию этого ПК мог бы сделать
+        любой, кто знает пароль компании и открытый ключ ПК. Старый сервер ключа не отдаёт — {}."""
+        try:
+            info = self._req("GET", "/api/ping", auth=False)
+            server_key, ts = str(info.get("server_public_key") or ""), int(info.get("time") or 0)
+        except (ApiError, ServerUnreachable, AttributeError, TypeError, ValueError):
+            return {}
+        if not KEY_RE.match(server_key) or not ts:
+            return {}
+        return {"proof": key_proof(private_key, server_key, public_key, ts), "proof_ts": ts}
 
     def me(self):
         return self._req("GET", "/api/me")
@@ -440,6 +494,25 @@ class Api:
 
     def update_info(self):
         return self._req("GET", "/api/update")
+
+
+def key_proof(private_key: str, server_key: str, public_key: str, ts: int) -> str:
+    shared = X25519PrivateKey.from_private_bytes(base64.b64decode(private_key)).exchange(
+        X25519PublicKey.from_public_bytes(base64.b64decode(server_key)))
+    return hmac.new(shared, f"retixhub-register|{public_key}|{int(ts)}".encode(), hashlib.sha256).hexdigest()
+
+
+def normalize_server_url(server: str) -> str:
+    """Адрес сервера из окна входа: без схемы — https://; http — только для этого же ПК (разработка).
+    ValueError — адрес не https: пароль компании и токены пошли бы по сети открытым текстом."""
+    server = (server or "").strip()
+    if server and "://" not in server:
+        server = "https://" + server
+    server = server.rstrip("/")
+    u = urlparse(server)
+    if not u.hostname or (u.scheme != "https" and u.hostname not in ("127.0.0.1", "localhost")):
+        raise ValueError("Адрес сервера должен начинаться с https://")
+    return server
 
 
 # ====================================================================== проверка ответа сервера
@@ -1874,7 +1947,11 @@ class Worker(threading.Thread):
         """Вход в компанию. Другая компания, чем текущая, — добавляется: текущая уходит в сохранённые
         (Компания → переключиться), у новой — свой ключ WireGuard (для сервера это другой ПК).
         Не вышло — всё как было."""
-        server, company = server.strip().rstrip("/"), company.strip()
+        try:
+            server = normalize_server_url(server)
+        except ValueError as e:
+            return str(e)
+        company = company.strip()
         with self.op_lock:
             snap = self.state.snapshot()
             target = State.profile_key(server, company)
@@ -2338,9 +2415,9 @@ class Worker(threading.Thread):
         # старый токен забываем до запроса: если ответ потеряется, он не уйдёт на сервер снова
         # (старый токен сервер считает копией входа и отключает ПК)
         self.state.set(token="")
-        _, pub = self.state.keypair()
+        priv, pub = self.state.keypair()
         res = self.api.register(self.state.get("company_login"), password,
-                                self.state.get("device_name") or socket.gethostname(), pub)
+                                self.state.get("device_name") or socket.gethostname(), pub, priv)
         # новая регистрация = сервер заново добавил пира: старая сессия WireGuard недействительна,
         # переставляем туннель сразу, а не ждём, пока WireGuard сам заметит (15–180 с)
         self.state.set(token=res.pop("token"), last_conf_hash="")

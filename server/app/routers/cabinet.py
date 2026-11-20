@@ -1,18 +1,27 @@
 """Кабинет компании. Компания берётся ТОЛЬКО из сессии — чужие данные недоступны."""
+import hashlib
+import hmac
+
 from fastapi import APIRouter, Depends, Form, Request
 from fastapi.responses import Response
 
 from .. import db, services, telegram
-from ..auth import check_pw, client_ip, hash_pw, limiter
+from ..auth import check_pw, client_ip, hash_pw, login_check, login_failed, login_ok
 from ..web import LoginRequired, redirect, templates
 
 router = APIRouter(prefix="/cabinet", include_in_schema=False)
 
 
+def session_mark(company) -> str:
+    """Отметка в сессии кабинета: пароль кабинета сменили — прежние сессии (другие браузеры) больше не действуют."""
+    return hashlib.sha256(f"cabinet|{company['id']}|{company['cabinet_pass_hash']}".encode()).hexdigest()[:24]
+
+
 def current_company(request: Request, conn=Depends(db.get_db)):
     cid = request.session.get("company_id") if request.session.get("role") == "company" else None
     company = conn.execute("SELECT * FROM companies WHERE id=?", (cid,)).fetchone() if cid else None
-    if not company or not company["is_active"]:
+    if not company or not company["is_active"] \
+            or not hmac.compare_digest(str(request.session.get("pv") or ""), session_mark(company)):
         request.session.clear()
         raise LoginRequired("/cabinet/login")
     return conn, company
@@ -28,16 +37,16 @@ def login_page(request: Request, msg: str = "", err: int = 0):
 @router.post("/login")
 def login(request: Request, login: str = Form(...), password: str = Form(...), conn=Depends(db.get_db)):
     ip = client_ip(request)
-    limiter.check(ip)
+    login_check("cabinet", login, ip)
     c = conn.execute("SELECT * FROM companies WHERE login=?", (login.strip(),)).fetchone()
     if not c or not check_pw(password, c["cabinet_pass_hash"]):
-        limiter.fail(ip)
+        login_failed("cabinet", login, ip)
         return redirect("/cabinet/login", "Неверный логин или пароль", err=True)
     if not c["is_active"]:
         return redirect("/cabinet/login", "Компания отключена", err=True)
-    limiter.reset(ip)
+    login_ok("cabinet", login, ip)
     request.session.clear()
-    request.session.update({"role": "company", "company_id": c["id"]})
+    request.session.update({"role": "company", "company_id": c["id"], "pv": session_mark(c)})
     return redirect("/cabinet")
 
 
@@ -188,7 +197,8 @@ def join_password(new_password: str = Form(...), kick_all: str = Form(""), ctx=D
 
 
 @router.post("/cabinet-password")
-def cabinet_password(old_password: str = Form(...), new_password: str = Form(...), ctx=Depends(current_company)):
+def cabinet_password(request: Request, old_password: str = Form(...), new_password: str = Form(...),
+                     ctx=Depends(current_company)):
     conn, company = ctx
     if not check_pw(old_password, company["cabinet_pass_hash"]):
         return redirect("/cabinet", "Текущий пароль неверный", err=True)
@@ -197,4 +207,6 @@ def cabinet_password(old_password: str = Form(...), new_password: str = Form(...
     conn.execute("UPDATE companies SET cabinet_pass_hash=? WHERE id=?", (hash_pw(new_password), company["id"]))
     services.audit(conn, company["id"], "cabinet_password")
     conn.commit()
+    # другие сессии этого кабинета завершаются (отметка в них — от старого пароля), эта — остаётся
+    request.session["pv"] = session_mark(conn.execute("SELECT * FROM companies WHERE id=?", (company["id"],)).fetchone())
     return redirect("/cabinet", "Пароль кабинета изменён")

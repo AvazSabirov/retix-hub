@@ -217,6 +217,7 @@ def init() -> None:
             if column not in have:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
         conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS ix_devices_token_next ON devices(token_next_hash)")
+        conn.execute("CREATE INDEX IF NOT EXISTS ix_audit_company ON audit_log(company_id, action, id)")
         conn.commit()
     finally:
         conn.close()
