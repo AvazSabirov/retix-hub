@@ -41,7 +41,7 @@ import requests
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
 
-VERSION = "1.0.26"
+VERSION = "1.0.27"
 APP_NAME = "RetixHub"          # служебное имя: папки, задачи, мьютекс
 APP_TITLE = "Retix Hub"        # то, что видит пользователь
 TUNNEL = "retixhub"
@@ -197,9 +197,12 @@ class State:
               "remote_local": "", "remote_own_pw": "",
               # блокировка программы паролем этого компьютера (хэш PBKDF2; тот же пароль — «доступ по моему паролю»):
               # включена ли, через сколько минут без действий; показано ли окно «Настройки этого компьютера»
-              "lock_hash": "", "lock_on": False, "lock_minutes": 10, "setup_done": False}
+              "lock_hash": "", "lock_on": False, "lock_minutes": 10, "setup_done": False,
+              # блокировка действует только на ПК, которому администратор разрешил управлять другими
+              # (последний ответ сервера; помним, чтобы после запуска Windows без сервера решить сразу):
+              "can_control": False, "lock_offered": False}
     PROFILE_FIELDS = ("server_url", "company_login", "company_name", "device_name", "token", "private_key",
-                      "join_password", "direct_cache")
+                      "join_password", "direct_cache", "can_control")
 
     def __init__(self, path: Path | None = None):
         self.path = path or STATE_FILE
@@ -1285,6 +1288,12 @@ REMOTE_LOCAL_CHOICES = {"": "Как разрешил администратор 
                         "own": "По моему паролю (его знаю только я)", "off": "Запретить управление этим компьютером"}
 
 
+def remote_can_control(cfg: dict | None) -> bool:
+    """Может ли этот ПК управлять другими: так решил администратор в кабинете (поле remote.can_control)."""
+    remote = (cfg or {}).get("remote")
+    return isinstance(remote, dict) and remote.get("can_control") is True
+
+
 def combine_remote_mode(admin: str, local: str, own_password: bool) -> str:
     """Как можно управлять этим ПК: что разрешил администратор и что выбрал пользователь — только строже."""
     if admin not in REMOTE_MODES or local == "off":
@@ -1959,7 +1968,7 @@ class Worker(threading.Thread):
                 self.state.stash_current()
                 if not self.state.activate(target):   # уже в списке — тот же ключ, тот же ПК на сервере
                     self.state.set(token="", private_key="", join_password="", company_name="", last_conf_hash="",
-                                   direct_cache={})
+                                   direct_cache={}, can_control=False)
             self.state.set(server_url=server, company_login=company, device_name=clean_device_name(device))
             try:
                 self._register(password)
@@ -2027,7 +2036,7 @@ class Worker(threading.Thread):
                 self.api.logout()   # токен больше не действует, ПК снят с сервера WireGuard
             except (ApiError, ServerUnreachable):
                 pass
-        self.state.set(token="", join_password="", last_conf_hash="", direct_cache={})
+        self.state.set(token="", join_password="", last_conf_hash="", direct_cache={}, can_control=False)
         try:
             self._uninstall()
         finally:
@@ -2345,8 +2354,14 @@ class Worker(threading.Thread):
         return None
 
     # --- блокировка программы паролем этого компьютера
+    def can_control(self) -> bool:
+        """Администратор разрешил этому ПК управлять другими (по последнему ответу сервера)."""
+        return self.state.get("can_control") is True
+
     def lock_ready(self) -> bool:
-        return bool(self.state.get("lock_on") and self.state.get("lock_hash"))
+        """Блокировать программу: включено, есть пароль и этот ПК может управлять другими. Компьютеры без
+        права удалённого управления не блокируются, даже если блокировка включена в настройках."""
+        return bool(self.state.get("lock_on") and self.state.get("lock_hash")) and self.can_control()
 
     def check_unlock(self, password: str) -> bool:
         return check_lock_pw(password, self.state.get("lock_hash") or "")
@@ -2691,6 +2706,11 @@ class Worker(threading.Thread):
             return
         if self.cfg.get("company") and self.cfg["company"] != self.state.get("company_name"):
             self.state.set(company_name=str(self.cfg["company"])[:100])
+        ctrl = remote_can_control(self.cfg)
+        if ctrl != (self.state.get("can_control") is True):
+            self.state.set(can_control=ctrl)
+            log.info("право управлять другими ПК: %s", "есть — программа блокируется паролем" if ctrl
+                     else "нет — программа не блокируется")
         # имя могли сменить в кабинете — запоминаем, иначе повторный вход вернул бы старое
         name = clean_device_name(str(self.cfg.get("device_name") or ""))
         if name and name != self.state.get("device_name"):
@@ -3728,10 +3748,13 @@ class SettingsDialog(tk.Toplevel):
     Пароль один: им разблокируется программа, и по нему подключаются, если выбран доступ «по моему паролю».
     При первом запуске окно открывается само."""
 
-    def __init__(self, app: "App", first: bool = False):
+    def __init__(self, app: "App", first: bool = False, offer_lock: bool = False):
         super().__init__(app)
         self.app, self.first = app, first
         st = app.state_
+        can_ctrl = app.worker.can_control()
+        if can_ctrl:   # блокировку этому ПК уже предложили — второй раз окно само не откроется
+            st.set(lock_offered=True)
         self.title("Настройка этого компьютера" if first else "Настройки этого компьютера")
         self.configure(bg=C["bg"])
         self.resizable(False, False)
@@ -3760,6 +3783,9 @@ class SettingsDialog(tk.Toplevel):
         if first:
             muted("Эти настройки касаются только этого компьютера. Их можно изменить позже: "
                   "«Система → Настройки этого компьютера…».")
+        if offer_lock:
+            muted("Администратор компании разрешил этому компьютеру управлять другими ПК. Включите блокировку "
+                  "программы паролем, чтобы этим не воспользовался чужой человек за этим компьютером.")
         # имя
         head("Имя компьютера")
         self.name0 = (app.cfg or {}).get("device_name") or st.get("device_name") or socket.gethostname()
@@ -3792,7 +3818,9 @@ class SettingsDialog(tk.Toplevel):
         put(ttk.Entry(frm, textvariable=self.pw2, show="•", width=40), sticky="ew")
         # блокировка
         head("Блокировка программы")
-        self.lock_on = tk.BooleanVar(value=bool(st.get("lock_on")) if st.get("setup_done") else True)
+        # по умолчанию блокируются только ПК с правом управлять другими (администраторы)
+        self.lock_on = tk.BooleanVar(value=bool(st.get("lock_on")) if st.get("setup_done") and not offer_lock
+                                     else can_ctrl)
         put(ttk.Checkbutton(frm, text="Блокировать программу паролем этого компьютера", variable=self.lock_on,
                             command=self._toggle))
         line = ttk.Frame(frm)
@@ -3805,6 +3833,9 @@ class SettingsDialog(tk.Toplevel):
             .pack(side="left")
         muted("Заблокированную программу нельзя открыть, отключить или закрыть, не зная пароля: так чужой "
               "человек за этим компьютером не воспользуется сетью компании. Сеть при этом работает.")
+        if not can_ctrl:
+            muted("Этому компьютеру не разрешено управлять другими ПК — программа на нём не блокируется. "
+                  "Блокировка заработает, когда администратор компании даст такое право.")
         if self.has_lock:   # менять пароль и снимать блокировку — только зная прежний
             put(ttk.Label(frm, text="Текущий пароль (чтобы сменить пароль или выключить блокировку)",
                           style="Muted.TLabel"), pady=(6, 0))
@@ -4255,6 +4286,8 @@ class App(tk.Tk):
                 online = sum(1 for p in others if self._peer_online(p))
                 text += f"  · {online} / {len(others)}"
         self.company_lbl.config(text=text)
+        if self.locked:
+            self._lock_info()
 
     def _hover_power(self, hover: bool):
         self.power_hover = hover
@@ -4421,6 +4454,20 @@ class App(tk.Tk):
                                                               and status != self.last_status):
             self._render_peers()
         self.last_status = status
+        self._lock_rights()
+
+    def _lock_rights(self):
+        """Право управлять другими ПК забрали — программа больше не блокируется (снять блокировку сразу).
+        Дали, а блокировка не настроена, — один раз предложить её в настройках."""
+        if self.locked:
+            if not self.worker.lock_ready():
+                log.info("блокировка снята: у этого ПК нет права управлять другими")
+                self.unlock()
+            return
+        if self.worker.can_control() and not self.worker.lock_ready() and not self.state_.get("lock_offered") \
+                and self.state_.get("setup_done") and not self.login_dialog and not self.settings_dialog:
+            self.state_.set(lock_offered=True)
+            self.after(300, lambda: self.settings(offer_lock=True))
 
     def _fit_compact(self):
         """Окно по содержимому: пустую строку сообщения не показываем, длинную — целиком."""
@@ -4529,8 +4576,14 @@ class App(tk.Tk):
             log.debug("значок на экране блокировки не нарисован", exc_info=True)
         tk.Label(b, text="Программа заблокирована", bg=C["panel"], fg=C["text"],
                  font=("Segoe UI", 12, "bold")).pack()
-        self.lock_net = tk.Label(b, text="", bg=C["panel"], fg=C["muted"], font=("Segoe UI", 9))
+        # и под блокировкой видно, работает ли сеть: статус, имя и IP этого ПК, компания
+        self.lock_status = Pill(b, bg=C["panel"])
+        self.lock_status.pack(pady=(8, 2))
+        self.lock_net = tk.Label(b, text="", bg=C["panel"], fg=C["text"], font=("Segoe UI", 10, "bold"))
         self.lock_net.pack(pady=(2, 0))
+        self.lock_company = tk.Label(b, text="", bg=C["panel"], fg=C["muted"], font=("Segoe UI", 9),
+                                     wraplength=280, justify="center")
+        self.lock_company.pack(pady=(0, 0))
         self.lock_hint = tk.Label(b, text="", bg=C["panel"], fg=C["muted"], font=("Segoe UI", 9), wraplength=280,
                                   justify="center")
         self.lock_hint.pack(pady=(10, 4), padx=12)
@@ -4565,7 +4618,21 @@ class App(tk.Tk):
             self.lock_forgot.config(text="Забыли пароль?")
         self.lock_entry.focus_set()
 
+    def _lock_info(self):
+        """Строки экрана блокировки: статус подключения, имя и IP этого ПК, компания — как в шапке окна."""
+        c = self.cfg or {}
+        label, color = STATUS_VIEW.get(self.status_now, ("Запуск…", C["off"]))
+        self.lock_status.show(label, color)
+        ip = c.get("ip") if self.status_now != Status.NEED_LOGIN else ""
+        self.lock_net.config(text=" · ".join(x for x in (c.get("device_name") or self.state_.get("device_name"),
+                                                        ip) if x))
+        self.lock_company.config(text=self.company_lbl.cget("text") or self.state_.get("company_name") or "")
+
     def lock_now(self):
+        if not self.worker.can_control():
+            messagebox.showinfo(APP_TITLE, "Программа блокируется только на компьютерах, которым администратор "
+                                           "компании разрешил управлять другими ПК.", parent=self)
+            return
         if not self.worker.lock_ready():
             messagebox.showinfo(APP_TITLE, "Сначала задайте пароль этого компьютера и включите блокировку.",
                                 parent=self)
@@ -4589,15 +4656,13 @@ class App(tk.Tk):
                 win.withdraw()
                 self._lock_chats.append(win)
         self.tree.configure(takefocus=0)
-        c = self.cfg or {}
-        self.lock_net.config(text=" · ".join(x for x in (c.get("device_name") or self.state_.get("device_name"),
-                                                        c.get("ip")) if x))
+        self._lock_info()
         self._lock_pending = None
         self._lock_mode(False)
         self.lock_frame.place(x=0, y=0, relwidth=1, relheight=1)
         self.lock_frame.lift()
         if self.compact:   # окно без списка низкое — экрану блокировки нужно место
-            self.geometry(f"{self._size[0]}x{max(self._size[1], 330)}")
+            self.geometry(f"{self._size[0]}x{max(self._size[1], 390)}")
             if self.state() == "normal":
                 self.place_corner()
 
@@ -4652,7 +4717,7 @@ class App(tk.Tk):
         self.unlock()
         self.after(200, self.settings)   # задать новый пароль
 
-    def settings(self, first: bool = False):
+    def settings(self, first: bool = False, offer_lock: bool = False):
         if self.locked:
             return
         if self.settings_dialog and self.settings_dialog.winfo_exists():
@@ -4661,7 +4726,7 @@ class App(tk.Tk):
         if first and self.state_.get("setup_done"):
             return
         self.show()
-        self.settings_dialog = SettingsDialog(self, first=first)
+        self.settings_dialog = SettingsDialog(self, first=first, offer_lock=offer_lock)
 
     def place_corner(self):
         """Окно — в правый нижний угол рабочей области (над панелью задач), как у программ из трея."""
