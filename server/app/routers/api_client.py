@@ -81,6 +81,8 @@ class HeartbeatIn(BaseModel):
     remote_local: str | None = Field(default=None, pattern="^(|ask|own|off)$")
     # клиент 1.0.21+: сетевые карты (адрес в локальной сети и MAC) — для включения по сети. Нет поля — прежние
     nics: list[NicIn] | None = Field(default=None, max_length=services.NICS_MAX)
+    # клиент 1.0.28+: ID RustDesk этого ПК (для подключения через облако RustDesk). Нет поля — прежний
+    rustdesk_id: str | None = Field(default=None, pattern=services.RUSTDESK_ID_RE)
 
 
 class WakeIn(BaseModel):
@@ -242,6 +244,7 @@ def peers(ctx=Depends(current_device)):
         raise HTTPException(403, "Устройство не активно")
     hidden = not dev["show_peers"]   # нет доступа — в программе только сам ПК (сеть при этом та же)
     me_controls = services.can_control(dev, company)   # меню RustDesk — только у ПК, которому разрешено управлять
+    cloud_ids = me_controls and services.remote_cloud(company)   # ID RustDesk — только им и только с облаком
     result = []
     for d in services.list_devices(conn, company["id"]):
         if d["status"] != "active" or (hidden and d["id"] != dev["id"]):
@@ -259,6 +262,8 @@ def peers(ctx=Depends(current_device)):
             # к нему можно подключиться через RustDesk (и этому ПК разрешено управлять)
             "remote": me_controls and bool(d["remote_ok"]) and d["remote_effective"] != "off",
             "remote_mode": d["remote_effective"] if me_controls else "off",
+            # ID RustDesk: подключиться через облако RustDesk (если оно включено в кабинете)
+            "rustdesk_id": d["rustdesk_id"] if cloud_ids and d["remote_effective"] != "off" else "",
             # выключен, но его можно включить по сети (этому ПК разрешено управлять)
             "wake": me_controls and not d["online"] and d["wol_ready"] and d["id"] != dev["id"],
             "is_me": d["id"] == dev["id"],
@@ -357,6 +362,8 @@ def heartbeat(data: HeartbeatIn, ctx=Depends(current_device)):
         conn.execute("UPDATE devices SET radmin_server=? WHERE id=?", (1 if data.radmin_server else 0, dev["id"]))
     if data.remote_ok is not None:
         conn.execute("UPDATE devices SET remote_ok=? WHERE id=?", (1 if data.remote_ok else 0, dev["id"]))
+    if data.rustdesk_id is not None and data.rustdesk_id != dev["rustdesk_id"]:
+        conn.execute("UPDATE devices SET rustdesk_id=? WHERE id=?", (data.rustdesk_id, dev["id"]))
     if data.nics is not None:
         nics = services.clean_nics([n.model_dump() for n in data.nics])
         if nics:   # пусто (карты не прочитались) — оставляем последние известные: по ним ПК и будят

@@ -264,7 +264,9 @@ def _help_text() -> str:
     return ("Это бот Retix Hub. Он присылает в группу компании запросы на подключение новых компьютеров: "
             "одобрить или заблокировать — кнопками под сообщением.\n\n"
             f"Подключить группу: кабинет компании → «Telegram» → «Подключить группу», затем ссылка или команда "
-            f"<code>/link{bot} КОД</code> в группе.\n<code>/pending{bot}</code> — кто ждёт одобрения сейчас.")
+            f"<code>/link{bot} КОД</code> в группе.\n<code>/pending{bot}</code> — кто ждёт одобрения сейчас.\n"
+            f"<code>/pass{bot} ИМЯ ПК</code> — ID и пароль RustDesk этого ПК для подключения через облако RustDesk "
+            "(если оно включено в кабинете и ПК управляется без согласия).")
 
 
 def _on_link(conn, chat: dict, user: dict, code: str) -> None:
@@ -310,6 +312,44 @@ def _on_pending(conn, chat: dict, quiet: bool = False) -> None:
             sent += 1
     if not sent and not quiet:
         _reply(chat_id, "Никто не ждёт одобрения.")
+
+
+def _on_pass(conn, chat: dict, user: dict, arg: str) -> None:
+    """/pass ИМЯ — ID и пароль RustDesk ПК компании этой группы (как кнопка «пароль для подключения» в кабинете)."""
+    chat_id = chat.get("id")
+    companies = conn.execute("SELECT * FROM companies WHERE tg_chat_id=? AND tg_chat_id<>'' AND is_active=1",
+                             (str(chat_id),)).fetchall()
+    if not companies:
+        _reply(chat_id, "Эта группа не подключена ни к одной компании.\n\n" + _help_text())
+        return
+    want = " ".join(arg.split()).casefold()
+    if not want:
+        bot = f"@{bot_username}" if bot_username else ""
+        _reply(chat_id, f"Укажите компьютер: <code>/pass{bot} Касса 2</code> (имя или IP из кабинета).")
+        return
+    found = [(c, d) for c in companies
+             for d in conn.execute("SELECT * FROM devices WHERE company_id=? ORDER BY id", (c["id"],)).fetchall()
+             if want in (" ".join(str(d["name"]).split()).casefold(), str(d["ip"]))]
+    if len(found) != 1:
+        _reply(chat_id, f"Компьютер «{_esc(arg.strip())}» не найден." if not found else
+               f"Компьютеров «{_esc(arg.strip())}» несколько — укажите IP-адрес из кабинета.")
+        return
+    company, dev = found[0]
+    try:
+        r = services.give_remote_password(conn, company, dev, f"Telegram: {_who(user)}")
+    except ValueError as e:
+        _reply(chat_id, "⛔ " + _esc(str(e)))
+        return
+    _reply(chat_id, f"🔑 <b>{_esc(r['name'])}</b> — RustDesk\nID: <code>{_esc(r['rustdesk_id'])}</code>\n"
+                    f"Пароль: <code>{_esc(r['password'])}</code>\n\nПодключитесь в ближайшие 2 минуты: после сеанса "
+                    f"компьютер сам сменит пароль. Запросил: {_esc(_who(user))}")
+
+
+def notify_remote_password(company, r: dict, where: str) -> None:
+    """В группу компании: пароль RustDesk выдан (не сам пароль — только кому и где)."""
+    if enabled() and company["tg_chat_id"]:
+        send(company["tg_chat_id"], f"🔑 Пароль RustDesk для <b>{_esc(r['name'])}</b> ({_esc(r['ip'])}) выдан "
+                                    f"{_esc(where)}. После сеанса компьютер сменит его сам.")
 
 
 def _on_callback(conn, cq: dict) -> None:
@@ -404,6 +444,8 @@ def handle_update(conn, upd: dict) -> None:
         _on_link(conn, chat, msg.get("from") or {}, arg.strip())
     elif cmd == "pending":
         _on_pending(conn, chat)
+    elif cmd in ("pass", "rustdesk"):
+        _on_pass(conn, chat, msg.get("from") or {}, arg)
     elif cmd == "help":
         _reply(chat.get("id"), _help_text())
 

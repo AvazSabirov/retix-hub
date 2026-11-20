@@ -11,7 +11,7 @@
     <div><span class="muted">Одобрение</span><b>{{ 'да' if company.require_approval else 'нет' }}</b></div>
     <div><span class="muted">Весь трафик внутри</span><b>{{ 'да, ПК связываются напрямую' if company.full_lan else 'ping, папки, Radmin' }}</b></div>
     <div><span class="muted">Скорость через сервер</span><b>{{ (company.speed_limit ~ ' Мбит/с') if company.speed_limit else 'без ограничения' }}</b></div>
-    <div><span class="muted">Удалённое управление</span><b>{{ remote_modes[remote_mode] }}</b></div>
+    <div><span class="muted">Удалённое управление</span><b>{{ remote_modes[remote_mode] }}{% if company.remote_cloud and remote_mode != 'off' %}, и через облако RustDesk{% endif %}</b></div>
   </div>
 </div>
 <div class="card">

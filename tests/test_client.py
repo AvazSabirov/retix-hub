@@ -1673,8 +1673,8 @@ FAKE_RUSTDESK = Path("C:/Program Files/RustDesk/rustdesk.exe")
 class FakeRustDesk:
     """RustDesk одного ПК: настройки (--option), постоянный пароль (--password), идёт ли сеанс."""
 
-    def __init__(self, installed=True):
-        self.options, self.password, self.calls = {}, "", []
+    def __init__(self, installed=True, rid="123456789"):
+        self.options, self.password, self.calls, self.id = {}, "", [], rid
         self.installed, self.sessions = installed, False
         self.service = "running" if installed else "missing"   # служба RustDesk: running / stopped / missing
 
@@ -1696,6 +1696,8 @@ def fake_rustdesk(monkeypatch, patch_windows):
             elif args[1] == "--password":
                 rd.password = args[2]
                 return 0, "Done!\n"
+            elif args[1] == "--get-id":
+                return 0, rd.id + "\n"
         return 0, ""
     monkeypatch.setattr(rc, "run", run)
     monkeypatch.setattr(rc, "run_rd", run)
@@ -1809,6 +1811,86 @@ def test_remote_control_end_to_end(make_client, company, server, fake_rustdesk):
     assert rdb.options["direct-server"] == "N" and b.state.get("remote_applied") == ""
     step_as(a, rda)
     assert all(p["remote"] is False for p in a.peers)
+
+
+def test_remote_cloud_rustdesk(make_client, company, server, fake_rustdesk):
+    """Облако RustDesk (галочка в кабинете): серверы RustDesk по умолчанию, firewall не держит RustDesk в VPN
+    (закрыт для интернета только прямой порт), без whitelist, одноразовый пароль или «Принять»; ID ПК — на
+    сервере, в кабинете и у ПК, которым можно управлять. Сняли галочку — RustDesk снова только в сети Retix Hub."""
+    calls = fake_rustdesk
+    a, rda = make_client("PC1"), FakeRustDesk(rid="111222333")
+    login(a, company, name="Склад"); step_as(a, rda, 2)
+    b, rdb = make_client("PC2"), FakeRustDesk(rid="444555666")
+    login(b, company, name="Касса"); step_as(b, rdb, 2)
+    settings = {"share_name": "share", "share_ports": "445", "remote_mode": "auto"}
+    company.cab.post(BASE + "/cabinet/settings", data=settings)
+    allow_control(company, "Склад")
+    step_as(b, rdb, 2); step_as(a, rda, 2)
+    assert rdb.options["custom-rendezvous-server"] == "10.66.0.1" and b.w.cfg["remote"]["cloud"] is False
+    assert b.w.rustdesk_id == "444555666"
+    _set_online(server, "Склад", "Касса")
+    step_as(a, rda)
+    assert next(p for p in a.peers if p["name"] == "Касса")["rustdesk_id"] == ""   # без облака ID не нужен
+
+    calls.clear()
+    r = company.cab.post(BASE + "/cabinet/settings", data=dict(settings, remote_cloud="1"))
+    assert "Настройки сохранены" in r.text
+    step_as(b, rdb, 2); step_as(a, rda, 2)
+    assert b.w.cfg["remote"]["cloud"] is True and "|cloud" in b.state.get("remote_applied")
+    o = rdb.options
+    assert o["custom-rendezvous-server"] == o["relay-server"] == o["api-server"] == ""   # облако RustDesk
+    assert o["whitelist"] == "" and o["direct-server"] == "Y"
+    assert o["approve-mode"] == "" and o["verification-method"] == "use-both-passwords"
+    assert o["enable-tunnel"] == "N" and o["access-mode"] == "custom"
+    rules = [" ".join(c) for c in calls if c[:1] == ["netsh"] and "add" in c]
+    assert not any("only VPN (out)" in r for r in rules)              # в интернет RustDesk ходит
+    assert any("only VPN (in)" in r and "localport=21118" in r and "action=block" in r for r in rules)
+    # с облаком к A (им управлять некому из VPN) подключаются через облако; запретил пользователь — никак:
+    # whitelist 127.0.0.1 не пускает никого, а сам A может подключаться через облако
+    assert rda.options["whitelist"] == "" and a.state.get("remote_applied").startswith("auto|")
+    assert a.w.set_remote_access("off") is None
+    step_as(a, rda, 2)
+    assert rda.options["whitelist"] == "127.0.0.1" and rda.options["custom-rendezvous-server"] == ""
+    assert rda.options["direct-server"] == "N" and a.state.get("remote_applied") == "off|cloud"
+    # ID: на сервере, у управляющего ПК и в кабинете
+    _set_online(server, "Склад", "Касса")
+    step_as(a, rda)
+    peer_b = next(p for p in a.peers if p["name"] == "Касса")
+    assert peer_b["rustdesk_id"] == "444555666"
+    assert "444555666" in company.cab.get(BASE + "/cabinet").text
+    step_as(b, rdb)
+    assert all(not p["rustdesk_id"] for p in b.peers)                # Касса не управляет — ID других не видит
+    # из VPN — как раньше, по паролю от сервера
+    RD_NOW["rd"] = rda
+    res, err = a.w.remote_connect(peer_b["id"])
+    assert err is None and res["password"] == rdb.password
+
+    calls.clear()
+    company.cab.post(BASE + "/cabinet/settings", data=settings)      # галочку сняли
+    step_as(b, rdb, 2); step_as(a, rda, 2)
+    assert rdb.options["custom-rendezvous-server"] == "10.66.0.1" and rdb.options["whitelist"] == a.w.cfg["ip"]
+    assert rdb.options["approve-mode"] == "password"
+    assert rdb.options["verification-method"] == "use-permanent-password"
+    assert rda.options["custom-rendezvous-server"] == "10.66.0.1" and a.state.get("remote_applied") == "off"
+    rules = [" ".join(c) for c in calls if c[:1] == ["netsh"] and "add" in c]
+    assert any("only VPN (out)" in r and "action=block" in r for r in rules)
+
+    # облако без удалённого управления не включается
+    company.cab.post(BASE + "/cabinet/settings", data=dict(settings, remote_mode="off", remote_cloud="1"))
+    step_as(b, rdb)
+    assert b.w.cfg["remote"]["cloud"] is False and rdb.options["direct-server"] == "N"
+    rules = [" ".join(c) for c in calls if c[:1] == ["netsh"] and "add" in c]
+    assert any("only VPN (out)" in r for r in rules)
+
+
+def test_rustdesk_cloud_options_and_id():
+    o = rc.rustdesk_options("ask", "", "10.66.0.1", cloud=True)
+    assert o["approve-mode"] == "click" and o["whitelist"] == "" and o["custom-rendezvous-server"] == ""
+    o = rc.rustdesk_options("own", "", "10.66.0.1", cloud=True)
+    assert o["approve-mode"] == "password" and o["verification-method"] == "use-permanent-password"
+    assert rc.rustdesk_servers("10.66.0.1")["api-server"] == "http://10.66.0.1"
+    assert rc.RUSTDESK_ID_RE.match("123456789") and not rc.RUSTDESK_ID_RE.match("12 34")
+    assert not rc.RUSTDESK_ID_RE.match("ошибка")
 
 
 def test_remote_ask_mode_and_install(make_client, company, server, fake_rustdesk, monkeypatch):
