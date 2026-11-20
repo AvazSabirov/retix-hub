@@ -2223,7 +2223,9 @@ def test_lock_settings(make_client):
     assert w.set_lock(True, 10).startswith("Придумайте пароль")      # без пароля блокировать нечем
     assert w.set_lock(True, 7, "1234").startswith("Выберите")
     assert w.set_lock(True, 10, "12 3").startswith("Пароль")          # пробелы нельзя
-    assert w.set_lock(True, 10, "ключ1") is None and w.lock_ready()
+    assert w.set_lock(True, 10, "ключ1") is None and not w.lock_ready()   # без права управлять — не блокируется
+    c.state.set(can_control=True)
+    assert w.lock_ready()
     assert w.check_unlock("ключ1") and not w.check_unlock("ключ2")
     assert "ключ1" not in c.state.path.read_text("utf-8")           # на диске — только хэш
     assert w.set_lock(False, 5) is None and not w.lock_ready() and c.state.get("lock_minutes") == 5
@@ -2233,20 +2235,39 @@ def test_lock_settings(make_client):
 
 def test_own_access_password_locks_program(make_client, company):
     """Пароль доступа «по моему паролю» — он же пароль блокировки программы."""
-    c = make_client(); login(c, company); c.step(2)
+    c = make_client(); login(c, company, name="Админ"); allow_control(company, "Админ")
+    c.state.set(can_control=True)   # право управлять — как прислал бы сервер (см. test_lock_only_for_controllers)
     assert c.w.set_remote_access("own", "My-Secret#2026") is None
     assert c.w.lock_ready() and c.w.check_unlock("My-Secret#2026")
 
 
+def test_lock_only_for_controllers(make_client, company):
+    """Блокируются только ПК, которым администратор разрешил управлять другими; право запоминается
+    (после запуска Windows без сервера решаем сразу), а забрали его — программа больше не блокируется."""
+    c = make_client(); login(c, company, name="Касса"); c.step(2)
+    assert c.w.set_lock(True, 10, "1234") is None
+    assert not c.w.can_control() and not c.w.lock_ready()          # касса без права управления — не блокируется
+    company.cab.post(BASE + "/cabinet/settings", data={"share_name": "share", "share_ports": "445",
+                                                       "remote_mode": "ask"})
+    allow_control(company, "Касса"); c.step(2)
+    assert c.w.can_control() and c.state.get("can_control") is True and c.w.lock_ready()
+    r = company.cab.post(BASE + f"/cabinet/devices/{device_id(company, 'Касса')}/control_off")
+    assert r.status_code == 200
+    c.step(2)
+    assert not c.w.can_control() and not c.w.lock_ready()
+    assert not rc.remote_can_control(None) and not rc.remote_can_control({"remote": {"can_control": 1}})
+    assert rc.remote_can_control({"remote": {"can_control": True}})
+
+
 def test_forgotten_lock_reset_by_company_password(make_client, company):
     a = make_client("PC-A"); login(a, company, remember=True); a.step(2)
-    a.w.set_lock(True, 10, "1111")
+    a.w.set_lock(True, 10, "1111"); a.state.set(can_control=True)
     assert a.w.reset_lock("wrong-pass") == "Неверный пароль подключения компании."
     assert a.w.lock_ready()
     assert a.w.reset_lock("join123") is None and not a.w.lock_ready()
     # пароль подключения не сохранён — его проверяет сервер (повторный вход тем же ключом)
     b = make_client("PC-B"); login(b, company, remember=False, name="Склад"); b.step(2)
-    b.w.set_lock(True, 10, "2222")
+    b.w.set_lock(True, 10, "2222"); b.state.set(can_control=True)
     assert b.w.reset_lock("wrong-pass") and b.w.lock_ready()
     assert b.w.reset_lock("join123") is None and not b.w.lock_ready()
     assert b.step(2)["status"] == rc.Status.ONLINE   # вход переподключил туннель — сеть снова работает
