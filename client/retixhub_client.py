@@ -1552,11 +1552,13 @@ def new_remote_password() -> str:
 
 
 def rustdesk_session_active(port: int = REMOTE_PORT) -> bool:
-    """Подключён ли сейчас кто-то к RustDesk этого ПК (установленное TCP-соединение на его порт)."""
+    """Подключён ли сейчас кто-то к RustDesk этого ПК: установленное TCP-соединение на его порт (из сети Retix Hub)
+    или окно подключения RustDesk (rustdesk.exe --cm) — оно открыто, пока идёт сеанс, и через облако RustDesk."""
     if not WINDOWS:
         return False
-    ps = (f"(Get-NetTCPConnection -LocalPort {int(port)} -State Established -ErrorAction SilentlyContinue "
-          "| Measure-Object).Count")
+    ps = (f"$n = (Get-NetTCPConnection -LocalPort {int(port)} -State Established -ErrorAction SilentlyContinue "
+          "| Measure-Object).Count; $n += (Get-CimInstance Win32_Process -Filter \"Name='rustdesk.exe'\" "
+          "-ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -like '*--cm*' } | Measure-Object).Count; $n")
     code, out = run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps], timeout=20)
     try:
         return code == 0 and int(out.strip().splitlines()[-1]) > 0

@@ -410,6 +410,42 @@ def can_control(dev, company) -> bool:
     return bool(dev["remote_control"]) and remote_mode(company) != "off" and device_status(dev) == "active"
 
 
+REMOTE_PW_GIVE_LIMIT = 10   # выдач пароля RustDesk (кабинет, Telegram) на компанию в час
+
+
+def give_remote_password(conn, company, dev, actor: str) -> dict:
+    """Пароль RustDesk ПК для подключения через облако RustDesk по ID (кабинет, Telegram): только ПК «без
+    согласия» и только с включённым облаком. Выдача — как подключение: в журнале, после сеанса ПК сменит
+    пароль сам (rotate). ValueError — почему не выдали."""
+    name = dev["name"]
+    if not remote_cloud(company):
+        raise ValueError("Облако RustDesk выключено: «Настройки сети» → «Разрешить RustDesk через интернет»")
+    if device_status(dev) != "active":
+        raise ValueError(f"{name} не подключён к сети компании (ждёт одобрения или заблокирован)")
+    mode = effective_remote_mode(dev, company)
+    if mode != "auto":
+        raise ValueError(f"Пароль выдаётся только для ПК, которыми можно управлять без согласия. {name}: "
+                         + {"off": "управлять нельзя", "ask": "только с согласием пользователя (он нажмёт «Принять»)",
+                            "own": "по паролю пользователя (его знает только он)"}.get(mode, mode))
+    if not dev["rustdesk_id"]:
+        raise ValueError(f"ID RustDesk у {name} ещё неизвестен: нужна Retix Hub 1.0.28 или новее, и RustDesk "
+                         "должен быть готов")
+    password = unseal(dev["remote_pw"])
+    if not password:
+        raise ValueError(f"{name} ещё готовит удалённое управление, попробуйте через минуту")
+    given = conn.execute("SELECT COUNT(*) FROM audit_log WHERE company_id=? AND action='remote_password' "
+                         "AND created_at > datetime('now', '-1 hour')", (company["id"],)).fetchone()[0]
+    if given >= REMOTE_PW_GIVE_LIMIT:
+        raise ValueError(f"Слишком много выдач пароля RustDesk за час (не больше {REMOTE_PW_GIVE_LIMIT}). "
+                         "Подождите.")
+    with db.write_lock:   # пароль выдан — после сеанса ПК сменит его сам
+        conn.execute("UPDATE devices SET remote_used_at=? WHERE id=?", (int(time.time()), dev["id"]))
+        audit(conn, company["id"], "remote_password",
+              f"пароль RustDesk выдан ({actor}) → {name} {dev['ip']}, ID {dev['rustdesk_id']}")
+        conn.commit()
+    return {"name": name, "ip": dev["ip"], "rustdesk_id": dev["rustdesk_id"], "password": password}
+
+
 def remote_controllers(conn, company, exclude_id: int = 0) -> list[str]:
     """IP компьютеров компании, которым администратор разрешил управлять другими ПК: только их пускает RustDesk."""
     if remote_mode(company) == "off":

@@ -1,5 +1,5 @@
 {% from "_extras.html" import role_select %}
-{% macro devices_table(devices, prefix, remote_on=False, remote_access={}, roles=[]) %}
+{% macro devices_table(devices, prefix, remote_on=False, remote_access={}, roles=[], cloud_pw=False) %}
 <table class="cards">
   <thead><tr><th>Статус</th><th>Имя</th><th>Компьютер</th><th>IP</th>{% if roles %}<th title="Группа компьютера в программе Retix Hub (роли — в блоке «Роли компьютеров»)">Роль</th>{% endif %}<th>Последняя связь</th><th>Клиент</th><th title="Скорость через сервер для этого ПК, Мбит/с: и приём, и отправка. Пусто или 0 — без ограничения. Прямой путь мимо сервера не ограничивается">Скорость</th><th title="Видит ли этот ПК в программе другие компьютеры и может ли им писать. Сеть (папки, Radmin, ping) от этого не меняется">Видит ПК</th>{% if remote_on %}<th title="Удалённое управление (RustDesk). «Управляет» — может ли этот ПК подключаться к другим (по умолчанию нет). «Им» — можно ли управлять этим ПК: только строже режима компании; пользователь ПК в программе может сделать ещё строже">Управление</th>{% endif %}<th>Действия</th></tr></thead>
   <tbody>
@@ -54,6 +54,10 @@
         </select><button class="small" title="Сохранить">✓</button>
       </form>
       {% if d.rustdesk_id %}<small class="muted" title="ID RustDesk этого ПК: по нему подключаются через облако RustDesk, если оно включено в настройках сети">ID RustDesk: <b>{{ d.rustdesk_id }}</b></small><br>{% endif %}
+      {% if cloud_pw and d.rustdesk_id and d.status == 'active' and d.remote_effective == 'auto' %}
+      <form method="post" action="{{ prefix }}{{ d.id }}/rustdesk_password">
+        <button class="small" title="ID и пароль RustDesk: подключиться через облако RustDesk из любого места без согласия пользователя. После сеанса ПК сменит пароль сам">пароль для подключения</button>
+      </form>{% endif %}
       <small class="muted" title="Как на самом деле можно управлять этим ПК: режим компании, настройка выше и выбор пользователя ПК">сейчас: {{ {'off': 'нельзя', 'ask': 'с согласием', 'auto': 'без согласия', 'own': 'по паролю пользователя'}[d.remote_effective] }}{% if d.remote_local %} (выбор пользователя){% endif %}</small>
     </td>
     {% endif %}

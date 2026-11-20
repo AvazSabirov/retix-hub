@@ -1905,6 +1905,55 @@ class TestTelegram:
         assert len(out) == 1 and "Вход скопирован на другой компьютер" in out[0][1]["text"]
         assert out[0][1]["reply_markup"]["inline_keyboard"][0][0]["callback_data"] == f"ap:{pc['device_id']}"
 
+    def test_rustdesk_password_cabinet_and_pass_command(self, ctx, tg, net):
+        """Пароль RustDesk для облака: кнопка в кабинете и /pass в группе — только ПК «без согласия» с ID,
+        только с облаком; выдача в журнале и в группе, после неё ПК сменит пароль (rotate); не больше 10 в час."""
+        telegram, flush = tg
+        from app import db
+        ctx.company("firma1")
+        cab, _ = _link_group(ctx, tg)
+        b = ctx.register("firma1", "Касса 2")
+        settings = {"share_name": "share", "share_ports": "445", "remote_mode": "auto"}
+        cab.post("/cabinet/settings", data=settings)
+        h = ctx.h(b["token"])
+        assert ctx.api.post("/api/remote/password", headers=h, json={"password": "Abcdefgh12345678"}).json()["ok"]
+        ctx.api.post("/api/heartbeat", headers=h, json={"rustdesk_id": "987654321"})
+        url = f"/cabinet/devices/{b['device_id']}/rustdesk_password"
+        assert "Облако RustDesk выключено" in cab.post(url).text           # без облака — нет
+        assert url not in cab.get("/cabinet").text                         # кнопки нет
+        cab.post("/cabinet/settings", data=dict(settings, remote_cloud="1"))
+        assert url in cab.get("/cabinet").text
+        flush()
+        r = cab.post(url)
+        assert "Abcdefgh12345678" in r.text and "987654321" in r.text and r.headers["cache-control"] == "no-store"
+        assert "Abcdefgh12345678" not in str(r.url)                          # пароль не в адресе
+        out = flush()
+        assert "Пароль RustDesk для <b>Касса 2</b>" in out[0][1]["text"] and "Abcdefgh12345678" not in out[0][1]["text"]
+        me = ctx.api.get("/api/me", headers=h).json()
+        assert me["remote"]["rotate"] is False                              # 2 минуты на подключение
+        conn = db.connect()
+        conn.execute("UPDATE devices SET remote_used_at=remote_used_at-300 WHERE id=?", (b["device_id"],))
+        conn.commit()
+        assert ctx.api.get("/api/me", headers=h).json()["remote"]["rotate"] is True   # потом ПК сменит пароль
+        assert "пароль RustDesk выдан (кабинет) → Касса 2" in cab.get("/cabinet").text
+
+        def cmd(text):
+            telegram.handle_update(conn, {"message": {"chat": GROUP, "from": IVAN, "text": text}})
+            return flush()[0][1]["text"]
+        assert "ID: <code>987654321</code>" in cmd("/pass@RetixTestBot касса   2") and \
+            "Abcdefgh12345678" in cmd(f"/pass {b['ip']}")
+        assert "не найден" in cmd("/pass Склад") and "Укажите компьютер" in cmd("/pass")
+        assert "Telegram: Иван (@ivan)" in cab.get("/cabinet").text
+        cab.post(f"/cabinet/devices/{b['device_id']}/remote_access", data={"value": "ask"})
+        assert "только для ПК, которыми можно управлять без согласия" in cmd("/pass Касса 2")
+        cab.post(f"/cabinet/devices/{b['device_id']}/remote_access", data={"value": "company"})
+        for _ in range(7):
+            assert "Пароль:" in cmd("/pass Касса 2")
+        assert "Слишком много выдач" in cmd("/pass Касса 2")                 # 10 в час на компанию
+        telegram.handle_update(conn, {"message": {"chat": {"id": -1, "type": "group"}, "text": "/pass Касса 2"}})
+        assert "не подключена" in flush()[0][1]["text"]
+        conn.close()
+
     def test_pending_command_lists_waiting(self, ctx, tg):
         telegram, flush = tg
         from app import db

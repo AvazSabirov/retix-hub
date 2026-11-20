@@ -59,10 +59,14 @@ def logout(request: Request):
 @router.get("")
 def index(request: Request, ctx=Depends(current_company), msg: str = "", err: int = 0):
     conn, company = ctx
+    return _page(request, conn, company, msg, err)
+
+
+def _page(request: Request, conn, company, msg: str = "", err: int = 0, reveal: dict | None = None):
     devices = services.list_devices(conn, company["id"])
-    remote_log = conn.execute("SELECT * FROM audit_log WHERE company_id=? AND action='remote_connect' "
-                              "ORDER BY id DESC LIMIT 30", (company["id"],)).fetchall()
-    return templates.TemplateResponse(request, "cabinet.html", {
+    remote_log = conn.execute("SELECT * FROM audit_log WHERE company_id=? AND action IN ('remote_connect', "
+                              "'remote_password') ORDER BY id DESC LIMIT 30", (company["id"],)).fetchall()
+    response = templates.TemplateResponse(request, "cabinet.html", {
         "title": company["name"] or company["login"], "company": company,
         "subnet": services.subnet(company), "devices": devices,
         "roles": services.list_roles(conn, company["id"]), "role_prefix": "/cabinet/roles/",
@@ -72,7 +76,11 @@ def index(request: Request, ctx=Depends(current_company), msg: str = "", err: in
         "logs": services.company_logs(conn, company["id"]), "log_prefix": "/cabinet/logs/",
         "tg": tg_view(company), "tg_prefix": "/cabinet/telegram/",
         "action_prefix": "/cabinet/devices/", "logout_url": "/cabinet/logout",
+        "remote_cloud": services.remote_cloud(company), "reveal": reveal,
         "msg": msg, "err": err})
+    if reveal:   # пароль — только в этом ответе: не в адресе, не в кэше браузера
+        response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 def tg_view(company) -> dict:
@@ -121,6 +129,21 @@ def telegram_test(ctx=Depends(current_company)):
         return redirect("/cabinet#telegram", "Группа Telegram не подключена", err=True)
     telegram.send(company["tg_chat_id"], "Проверка: сообщения от Retix Hub приходят в эту группу ✅")
     return redirect("/cabinet#telegram", "Проверочное сообщение отправлено в группу")
+
+
+@router.post("/devices/{device_id}/rustdesk_password")
+def rustdesk_password(request: Request, device_id: int, ctx=Depends(current_company)):
+    """Пароль RustDesk ПК «без согласия» — подключиться через облако RustDesk по ID из любого места."""
+    conn, company = ctx
+    dev = conn.execute("SELECT * FROM devices WHERE id=? AND company_id=?", (device_id, company["id"])).fetchone()
+    if not dev:
+        return redirect("/cabinet", "Устройство не найдено", err=True)
+    try:
+        reveal = services.give_remote_password(conn, company, dev, "кабинет")
+    except ValueError as e:
+        return redirect("/cabinet", str(e), err=True)
+    telegram.notify_remote_password(company, reveal, "в кабинете")
+    return _page(request, conn, company, reveal=reveal)
 
 
 @router.post("/devices/{device_id}/{action}")
