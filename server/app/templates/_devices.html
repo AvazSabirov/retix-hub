@@ -53,6 +53,7 @@
           {% for key, title in remote_access.items() %}<option value="{{ key }}" {{ 'selected' if key == d.remote_access }}>им: {{ title }}</option>{% endfor %}
         </select><button class="small" title="Сохранить">✓</button>
       </form>
+      {% if d.rustdesk_id %}<small class="muted" title="ID RustDesk этого ПК: по нему подключаются через облако RustDesk, если оно включено в настройках сети">ID RustDesk: <b>{{ d.rustdesk_id }}</b></small><br>{% endif %}
       <small class="muted" title="Как на самом деле можно управлять этим ПК: режим компании, настройка выше и выбор пользователя ПК">сейчас: {{ {'off': 'нельзя', 'ask': 'с согласием', 'auto': 'без согласия', 'own': 'по паролю пользователя'}[d.remote_effective] }}{% if d.remote_local %} (выбор пользователя){% endif %}</small>
     </td>
     {% endif %}

@@ -1482,11 +1482,34 @@ class TestRemoteControl:
     def _me(self, ctx, pc):
         return ctx.api.get("/api/me", headers=ctx.h(pc["token"])).json()
 
+    def test_cloud_and_rustdesk_id(self, ctx, net):
+        """Облако RustDesk — галочка кабинета (только вместе с удалённым управлением); ID RustDesk ПК приходит
+        в heartbeat и виден в кабинете и ПК с правом управлять (только когда облако включено)."""
+        a, b, cab = self._setup(ctx)
+        assert self._me(ctx, b)["remote"]["cloud"] is False
+        r = ctx.api.post("/api/heartbeat", headers=ctx.h(b["token"]), json={"rustdesk_id": "987654321"})
+        assert r.json()["ok"]
+        assert ctx.api.post("/api/heartbeat", headers=ctx.h(b["token"]),
+                            json={"rustdesk_id": "1; DROP"}).status_code == 422
+        assert "987654321" in cab.get("/cabinet").text
+        ids = lambda pc: {p["name"]: p["rustdesk_id"] for p in   # noqa: E731
+                          ctx.api.get("/api/peers", headers=ctx.h(pc["token"])).json()["peers"]}
+        assert ids(a)["B"] == ""                                   # облако выключено — ID не нужен
+        cab.post("/cabinet/settings", data={"share_name": "share", "share_ports": "445", "remote_mode": "auto",
+                                            "remote_cloud": "1"})
+        assert self._me(ctx, b)["remote"]["cloud"] is True
+        assert ids(a)["B"] == "987654321" and ids(b)["B"] == ""   # B не управляет — ID не видит
+        ctx.api.post("/api/heartbeat", headers=ctx.h(b["token"]), json={"client_version": "1.0.27"})
+        assert ids(a)["B"] == "987654321"                          # нет поля — прежний ID
+        cab.post("/cabinet/settings", data={"share_name": "share", "share_ports": "445", "remote_mode": "off",
+                                            "remote_cloud": "1"})
+        assert self._me(ctx, b)["remote"]["cloud"] is False      # без удалённого управления облака нет
+
     def test_off_by_default(self, ctx, net):
         ctx.company("firma")
         a, b = ctx.register("firma", name="A"), ctx.register("firma", name="B")
         assert self._me(ctx, a)["remote"] == {"mode": "off", "port": 21118, "rotate": False, "can_control": False,
-                                              "allowed": []}
+                                              "cloud": False, "allowed": []}
         r = ctx.api.post("/api/remote/connect", headers=ctx.h(a["token"]), json={"to": b["device_id"]})
         assert r.status_code == 403 and "выключено" in r.json()["detail"]
         assert not any("21118" in rule for rule in net["rules"])

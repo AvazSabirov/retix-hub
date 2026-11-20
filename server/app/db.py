@@ -21,6 +21,7 @@ CREATE TABLE IF NOT EXISTS companies (
     share_ports       TEXT NOT NULL DEFAULT '445',
     speed_limit       INTEGER NOT NULL DEFAULT 0,  -- Мбит/с через сервер на всю компанию, 0 — без ограничения
     remote_mode       TEXT NOT NULL DEFAULT 'off', -- удалённое управление (RustDesk): off, ask — с согласием, auto — без
+    remote_cloud      INTEGER NOT NULL DEFAULT 0,  -- RustDesk и через облако RustDesk (по ID, из-за пределов VPN)
     tg_chat_id        TEXT NOT NULL DEFAULT '',    -- группа Telegram компании: запросы на подключение ПК
     tg_chat_title     TEXT NOT NULL DEFAULT '',
     tg_link_code      TEXT NOT NULL DEFAULT '',    -- одноразовый код из кабинета: /link@бот КОД в группе
@@ -62,6 +63,7 @@ CREATE TABLE IF NOT EXISTS devices (
     remote_control  INTEGER NOT NULL DEFAULT 0, -- может управлять другими ПК компании (решает администратор)
     remote_access   TEXT NOT NULL DEFAULT 'company', -- управление ЭТИМ ПК: company (как в компании), off, ask
     remote_local    TEXT NOT NULL DEFAULT '',   -- что выбрал пользователь ПК в программе: '', ask, own, off
+    rustdesk_id     TEXT NOT NULL DEFAULT '',   -- ID RustDesk этого ПК (клиент 1.0.28+): подключение через облако RustDesk
     log_requested_at INTEGER NOT NULL DEFAULT 0, -- администратор запросил журнал программы: ПК пришлёт его (/api/log)
     nics            TEXT NOT NULL DEFAULT '',   -- JSON [{addr, mac}]: сетевые карты ПК (включение по сети, клиент 1.0.21+)
     nics_at         INTEGER NOT NULL DEFAULT 0, -- когда ПК последний раз сообщил nics
@@ -200,6 +202,8 @@ MIGRATIONS = [
     ("devices", "role_id", "INTEGER NOT NULL DEFAULT 0"),
     ("companies", "speed_limit", "INTEGER NOT NULL DEFAULT 0"),
     ("companies", "remote_mode", "TEXT NOT NULL DEFAULT 'off'"),
+    ("companies", "remote_cloud", "INTEGER NOT NULL DEFAULT 0"),
+    ("devices", "rustdesk_id", "TEXT NOT NULL DEFAULT ''"),
     ("companies", "tg_chat_id", "TEXT NOT NULL DEFAULT ''"),
     ("companies", "tg_chat_title", "TEXT NOT NULL DEFAULT ''"),
     ("companies", "tg_link_code", "TEXT NOT NULL DEFAULT ''"),

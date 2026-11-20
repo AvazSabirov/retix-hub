@@ -349,6 +349,13 @@ REMOTE_LOCAL = {"": "как разрешил администратор", "ask":
 EFFECTIVE_TITLES = {"off": "нельзя", "ask": "с согласием", "auto": "без согласия", "own": "по паролю пользователя"}
 REMOTE_ROTATE_AFTER = 120   # сек после выдачи пароля: подключиться успевают, дальше ПК меняет пароль (без сеанса)
 REMOTE_PW_RE = re.compile(r"^[A-Za-z0-9]{12,64}$")
+RUSTDESK_ID_RE = r"^[A-Za-z0-9_-]{6,32}$"   # ID RustDesk (обычно 9–10 цифр; бывает и свой, из букв)
+
+
+def remote_cloud(company) -> bool:
+    """RustDesk работает и через облако RustDesk: к ПК подключаются по ID из любого места, не только из VPN.
+    Включает администратор компании (по умолчанию выключено), только вместе с удалённым управлением."""
+    return remote_mode(company) != "off" and bool(company["remote_cloud"])
 
 
 def clean_remote_mode(value) -> str | None:
@@ -422,6 +429,7 @@ def remote_config(conn, dev, company) -> dict:
     rotate = effective_remote_mode(dev, company) == "auto" and (
         not unseal(dev["remote_pw"]) or bool(used) and time.time() - used >= REMOTE_ROTATE_AFTER)
     return {"mode": mode, "port": REMOTE_PORT, "rotate": rotate, "can_control": can_control(dev, company),
+            "cloud": remote_cloud(company),
             "allowed": remote_controllers(conn, company, dev["id"]) if mode != "off" else []}
 
 

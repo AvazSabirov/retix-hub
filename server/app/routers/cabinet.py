@@ -157,7 +157,7 @@ def role_redirect(url: str, conn, company_id: int, action: str, role_id: int, va
 @router.post("/settings")
 def settings(require_approval: str = Form(""), full_lan: str = Form(""),
              share_name: str = Form("share"), share_ports: str = Form("445"),
-             remote_mode: str | None = Form(None), ctx=Depends(current_company)):
+             remote_mode: str | None = Form(None), remote_cloud: str = Form(""), ctx=Depends(current_company)):
     conn, company = ctx
     remote = services.remote_mode(company) if remote_mode is None else services.clean_remote_mode(remote_mode)
     if remote is None:
@@ -169,11 +169,12 @@ def settings(require_approval: str = Form(""), full_lan: str = Form(""),
     if not services.SHARE_RE.match(share_name):
         return redirect("/cabinet", "Недопустимое имя общей папки", err=True)
     with db.write_lock:
-        conn.execute("UPDATE companies SET require_approval=?, full_lan=?, share_name=?, share_ports=?, remote_mode=? "
-                     "WHERE id=?", (1 if require_approval else 0, 1 if full_lan else 0, share_name, ports, remote,
-                                    company["id"]))
+        cloud = 1 if remote_cloud and remote != "off" else 0
+        conn.execute("UPDATE companies SET require_approval=?, full_lan=?, share_name=?, share_ports=?, remote_mode=?, "
+                     "remote_cloud=? WHERE id=?", (1 if require_approval else 0, 1 if full_lan else 0, share_name,
+                                                   ports, remote, cloud, company["id"]))
         services.audit(conn, company["id"], "settings", f"approval={bool(require_approval)} full_lan={bool(full_lan)} "
-                                                        f"ports={ports} remote={remote}")
+                                                        f"ports={ports} remote={remote} cloud={bool(cloud)}")
         conn.commit()
         services.reconcile(conn)
     return redirect("/cabinet", "Настройки сохранены")
