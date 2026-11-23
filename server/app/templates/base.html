@@ -18,7 +18,7 @@
   .scope-box { max-height:150px; overflow:auto; border:1px solid var(--line); border-radius:7px; padding:6px 10px; margin-top:4px; }
   .tbl-wrap { overflow-x:auto; } input[type=file], input[type=datetime-local] { font:inherit; }
   .key { word-break:break-all; user-select:all; }
-  main { max-width:1150px; margin:24px auto; padding:0 16px; }
+  main { max-width:1440px; margin:24px auto; padding:0 16px; }
   .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:18px 20px; margin-bottom:18px; }
   h1 { font-size:20px; margin:0 0 4px; } h2 { font-size:16px; margin:0 0 12px; }
   .muted { color:var(--muted); }
@@ -33,6 +33,15 @@
   .tag.warn { background:#fef3c7; color:#92400e; } .tag.bad { background:#fee2e2; color:#991b1b; }
   .tag.share { background:#dcfce7; color:#166534; }
   .actions { display:flex; gap:4px; flex-wrap:wrap; } .actions form { margin:0; }
+  /* ячейка таблицы с кнопками остаётся ячейкой: с display:flex она выпадала из сетки таблицы — вылезала за
+     край карточки, а линия под строкой у неё была своя, не на уровне остальных */
+  td.actions { display:table-cell; } td.actions > form, td.actions > a { display:inline-block; margin:2px 4px 2px 0; }
+  details.direct summary { cursor:pointer; list-style:none; white-space:nowrap; } details.direct summary::-webkit-details-marker { display:none; }
+  details.direct summary::after { content:' ▾'; } details.direct[open] summary::after { content:' ▴'; }
+  details.direct div { max-width:220px; }
+  /* таблица компьютеров: много колонок — плотнее, чтобы на экране 1280 помещалась целиком */
+  table.devices th, table.devices td { padding:8px 4px; } table.devices .rename input { width:100px; }
+  table.devices .rename.speed input { width:52px; } table.devices th { font-size:11px; }
   button, .btn { font:inherit; padding:6px 12px; border-radius:7px; border:1px solid var(--line); background:#fff; cursor:pointer; color:var(--text); text-decoration:none; }
   button.primary, .btn.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
   button.danger { color:var(--bad); } button.small { padding:3px 8px; font-size:12px; }
@@ -86,6 +95,7 @@
     table.cards tr.joined { border-bottom:none; border-radius:9px 9px 0 0; margin-bottom:0; }
     table.cards tr.joined + tr { border-top:1px dashed var(--line); border-radius:0 0 9px 9px; }
     table.cards .rename { width:100%; } table.cards .rename input { flex:1; width:auto; min-width:0; font-size:16px; padding:6px 8px; }
+    table.cards .rename select { flex:1; min-width:0; }
     table.log, table.log tbody, table.log tr, table.log td { display:block; width:auto; }
     table.log tr { padding:8px 0; border-bottom:1px solid var(--line); }
     table.log td { border:none; padding:1px 0; }

@@ -1178,7 +1178,8 @@ class TestDirectLan:
         _, (a, b) = self._office(ctx)
         self._report(ctx, a, ["192.168.1.10/24"], 51000, direct=[b["device_id"], 999])
         page = ctx.cabinet("office").get("/cabinet").text
-        assert "напрямую: PC1" in page and "999" not in page.split("напрямую:")[1][:40]
+        part = page.split("напрямую: 1 ПК")[1][:200]   # список свёрнут под «напрямую: N ПК»
+        assert ">PC1<" in part and "999" not in part
         assert "мимо сервера" in page
 
 
