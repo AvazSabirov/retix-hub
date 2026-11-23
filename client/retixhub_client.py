@@ -41,7 +41,7 @@ import requests
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
 
-VERSION = "1.0.28"
+VERSION = "1.0.29"
 APP_NAME = "RetixHub"          # служебное имя: папки, задачи, мьютекс
 APP_TITLE = "Retix Hub"        # то, что видит пользователь
 TUNNEL = "retixhub"
@@ -81,6 +81,13 @@ DIRECT_NUDGE_AFTER_WAN = 22  # сек — через интернет (keepalive
 DIRECT_RETRY_FAILED = 300  # сек — ни один адрес не ответил: снова в начале следующего окна
 DIRECT_RETRY_LOST = 60     # сек — прямой путь пропал: снова в начале следующего окна
 DIRECT_TICK = 1            # сек — пока идёт проверка пути, handshake смотрим чаще основного цикла
+# Handshake и keepalive — ещё не всё: бывает, что они ходят, а данные напрямую не проходят (у соседа нет нашего
+# адреса в AllowedIPs — его программа закрыта или зависла, — и WireGuard соседа выбрасывает наши пакеты; ответ
+# ping приходит не тем путём). Keepalive соседа приходят, и такой путь выглядел живым вечно: ping и общие папки
+# не работали, а с других ПК работали. Поэтому после включения прямого пути — ping соседу через него.
+DIRECT_VERIFY_AFTER = 3    # сек после включения пути: сосед за это время тоже успевает его включить
+DIRECT_VERIFY_RETRY = 5    # сек — повтор, если ping не ответил
+DIRECT_VERIFY_TRIES = 2    # столько раз ping через прямой путь, прежде чем проверить его через сервер
 LAN_CHECK_EVERY = 60       # сек — как часто перечитывать адреса своей локальной сети
 DIRECT_CACHE_DAYS = 3      # сохранённые соседи действуют без сервера столько дней после его последнего ответа
 DIRECT_CACHE_REFRESH = 3600  # сек — как часто переписывать неизменившийся список соседей на диск
@@ -856,6 +863,18 @@ class Tunnel:
         return False
 
     @staticmethod
+    def check_reach(ip: str, done) -> None:
+        """Отвечает ли ip на ping (через туннель) — в фоне: done(True/False) вызывается из другого потока."""
+        def work():
+            ok = False
+            try:
+                code, out = run(["ping", "-n", "2", "-w", "1000", ip], timeout=10)
+                ok = code == 0 and "TTL=" in out.upper()
+            finally:
+                done(ok)
+        threading.Thread(target=work, daemon=True, name="reach").start()
+
+    @staticmethod
     def nudge(ip: str) -> None:
         """Один ping соседу через прямой путь — в фоне, не задерживая цикл (см. DIRECT_NUDGE_AFTER)."""
         threading.Thread(target=run, args=(["ping", "-n", "1", "-w", "1000", ip],), kwargs={"timeout": 5},
@@ -964,10 +983,12 @@ class DirectPaths:
         self.own_port = 0                                  # порт, который задали сами (set_listen_port)
         self.port_done = False                             # порт туннеля уже приведён к сохранённому
         self.endpoints: dict[str, str] = {}                # ключ -> адрес, по которому сосед отвечает сейчас
+        self.verify: dict[str, dict] = {}                  # ключ -> проверка пути ping-ом (DIRECT_VERIFY_*)
+        self.noping: set[str] = set()                      # соседи, которые не отвечают на ping вообще
         self.clock = 0.0                                   # часы сервера минус свои: окна попыток через интернет
 
     def probing(self) -> bool:
-        return bool(self.probes)
+        return bool(self.probes or self.verify)
 
     def active_ids(self) -> list[int]:
         return sorted(self.active.values())
@@ -984,7 +1005,7 @@ class DirectPaths:
     def reset(self) -> None:
         """Туннель снят или переустановлен — прямых пиров в нём больше нет."""
         self.wanted.clear(); self.probes.clear(); self.rx.clear(); self.active.clear(); self.endpoints.clear()
-        self.nudged.clear()
+        self.nudged.clear(); self.verify.clear()
         self.listen_port = self.own_port = 0
         self.port_done = False
 
@@ -1035,6 +1056,9 @@ class DirectPaths:
         last = self.rx.get(key)
         if last is None or peer["rx"] != last[0]:
             self.rx[key] = last = (peer["rx"], now)
+        if (self.verify.get(key) or {}).get("stage") == "server":
+            self._verify_server(key, n, endpoints, wan, now)
+            return
         if peer["allowed_ips"]:                               # уже напрямую
             if peer["allowed_ips"] != allowed:
                 self.tunnel.set_peer(key, allowed_ips=allowed)
@@ -1053,6 +1077,7 @@ class DirectPaths:
                 if nudge and quiet > after and now - self.nudged.get(key, 0) >= min(after, 6):
                     self.nudged[key] = now
                     nudge(n["ip"])
+                self._verify_direct(key, n, now)
             return
         probe = self.probes.setdefault(key, {"started": now, "idx": 0})
         if peer["handshake"] and now - peer["handshake"] < HANDSHAKE_OK:
@@ -1061,6 +1086,9 @@ class DirectPaths:
             self.active[key] = n["id"]
             self.rx[key] = (peer["rx"], now)
             self.backoff.pop(key, None)
+            if key not in self.noping and getattr(self.tunnel, "check_reach", None):
+                self.verify[key] = {"stage": "direct", "at": now + DIRECT_VERIFY_AFTER, "tries": 0,
+                                    "busy": False, "result": None}
             log.info("прямой путь к %s %s (%s)", n["ip"], where, peer["endpoint"] or endpoints[0])
         elif now - probe["started"] > (DIRECT_PROBE_WAN if wan else DIRECT_PROBE_SECONDS):
             probe["idx"] += 1
@@ -1071,11 +1099,62 @@ class DirectPaths:
                 probe["started"] = now
                 self.tunnel.set_peer(key, endpoint=endpoints[probe["idx"]])
 
+    def _ping(self, key: str, ip: str, now: float) -> bool | None:
+        """Ping соседу в фоне. None — ответа ещё нет (или рано), иначе ответил ли он."""
+        v = self.verify[key]
+        if v["busy"] or (v["result"] is None and now < v["at"]):
+            return None
+        if v["result"] is None:
+            v["busy"] = True
+
+            def done(ok, v=v):
+                v["result"], v["busy"] = bool(ok), False
+            self.tunnel.check_reach(ip, done)
+            return None
+        ok, v["result"] = v["result"], None
+        return ok
+
+    def _verify_direct(self, key: str, n: dict, now: float) -> None:
+        """Путь включён: доходят ли до соседа данные (ping), а не только handshake и keepalive."""
+        if key not in self.verify:
+            return
+        ok = self._ping(key, n["ip"], now)
+        if ok is None:
+            return
+        v = self.verify[key]
+        if ok:
+            self.verify.pop(key, None)
+            return
+        v["tries"] += 1
+        if v["tries"] < DIRECT_VERIFY_TRIES:
+            v["at"] = now + DIRECT_VERIFY_RETRY
+            return
+        # напрямую ping не проходит — тот же ping через сервер: пир соседа остаётся (handshake идёт), но без
+        # AllowedIPs, и пакеты к нему снова идут через сервер
+        v.update(stage="server", at=now + 1)
+        self.tunnel.set_peer(key, allowed_ips="")
+
+    def _verify_server(self, key: str, n: dict, endpoints: tuple, wan: bool, now: float) -> None:
+        ok = self._ping(key, n["ip"], now)
+        if ok is None:
+            return
+        self.verify.pop(key, None)
+        if ok:
+            # через сервер отвечает, напрямую — нет: путь только выглядит рабочим
+            self._fail(key, endpoints, DIRECT_SLOT_WAN_LOST if wan else DIRECT_RETRY_LOST,
+                       f"{n['ip']} отвечает на ping через сервер, а напрямую — нет (handshake есть, данные "
+                       f"не проходят) — снова через сервер", wan)
+            return
+        # не отвечает ни так, ни так — ping у соседа закрыт (антивирус); судить по нему нельзя, путь оставляем
+        self.noping.add(key)
+        self.tunnel.set_peer(key, allowed_ips=f"{n['ip']}/32")
+        log.info("прямой путь к %s: на ping не отвечает ни напрямую, ни через сервер — путь оставляем", n["ip"])
+
     def _drop(self, key: str, why: str) -> None:
         if key in self.active:
             log.info("прямой путь закрыт: %s", why)
         self.tunnel.remove_peer(key)
-        for d in (self.active, self.probes, self.rx, self.endpoints, self.nudged):
+        for d in (self.active, self.probes, self.rx, self.endpoints, self.nudged, self.verify):
             d.pop(key, None)
 
     def _fail(self, key: str, endpoints: tuple, delay: int, why: str, wan: bool = False) -> None:

@@ -113,6 +113,8 @@ class FakeTunnel:
         # от этих соседей keepalive не приходит (WireGuard молчит, пока получает наши), только ответ на ping
         self.quiet_keys = set()
         self.nudges = []                   # кому слали ping через прямой путь (ответ — при следующем wg show)
+        self.reach_checks = []             # проверки пути ping-ом: [(ip, ответил ли)]
+        self.ping_blocked = False          # этот ПК не отвечает на ping (антивирус)
         self._listen(port)
 
     def _listen(self, port):
@@ -189,6 +191,25 @@ class FakeTunnel:
 
     def nudge(self, ip):
         self.nudges.append(ip)
+
+    def vpn_ip(self):
+        return self._conf_value(self.conf, "Address").split("/")[0]
+
+    def check_reach(self, ip, done):
+        """Ping по туннелю: WireGuard принимает пакет, только если адрес отправителя — в AllowedIPs того пира,
+        от которого пакет пришёл. Напрямую — у обоих ПК /32 друг друга, через сервер — ни у кого."""
+        other = next((t for t in (self.lan.hosts.values() if self.lan else []) if t.state == "running"
+                      and t is not self and t.vpn_ip() == ip), None)
+        ok = False
+        if other and self.state == "running":
+            mine = (self.peers.get(other.key) or {}).get("allowed_ips") == f"{ip}/32"
+            theirs = (other.peers.get(self.key) or {}).get("allowed_ips") == f"{self.vpn_ip()}/32"
+            if mine and theirs:
+                ok = not self.lan.blocked and not other.ping_blocked
+            elif not mine and not theirs:
+                ok = not other.ping_blocked
+        self.reach_checks.append((ip, ok))
+        done(ok)
 
     def set_peer(self, key, endpoint="", allowed_ips=None, keepalive=None):
         if key == self.server[0]:
@@ -1106,6 +1127,53 @@ def test_direct_quiet_neighbor_kept_by_ping(make_client, company, server, monkey
     a.tunnel.nudges = []
     time.sleep(1.2); a.step()
     assert direct_peer(a, b) is None
+
+
+def _verify_now(c):
+    """Время проверки пути ping-ом наступило (не ждём DIRECT_VERIFY_AFTER / RETRY)."""
+    for v in c.w.direct.verify.values():
+        v["at"] = 0
+
+
+def test_direct_verified_by_ping(make_client, company, server):
+    """Путь включён у обоих — ping через него проходит, путь остаётся, проверка закончена."""
+    lan, a, b = lan_pair(make_client, company, server)
+    a.step(); b.step(); a.step(); b.step()
+    assert a.w.direct.verify and a.w.direct.probing()        # проверка идёт — цикл смотрит чаще
+    _verify_now(a); a.step(); a.step()
+    assert a.tunnel.reach_checks == [(b.w.cfg["ip"], True)]
+    assert not a.w.direct.verify and direct_peer(a, b)["allowed_ips"] == f"{b.w.cfg['ip']}/32"
+
+
+def test_direct_one_sided_falls_back_to_server(make_client, company, server):
+    """Handshake и keepalive ходят, но у соседа прямой путь не включён (его программа закрыта или зависла):
+    WireGuard соседа выбрасывает наши пакеты — ping не проходит, хотя путь выглядит живым. Программа это
+    замечает по ping и возвращает трафик через сервер — там сосед отвечает."""
+    lan, a, b = lan_pair(make_client, company, server)
+    a.step(); b.step(); a.step()                              # B добавил пира A, но путь не включил
+    assert direct_peer(a, b)["allowed_ips"] and not direct_peer(b, a)["allowed_ips"]
+    for _ in range(rc.DIRECT_VERIFY_TRIES):
+        _verify_now(a); a.step(); a.step()
+    assert a.tunnel.reach_checks == [(b.w.cfg["ip"], False)] * rc.DIRECT_VERIFY_TRIES
+    assert direct_peer(a, b) and direct_peer(a, b)["allowed_ips"] == ""   # пробуем тот же ping через сервер
+    _verify_now(a); a.step(); a.step()
+    assert a.tunnel.reach_checks[-1] == (b.w.cfg["ip"], True)
+    assert direct_peer(a, b) is None and a.w.direct.active_ids() == []    # снова через сервер
+    assert b.state.keypair()[1] in a.w.direct.backoff and not a.w.direct.verify
+
+
+def test_direct_kept_when_neighbor_ignores_ping(make_client, company, server):
+    """Сосед не отвечает на ping совсем (антивирус) — ни напрямую, ни через сервер: судить по ping нельзя,
+    прямой путь остаётся, больше этого соседа ping-ом не проверяем."""
+    lan, a, b = lan_pair(make_client, company, server)
+    b.tunnel.ping_blocked = True
+    a.step(); b.step(); a.step(); b.step()
+    for _ in range(rc.DIRECT_VERIFY_TRIES + 1):
+        _verify_now(a); a.step(); a.step()
+    assert [ok for _, ok in a.tunnel.reach_checks] == [False] * (rc.DIRECT_VERIFY_TRIES + 1)
+    assert direct_peer(a, b)["allowed_ips"] == f"{b.w.cfg['ip']}/32"
+    assert a.w.direct.active_ids() == [b.w.cfg["device_id"]] and not a.w.direct.verify
+    assert b.state.keypair()[1] in a.w.direct.noping
 
 
 def test_direct_neighbor_blocked_is_removed(make_client, company, server):
