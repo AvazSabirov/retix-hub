@@ -1177,6 +1177,27 @@ def test_direct_kept_when_neighbor_ignores_ping(make_client, company, server):
     assert b.state.keypair()[1] in a.w.direct.noping
 
 
+def test_direct_cleared_on_exit(make_client, company, server):
+    """Выход из программы (и перед обновлением): прямые пути убираются из туннеля, пир сервера остаётся.
+    Иначе ПК без программы держал свою сторону пути, сосед свою закрывал — и связь между ними пропадала
+    совсем: пакеты соседа через сервер этот ПК выбрасывал, хотя был «в сети»."""
+    lan, a, b = lan_pair(make_client, company, server)
+    a.step(); b.step(); a.step(); b.step()
+    assert direct_peer(a, b)["allowed_ips"]
+    a.w.leave_direct()
+    assert not a.tunnel.peers and a.w.direct.active_ids() == [] and a.tunnel.violations == []
+    assert a.tunnel.server[0] in a.tunnel.dump()["peers"]                  # пир сервера на месте
+    a.w.leave_direct()                                                       # повторно — без ошибок
+
+
+def test_peer_link_app_silent():
+    """Сервер говорит, что программа на ПК не отвечает, — свой значок, даже если путь был прямым."""
+    assert rc.peer_link({"app_ok": False, "direct": True}, True) == "noapp"
+    assert rc.peer_link({"app_ok": False}, False) == "off"
+    assert rc.peer_link({"direct": True}, True) == "lan"                       # старый сервер — поля нет
+    assert set(rc.LINK_HINTS) == set(rc.LINK_COLORS)
+
+
 def test_direct_neighbor_blocked_is_removed(make_client, company, server):
     lan, a, b = lan_pair(make_client, company, server)
     a.step(); b.step(); a.step()
@@ -2501,3 +2522,14 @@ def test_rustdesk_id_missing_reason():
     assert "облако RustDesk выключено" in rc.rustdesk_id_missing_reason(peer, off)
     assert "1.0.27" in rc.rustdesk_id_missing_reason(dict(peer, client_version="1.0.27"), on)
     assert "не ответил" in rc.rustdesk_id_missing_reason(peer, on)
+
+
+def test_restart_watchdog_waits_for_installer(monkeypatch):
+    """Страховка автообновления не запускает программу, пока работает установщик: запущенная посреди копирования
+    программа держала бы старые библиотеки, и установка вышла бы смешанной («ошибка библиотеки Python»)."""
+    calls = []
+    monkeypatch.setattr(rc.subprocess, "Popen", lambda cmd, **kw: calls.append(cmd))
+    rc.restart_watchdog(Path(r"C:\Program Files\RetixHub\RetixHub.exe"), delay=240)
+    script = calls[0]
+    assert "ping -n 241" in script and 'find /I "RetixHub_Setup"' in script
+    assert script.index("RetixHub_Setup") < script.index('start "" "C:\\Program Files\\RetixHub\\RetixHub.exe" --minimized')

@@ -1,5 +1,6 @@
 """Бизнес-логика, общая для API клиента, кабинета компании и суперадмина."""
 import base64
+import calendar
 import hashlib
 import ipaddress
 import json
@@ -64,6 +65,26 @@ def is_online(dev) -> bool:
             and now - dev["last_rx_at"] < OFFLINE_AFTER_SECONDS)
 
 
+# «В сети» — это туннель WireGuard: его держит служба Windows, и он живёт без программы Retix Hub (её закрыли,
+# она зависла или не запустилась после обновления). Программа шлёт heartbeat раз в минуту (last_seen). Туннель
+# есть, а heartbeat давно нет — значит, программа не работает: прямые пути, удалённое управление и обновления
+# на этом ПК не обслуживаются, и подключиться к нему может не получиться, хотя он «в сети».
+APP_SILENT_SECONDS = 300
+
+
+def _utc_ts(text) -> float:
+    """'2026-11-23 08:35:42' (CURRENT_TIMESTAMP SQLite, UTC) -> секунды; не разобрали -> 0."""
+    try:
+        return float(calendar.timegm(time.strptime(str(text or "")[:19], "%Y-%m-%d %H:%M:%S")))
+    except ValueError:
+        return 0.0
+
+
+def app_alive(dev) -> bool:
+    """Программа Retix Hub на ПК недавно отзывалась (heartbeat)."""
+    return time.time() - _utc_ts(dev["last_seen"]) < APP_SILENT_SECONDS
+
+
 # Для прямого пути — терпимее, чем для отметки «в сети»: один потерянный keepalive (25 с) плюс интервал опроса
 # wg (10 с) уже давали паузу больше OFFLINE_AFTER_SECONDS, сервер на один ответ переставал называть соседа,
 # и работающий прямой путь закрывался у обоих ПК.
@@ -102,7 +123,7 @@ def list_devices(conn, company_id: int) -> list[dict]:
         direct = [names[i] for i in _json_ints(r["direct_ids"]) if i in names] \
             if full_lan and online and time.time() - r["lan_at"] < LAN_FRESH_SECONDS else []
         pos, role = roles.get(r["role_id"], (len(roles), ""))
-        out.append(dict(r, online=online, status=device_status(r), direct_peers=direct,
+        out.append(dict(r, online=online, app_ok=not online or app_alive(r), status=device_status(r), direct_peers=direct,
                         remote_effective=effective_remote_mode(r, company) if company else "off",
                         wol_ready=bool(_nics(r)), role_id=r["role_id"] if role else 0, role=role, role_pos=pos))
     return out

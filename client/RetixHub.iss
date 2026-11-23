@@ -34,6 +34,10 @@
 ;   - перед заменой файлов папка _internal должна быть свободна: её библиотеки не держит ни один процесс.
 ;     Иначе часть файлов осталась бы старой, и программа не запустилась бы («ошибка библиотеки Python»).
 ;     Не освободилась за 30 с — установка отменяется, прежняя версия остаётся рабочей;
+;   - прежняя версия (_internal.prev и RetixHub.exe.prev) хранится до следующего обновления. Новая после
+;     копирования проверяется (RetixHub.exe --selftest) ДО запуска; не прошла — возвращается прежняя, и
+;     программа сама попробует обновиться снова позже. Так ПК не остаётся с программой, которая не запускается
+;     (файл не скопировался, его удалил или держит антивирус, программу запустили посреди установки);
 ;   - журнал установки — всегда; копия — {app}\logs\setup.log (её присылает кнопка «Журнал» в кабинете).
 ;
 ;  Тихая установка на много ПК:  RetixHub_Setup_<версия>.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART
@@ -124,7 +128,8 @@ Name: "{autoprograms}\{#AppName}"; Filename: "{app}\{#AppExe}"; WorkingDir: "{ap
 [Run]
 ; автозапуск при входе в Windows — сразу при установке: задача Планировщика с наивысшими правами
 ; (программе нужны права администратора, а задача запускает её без окна UAC), окно — свёрнутым в трей
-Filename: "{sys}\schtasks.exe"; Parameters: "/Create /F /TN ""RetixHub"" /SC ONLOGON /RL HIGHEST /TR ""\""{app}\{#AppExe}\"" --minimized"""; Flags: runhidden waituntilterminated; StatusMsg: "Автозапуск при входе в Windows…"
+; BeforeInstall: новая версия проверяется до первого запуска программы (не запускается — возвращается прежняя)
+Filename: "{sys}\schtasks.exe"; Parameters: "/Create /F /TN ""RetixHub"" /SC ONLOGON /RL HIGHEST /TR ""\""{app}\{#AppExe}\"" --minimized"""; Flags: runhidden waituntilterminated; StatusMsg: "Автозапуск при входе в Windows…"; BeforeInstall: VerifyNewVersion
 ; установщик уже с правами администратора — клиент стартует без второго окна UAC
 Filename: "{app}\{#AppExe}"; WorkingDir: "{app}"; Flags: nowait skipifsilent
 ; автообновление (тихая установка из клиента): запустить новую версию, окно — в трее
@@ -136,6 +141,9 @@ Filename: "{app}\{#AppExe}"; Parameters: "--uninstall"; WorkingDir: "{app}"; Fla
 [UninstallDelete]
 Type: files; Name: "{app}\retixhub_selftest.txt"
 Type: filesandordirs; Name: "{app}\_internal.old"
+Type: filesandordirs; Name: "{app}\_internal.prev"
+Type: filesandordirs; Name: "{app}\_internal.bad"
+Type: files; Name: "{app}\{#AppExe}.prev"
 Type: filesandordirs; Name: "{app}\logs"
 
 [Code]
@@ -256,25 +264,32 @@ end;
 
 { Папка _internal (библиотеки программы) свободна: её удаётся переименовать — значит, ни один процесс не держит
   её файлы. Занятую папку установщик заменил бы лишь частично: старые и новые библиотеки вперемешку, и программа
-  не запускается («ошибка библиотеки Python»). Ждём до 30 с, добивая RetixHub.exe. True — папки больше нет. }
+  не запускается («ошибка библиотеки Python»). Ждём до 30 с, добивая RetixHub.exe. Переименованная папка —
+  _internal.prev — и копия RetixHub.exe.prev хранятся: если новая версия не пройдёт самопроверку, их вернём.
+  True — папки _internal больше нет. }
 function FreeInternalDir: Boolean;
 var
-  Dir, Old: String;
+  Dir, Prev: String;
   I, RC: Integer;
 begin
   Dir := ExpandConstant('{app}\_internal');
-  Old := Dir + '.old';
-  if DirExists(Old) then
-    DelTree(Old, True, True, True);
+  Prev := Dir + '.prev';
+  if DirExists(Dir + '.old') then
+    DelTree(Dir + '.old', True, True, True);      { так её называли до 1.0.30 }
+  if DirExists(Dir + '.bad') then
+    DelTree(Dir + '.bad', True, True, True);
   Result := not DirExists(Dir);
   if Result then
     Exit;
   for I := 1 to 30 do
   begin
-    if RenameFile(Dir, Old) then
+    if DirExists(Prev) then
+      DelTree(Prev, True, True, True);            { позапрошлая версия больше не нужна }
+    if (not DirExists(Prev)) and RenameFile(Dir, Prev) then
     begin
-      Log('_internal свободна (попытка ' + IntToStr(I) + ')');
-      DelTree(Old, True, True, True);   { что не удалилось — удалит следующая установка }
+      Log('_internal свободна (попытка ' + IntToStr(I) + '), прежняя версия сохранена в _internal.prev');
+      if not FileCopy(ExpandConstant('{app}\{#AppExe}'), ExpandConstant('{app}\{#AppExe}.prev'), False) then
+        Log('ОШИБКА: не сохранилась копия {#AppExe} — вернуть прежнюю версию будет нечем');
       Result := True;
       Exit;
     end;
@@ -288,6 +303,77 @@ begin
   end;
   LogBusyProcesses;
   Log('ОШИБКА: _internal так и не освободилась — установка отменена, прежняя версия не тронута');
+end;
+
+{ Самопроверка установленной программы: RetixHub.exe --selftest (Tcl/Tk, cryptography, SSL, значок у часов),
+  не дольше 90 с — если библиотека Python не загрузится, окно ошибки не задержит установку навсегда.
+  1 — прошла, 0 — не прошла, -1 — проверить не удалось (PowerShell не запустился): тогда ничего не трогаем. }
+function SelfTest: Integer;
+var
+  Exe, Report, Ps: String;
+  Output: AnsiString;
+  RC: Integer;
+begin
+  Exe := ExpandConstant('{app}\{#AppExe}');
+  Report := ExpandConstant('{app}\retixhub_selftest.txt');
+  DeleteFile(Report);
+  Ps := '$p = Start-Process -FilePath ''' + Exe + ''' -ArgumentList ''--selftest'' -PassThru; $null = $p.Handle; ' +
+        'if (-not $p.WaitForExit(90000)) { Stop-Process -Id $p.Id -Force; exit 3 }; exit $p.ExitCode';
+  if not Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
+              '-NoProfile -ExecutionPolicy Bypass -Command "' + Ps + '"', '', SW_HIDE, ewWaitUntilTerminated, RC) then
+  begin
+    Log('Самопроверка не запустилась (PowerShell), код ' + IntToStr(RC) + ' — оставляем новую версию');
+    Result := -1;
+    Exit;
+  end;
+  Output := '';
+  LoadStringFromFile(Report, Output);
+  DeleteFile(Report);
+  Log('Самопроверка новой версии: код ' + IntToStr(RC) + #13#10 + String(Output));
+  if (RC = 0) and (Pos('RESULT: OK', String(Output)) > 0) then
+    Result := 1
+  else
+    Result := 0;
+end;
+
+{ Новая версия не работает — вернуть прежнюю (_internal.prev, RetixHub.exe.prev) }
+procedure RollBack;
+var
+  App, Dir, Prev: String;
+  RC: Integer;
+begin
+  App := ExpandConstant('{app}');
+  Dir := App + '\_internal';
+  Prev := Dir + '.prev';
+  if not DirExists(Prev) or not FileExists(App + '\{#AppExe}.prev') then
+  begin
+    Log('ОШИБКА: прежней версии нет (первая установка) — вернуть нечего');
+    Exit;
+  end;
+  Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /IM {#AppExe}', '', SW_HIDE, ewWaitUntilTerminated, RC);
+  if DirExists(Dir) and not RenameFile(Dir, Dir + '.bad') then
+    DelTree(Dir, True, True, True);
+  if DirExists(Dir) then
+  begin
+    Log('ОШИБКА: новая _internal занята — прежнюю версию не вернуть');
+    Exit;
+  end;
+  if RenameFile(Prev, Dir) and FileCopy(App + '\{#AppExe}.prev', App + '\{#AppExe}', False) then
+    Log('Возвращена прежняя версия Retix Hub — новую программа попробует поставить позже')
+  else
+    Log('ОШИБКА: прежняя версия вернулась не полностью');
+  DelTree(Dir + '.bad', True, True, True);   { что не удалилось — удалит следующая установка }
+end;
+
+{ [Run], перед первой командой: новая версия запускается? Иначе — прежняя }
+procedure VerifyNewVersion;
+begin
+  WizardForm.StatusLabel.Caption := 'Проверка Retix Hub…';
+  if SelfTest = 0 then
+  begin
+    Log('ОШИБКА: новая версия не прошла самопроверку — возвращаю прежнюю');
+    RollBack;
+  end;
 end;
 
 { Перед копированием файлов: клиента быть не должно, и его библиотеки никто не держит }

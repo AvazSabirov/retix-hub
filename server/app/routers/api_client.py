@@ -255,6 +255,8 @@ def peers(ctx=Depends(current_device)):
             "hostname": d["hostname"],
             "ip": d["ip"],
             "online": d["online"],
+            # туннель есть, а программа Retix Hub не отзывается (закрыта, зависла, не встала после обновления)
+            "app_ok": d["app_ok"],
             "last_handshake": d["last_handshake"],
             "client_version": d["client_version"],
             "is_share_host": bool(d["is_share_host"]),

@@ -1174,6 +1174,23 @@ class TestDirectLan:
         assert ctx.api.post("/api/heartbeat", headers=ctx.h(b["token"]), json={"client_version": "1.0.10"}).json()["ok"]
         assert self._me(ctx, a)["direct"]
 
+    def test_app_silent_shown(self, ctx):
+        """Туннель есть, а программа давно не шлёт heartbeat (закрыта, не встала после обновления): ПК «в сети»,
+        но в программе и в кабинете видно, что программа не отвечает. Только что отозвался — всё как обычно."""
+        from app import db
+        _, (a, b) = self._office(ctx)
+        peers = {p["name"]: p for p in ctx.api.get("/api/peers", headers=ctx.h(a["token"])).json()["peers"]}
+        assert peers["PC1"]["online"] and peers["PC1"]["app_ok"] is True
+        conn = db.connect()
+        conn.execute("UPDATE devices SET last_seen=datetime('now', '-10 minutes') WHERE id=?", (b["device_id"],))
+        conn.commit(); conn.close()
+        peers = {p["name"]: p for p in ctx.api.get("/api/peers", headers=ctx.h(a["token"])).json()["peers"]}
+        assert peers["PC1"]["online"] and peers["PC1"]["app_ok"] is False and peers["PC0"]["app_ok"] is True
+        assert "программа не отвечает" in ctx.cabinet("office").get("/cabinet").text
+        self._report(ctx, b, ["192.168.1.11/24"], 51001)                     # программа снова отозвалась
+        peers = {p["name"]: p for p in ctx.api.get("/api/peers", headers=ctx.h(a["token"])).json()["peers"]}
+        assert peers["PC1"]["app_ok"] is True
+
     def test_cabinet_shows_direct_peers(self, ctx):
         _, (a, b) = self._office(ctx)
         self._report(ctx, a, ["192.168.1.10/24"], 51000, direct=[b["device_id"], 999])

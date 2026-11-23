@@ -6,7 +6,8 @@
   {% for d in devices %}
   <tr>
     <td data-label="Статус">
-      <span class="dot {{ 'on' if d.online }}"></span>{{ 'online' if d.online else 'offline' }}
+      <span class="dot {{ ('on' if d.app_ok else 'warn') if d.online }}"></span>{{ 'online' if d.online else 'offline' }}
+      {% if d.online and not d.app_ok %}<span class="tag warn" title="VPN на этом ПК работает (его держит служба WireGuard), а программа Retix Hub больше 5 минут не отзывается: закрыта, зависла или не запустилась после обновления. Прямые пути, удалённое управление и обновления на нём не работают, подключиться к нему может не получиться. Запустите на нём Retix Hub или перезагрузите его">программа не отвечает</span>{% endif %}
       {% if d.status == 'pending' %}<span class="tag warn">ждёт одобрения</span>{% endif %}
       {% if d.status == 'blocked' %}<span class="tag bad">заблокирован</span>{% endif %}
       {% if d.log_requested_at %}<span class="tag" title="Программа на ПК пришлёт журнал при следующей связи с сервером (Retix Hub 1.0.21+)">журнал запрошен</span>{% endif %}

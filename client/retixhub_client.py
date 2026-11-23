@@ -41,7 +41,7 @@ import requests
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
 
-VERSION = "1.0.29"
+VERSION = "1.0.30"
 APP_NAME = "RetixHub"          # служебное имя: папки, задачи, мьютекс
 APP_TITLE = "Retix Hub"        # то, что видит пользователь
 TUNNEL = "retixhub"
@@ -1009,6 +1009,21 @@ class DirectPaths:
         self.listen_port = self.own_port = 0
         self.port_done = False
 
+    def clear(self) -> int:
+        """Программа закрывается: свои прямые пиры — из туннеля (пир сервера не трогаем). Иначе они остались бы
+        в WireGuard без присмотра: сосед закрывает свою сторону (сервер перестаёт называть этот ПК соседом, когда
+        от программы нет heartbeat), а этот ПК по-прежнему считает пакеты соседа своими только через прямой путь —
+        и выбрасывает их, когда они приходят через сервер. Связь с таким соседом пропадала совсем, хотя ПК «в сети»."""
+        state = self.tunnel.dump()
+        removed = 0
+        for key, v in ((state or {}).get("peers") or {}).items():
+            if key != self.server_key and "," not in v["allowed_ips"] and \
+                    (not v["allowed_ips"] or v["allowed_ips"].endswith("/32")):
+                self.tunnel.remove_peer(key)
+                removed += 1
+        self.reset()
+        return removed
+
     def sync(self, neighbors: list[dict], server_key: str) -> None:
         self.server_key = server_key
         self.wanted = {n["public_key"]: n for n in neighbors}
@@ -1832,7 +1847,11 @@ def restart_watchdog(exe: Path, delay: int = RESTART_AFTER) -> None:
     несколько минут её запустит отдельный cmd, иначе ПК остаётся без программы до перезагрузки. Программа уже
     работает — ничего не делает (а лишний запуск с --minimized окно не открывает)."""
     name = ntpath.basename(str(exe))
-    script = (f'ping -n {delay + 1} 127.0.0.1 >nul & tasklist /NH /FI "IMAGENAME eq {name}" | find /I "{name}" >nul'
+    # установщик ещё работает (медленный диск, антивирус проверяет файлы) — ждём его, до 5 минут сверх delay:
+    # программа, запущенная посреди копирования, держит часть старых библиотек, и установка выходит смешанной
+    script = (f'ping -n {delay + 1} 127.0.0.1 >nul'
+              f' & for /L %i in (1,1,30) do @(tasklist /NH | find /I "RetixHub_Setup" >nul && ping -n 11 127.0.0.1 >nul)'
+              f' & tasklist /NH /FI "IMAGENAME eq {name}" | find /I "{name}" >nul'
               f' || start "" "{exe}" --minimized')
     subprocess.Popen(f'cmd /s /c "{script}"', creationflags=CREATE_NO_WINDOW)
 
@@ -2647,6 +2666,20 @@ class Worker(threading.Thread):
                         self.direct.poll()
                 except Exception:  # noqa: BLE001
                     log.exception("прямой путь")
+
+    def leave_direct(self) -> None:
+        """Выход из программы (и перед установкой обновления): прямые пути — из туннеля, связь через сервер
+        до следующего запуска программы (DirectPaths.clear)."""
+        got = self.op_lock.acquire(timeout=15)   # шаг цикла закончится — пиров за нашей спиной он уже не добавит
+        try:
+            removed = self.direct.clear()
+            if removed:
+                log.info("прямые пути закрыты при выходе (%d) — до запуска программы связь через сервер", removed)
+        except Exception:  # noqa: BLE001
+            log.exception("прямые пути при выходе")
+        finally:
+            if got:
+                self.op_lock.release()
 
     def _direct_step(self, now: float):
         enabled = bool(self.cfg.get("direct_enabled"))
@@ -3598,15 +3631,20 @@ def natural_key(text: str):
 
 # как связан ПК из списка: значок вместо подписи «⇄ LAN / ⇄ WAN» рядом с IP.
 # Через сервер — зелёная R с логотипа Retix Hub
-LINK_COLORS = {"server": C["green"], "lan": "#2dd4bf", "wan": "#60a5fa", "off": C["muted"]}
+LINK_COLORS = {"server": C["green"], "lan": "#2dd4bf", "wan": "#60a5fa", "off": C["muted"], "noapp": C["orange"]}
 LINK_HINTS = {"server": "В сети · связь через сервер Retix Hub", "lan": "В сети · напрямую по локальной сети",
-              "wan": "В сети · напрямую через интернет", "off": "Не в сети"}
+              "wan": "В сети · напрямую через интернет", "off": "Не в сети",
+              "noapp": "VPN есть, но программа Retix Hub на том ПК не отвечает (закрыта, зависла или не запустилась\n"
+                       "после обновления) — подключиться к нему может не получиться. Запустите на нём Retix Hub\n"
+                       "или перезагрузите его"}
 
 
 def peer_link(p: dict, online: bool) -> str:
-    """Значок ПК в списке: server / lan / wan / off."""
+    """Значок ПК в списке: server / lan / wan / off / noapp."""
     if not online:
         return "off"
+    if p.get("app_ok") is False:      # сервер 1.0.30+: туннель есть, программа не отзывается
+        return "noapp"
     if p.get("direct"):
         return "wan" if p.get("direct_wan") else "lan"
     return "server"
@@ -3640,11 +3678,12 @@ def logo_letter(color: str, size: int = 16):
 
 def render_link_icon(kind: str, size: int = 16):
     """Значок связи (Pillow, рисуется в 8 раз крупнее и уменьшается — со сглаживанием):
-    server — зелёная R как на логотипе, lan — гнездо сетевого кабеля, wan — глобус, off — крестик."""
+    server — зелёная R как на логотипе, lan — гнездо сетевого кабеля, wan — глобус, off — крестик,
+    noapp — та же R оранжевая (программа на том ПК не отвечает)."""
     from PIL import Image, ImageDraw
-    if kind == "server":
+    if kind in ("server", "noapp"):
         try:
-            return logo_letter(LINK_COLORS["server"], size)
+            return logo_letter(LINK_COLORS[kind], size)
         except Exception:  # noqa: BLE001 — нет значка программы: полоски сигнала
             log.debug("буква R из app_icon.ico не собрана", exc_info=True)
     S = size * 8
@@ -3653,7 +3692,7 @@ def render_link_icon(kind: str, size: int = 16):
     d = ImageDraw.Draw(img)
     col = tuple(int(LINK_COLORS[kind][i:i + 2], 16) for i in (1, 3, 5)) + (255,)
     w, thin = max(1, round(1.5 * u)), max(1, round(1.2 * u))
-    if kind == "server":
+    if kind in ("server", "noapp"):
         for i in range(4):
             x0, h = (1.5 + i * 3.5) * u, (4 + i * 3) * u
             d.rounded_rectangle((x0, 14.5 * u - h, x0 + 2.5 * u, 14.5 * u), radius=0.6 * u, fill=col)
@@ -3689,7 +3728,8 @@ def make_link_images() -> dict:
     imgs = {k: tk.PhotoImage(width=w, height=h) for k in LINK_COLORS}
     for i in range(4):
         bh = 4 + i * 3
-        imgs["server"].put(LINK_COLORS["server"], to=(1 + i * 4, h - 1 - bh, 4 + i * 4, h - 1))
+        for k in ("server", "noapp"):
+            imgs[k].put(LINK_COLORS[k], to=(1 + i * 4, h - 1 - bh, 4 + i * 4, h - 1))
     lan = imgs["lan"]
     for x0, y0, x1, y1 in ((1, 1, 15, 3), (1, 13, 15, 15), (1, 1, 3, 15), (13, 1, 15, 15), (4, 7, 12, 10), (6, 10, 10, 12)):
         lan.put(LINK_COLORS["lan"], to=(x0, y0, x1, y1))
@@ -5397,6 +5437,7 @@ class App(tk.Tk):
         log.info("выход из программы (VPN продолжает работать)")
         self.worker.stop_flag = True
         self.updater.stop_event.set()
+        self.worker.leave_direct()
         self.tray.stop()
         self.destroy()
 
