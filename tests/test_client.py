@@ -2489,3 +2489,13 @@ def test_new_token_not_saved_keeps_working(make_client, company, monkeypatch):
     c.w.api.me()                                          # сервер прислал новый токен (ротация на каждом запросе)
     fail["on"] = False
     assert c.step(2)["status"] == rc.Status.ONLINE
+
+
+def test_rustdesk_id_missing_reason():
+    """Пункт «Копировать ID RustDesk» — только с облаком RustDesk; без ID программа называет одну причину."""
+    off, on = {"remote": {"mode": "auto", "cloud": False}}, {"remote": {"mode": "auto", "cloud": True}}
+    assert not rc.remote_cloud_on(off) and not rc.remote_cloud_on({}) and rc.remote_cloud_on(on)
+    peer = {"name": "Z15", "ip": "10.66.1.12", "client_version": "1.0.28"}
+    assert "облако RustDesk выключено" in rc.rustdesk_id_missing_reason(peer, off)
+    assert "1.0.27" in rc.rustdesk_id_missing_reason(dict(peer, client_version="1.0.27"), on)
+    assert "не ответил" in rc.rustdesk_id_missing_reason(peer, on)

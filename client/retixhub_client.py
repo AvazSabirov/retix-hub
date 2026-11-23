@@ -1232,6 +1232,28 @@ def remote_menu_allowed(peer: dict | None, cfg: dict | None) -> bool:
         and remote.get("can_control", True) is not False and rustdesk_exe() is not None
 
 
+def remote_cloud_on(cfg: dict | None) -> bool:
+    """Облако RustDesk включено в кабинете компании: только тогда у ПК есть ID RustDesk для подключения."""
+    remote = (cfg or {}).get("remote") if isinstance((cfg or {}).get("remote"), dict) else {}
+    return remote.get("cloud") is True
+
+
+def rustdesk_id_missing_reason(peer: dict, cfg: dict | None) -> str:
+    """Почему ID RustDesk того ПК неизвестен — одна конкретная причина, а не перечень возможных."""
+    name = peer.get("name") or peer.get("ip") or "компьютер"
+    if not remote_cloud_on(cfg):
+        return (f"ID RustDesk не нужен: облако RustDesk выключено в кабинете компании (настройки сети, галочка "
+                f"«Разрешить RustDesk через интернет»). В сети Retix Hub к {name} подключаются без ID: "
+                f"«Удалённое управление» в меню компьютера.")
+    ver = peer.get("client_version") or ""
+    if not vkey(ver) or vkey(ver) < vkey("1.0.28"):
+        return (f"ID RustDesk компьютера {name} неизвестен: на нём Retix Hub {ver or 'неизвестной версии'}, "
+                f"а ID сообщает серверу только 1.0.28 и новее. Обновится сам — ID появится.")
+    return (f"{name} ещё не сообщил свой ID RustDesk: RustDesk на нём не ответил программе Retix Hub. "
+            f"Программа спрашивает ID раз в минуту, пока не узнает. Если долго нет — пришлите журнал того ПК "
+            f"(кнопка «Журнал» в кабинете).")
+
+
 def wake_menu_allowed(peer: dict | None) -> bool:
     """«Включить компьютер»: ПК выключен, сервер знает его MAC, а этому ПК разрешено управлять другими."""
     return bool(peer) and peer.get("wake") is True and not peer.get("online") and not peer.get("is_me")
@@ -4407,9 +4429,11 @@ class App(tk.Tk):
 
         # меню правой кнопки: с пунктами Radmin Viewer — только если у того ПК есть Radmin Server, а здесь Viewer;
         # с пунктами RustDesk — если удалённое управление включено в кабинете и готово на обоих ПК
-        self.ctx_menus = {(radmin, remote, wake): self._build_peer_menu(radmin, remote, wake)
-                          for radmin in (True, False) for remote in (True, False) for wake in (True, False)}
-        self.ctx = self.ctx_menus[(False, False, False)]
+        # «Копировать ID RustDesk» — только с облаком RustDesk: без него ID не нужен и его нет
+        self.ctx_menus = {(radmin, remote, wake, cloud): self._build_peer_menu(radmin, remote, wake, cloud)
+                          for radmin in (True, False) for remote in (True, False) for wake in (True, False)
+                          for cloud in (True, False)}
+        self.ctx = self.ctx_menus[(False, False, False, False)]
 
         self.msg_lbl = tk.Label(self, text="", bg=C["bg"], fg=C["muted"], anchor="w", justify="left",
                                 wraplength=330, padx=10)
@@ -5020,7 +5044,7 @@ class App(tk.Tk):
             return None
         return next((p for p in self.peers if str(p["id"]) == sel[0]), None)
 
-    def _build_peer_menu(self, radmin: bool, remote: bool = False, wake: bool = False):
+    def _build_peer_menu(self, radmin: bool, remote: bool = False, wake: bool = False, cloud: bool = False):
         m = dark_menu(self)
         if wake:
             m.add_command(label="Включить компьютер", command=self.wake_peer, font=("Segoe UI", 9, "bold"))
@@ -5037,7 +5061,8 @@ class App(tk.Tk):
             m.add_command(label="Удалённое управление", command=lambda: self.remote("control"),
                           font=("Segoe UI", 9, "bold"))
             m.add_command(label="Передача файлов (RustDesk)", command=lambda: self.remote("files"))
-            m.add_command(label="Копировать ID RustDesk", command=self.copy_rustdesk_id)
+            if cloud:
+                m.add_command(label="Копировать ID RustDesk", command=self.copy_rustdesk_id)
         if radmin:
             m.add_command(label="Полное управление", command=lambda: self.radmin("full"),
                           font=("Segoe UI", 9, "bold"))
@@ -5056,7 +5081,7 @@ class App(tk.Tk):
         viewer = find_radmin_viewer(self.state_.get("radmin_path") or "")
         peer = self.selected_peer()
         self.ctx = self.ctx_menus[(radmin_menu_allowed(peer, viewer), remote_menu_allowed(peer, self.cfg),
-                                   wake_menu_allowed(peer))]
+                                   wake_menu_allowed(peer), remote_cloud_on(self.cfg))]
         try:
             self.ctx.tk_popup(event.x_root, event.y_root)
         finally:
@@ -5271,9 +5296,7 @@ class App(tk.Tk):
             return
         rid = str(p.get("rustdesk_id") or "")
         if not RUSTDESK_ID_RE.match(rid):
-            messagebox.showinfo(APP_TITLE, f"ID RustDesk компьютера {p['name']} неизвестен: облако RustDesk "
-                                           "выключено в кабинете компании или на том ПК Retix Hub старее 1.0.28.",
-                                parent=self)
+            messagebox.showinfo(APP_TITLE, rustdesk_id_missing_reason(p, self.cfg), parent=self)
             return
         self.clipboard_clear()
         self.clipboard_append(rid)
