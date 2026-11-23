@@ -521,7 +521,7 @@ def direct_lan(srv, cab_a, a1, a2, a3, b1):
     check("в программе Бухгалтерия отмечена «напрямую»",
           any(p["name"] == "Бухгалтерия" and p.get("direct") for p in a1.peers), str(a1.peers))
     page = cab_a.get(API + "/cabinet").text
-    check("кабинет показывает прямые пути", "напрямую: Бухгалтерия" in page and "напрямую: Склад PC1" in page)
+    check("кабинет показывает прямые пути", page.count("напрямую: 1 ПК") >= 2 and ">Бухгалтерия<" in page and ">Склад PC1<" in page)
 
     # доказательство: сервер больше не пропускает трафик между ними, а связь есть
     drop = [f"FORWARD -s {a1.ip} -d {a2.ip} -j DROP", f"FORWARD -s {a2.ip} -d {a1.ip} -j DROP"]

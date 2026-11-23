@@ -1023,7 +1023,8 @@ def test_direct_path_same_lan(make_client, company, server):
     assert peers["Бухгалтерия"]["direct"] and not peers["Склад"]["direct"]
     # сервер знает о прямом пути — видно в кабинете
     mark_online(server)
-    assert "напрямую: Бухгалтерия" in company.cab.get(BASE + "/cabinet").text
+    page = company.cab.get(BASE + "/cabinet").text
+    assert "напрямую: 1 ПК" in page and ">Бухгалтерия<" in page.split("напрямую: 1 ПК")[1][:200]
     # firewall: входящие UDP на порт туннеля из локальной сети
     assert a.state.get("fw_direct") == a.tunnel.port
 
@@ -1605,7 +1606,8 @@ def test_direct_path_wan(make_client, company, server):
     peers = {p["name"]: p for p in a.peers}
     assert peers["Самарканд"]["direct"] and peers["Самарканд"]["direct_wan"]
     mark_online(server, OFFICE_A, names=["Ташкент"]); mark_online(server, OFFICE_B, names=["Самарканд"])
-    assert "напрямую: Самарканд" in company.cab.get(BASE + "/cabinet").text
+    page = company.cab.get(BASE + "/cabinet").text
+    assert "напрямую: 1 ПК" in page and ">Самарканд<" in page.split("напрямую: 1 ПК")[1][:200]
     # прямой путь через интернет не сохраняется для работы без интернета (он без сервера не найдётся)
     assert a.state.get("direct_cache")["neighbors"] == []
 
